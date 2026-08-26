@@ -1,5 +1,11 @@
 # FlakeBrake Decision Log
 
+## 2026-08-26 — Owner review 0003 corrects admission and denial matching
+
+**Status:** Accepted as two semantic corrections; no v0.1 scope expansion.
+
+Admission commit preconditions now atomically compare the complete evaluated state tuple: portfolio, capacity-model, and capacity-plan versions. Denial matching now uses the typed scoped-effect predicate—including effect schema/class, target, operation, material parameters, and resources—rather than requiring equality with the originally denied full fingerprint, which remains an immutable audit and identity anchor.
+
 ## 2026-08-26 — Owner review 0002 closes execution and replan ambiguities
 
 **Status:** Accepted into specification clarification; no v0.1 scope expansion.
