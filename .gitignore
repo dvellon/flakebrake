@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and builds
+node_modules/
+dist/
+build/
+coverage/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime state and logs
+logs/
+*.log
+artifacts/private/
+
+# Local tools and editors
+.DS_Store
+.vscode/
+.idea/
