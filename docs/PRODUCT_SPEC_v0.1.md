@@ -1,6 +1,6 @@
 # FlakeBrake Product Specification v0.1
 
-**Status:** DRAFT — owner reviews 0001–0003 incorporated; pending owner lock
+**Status:** DRAFT — owner reviews 0001–0004 incorporated; pending owner lock
 
 **Date:** 2026-08-26
 
@@ -24,7 +24,7 @@ Demo hook:
 
 > Your human is not an infinite API—and neither is your agent.
 
-FlakeBrake v0.1 proves only that a proposal is feasible under the declared capacity model, capacity plan, estimator, evidence, and assumptions evaluated at a specific portfolio, capacity-model, and capacity-plan version tuple. `ADMITTABLE` is not a guarantee that every accepted promise will be fulfilled. Unmodeled failures, invalid assumptions, and post-admission changes can still prevent fulfillment and MUST be reported rather than hidden.
+FlakeBrake v0.1 proves only that a proposal is feasible under the declared capacity model, capacity plan, authorization state, estimator, evidence, and assumptions evaluated at a specific portfolio, capacity-model, capacity-plan, and authorization-state version tuple. `ADMITTABLE` is not a guarantee that every accepted promise will be fulfilled. Unmodeled failures, invalid assumptions, and post-admission changes can still prevent fulfillment and MUST be reported rather than hidden.
 
 ## 2. v0.1 user job and demonstration domain
 
@@ -61,13 +61,14 @@ The deterministic demo fixture MUST make the direct rush-order plan exceed both 
 
 - An **obligation** is a promise with a stable ID, beneficiary, objective, service level, deadline or horizon, criticality, required resources, and expected consequential effects.
 - The **accepted portfolio** is the immutable snapshot of all currently accepted obligations and their predicted resource reservations. A `portfolio_version` changes only after an explicit owner decision atomically accepts a new promise or approves a bounded modification to an existing promise.
-- A **proposal** is a not-yet-accepted obligation or portfolio change evaluated against one complete portfolio, capacity-model, and capacity-plan version tuple.
+- A **proposal** is a not-yet-accepted obligation or portfolio change evaluated against one complete portfolio, capacity-model, capacity-plan, and authorization-state version tuple.
 - A **candidate plan** is a complete proposed portfolio state plus its action graph, resource allocations, decision frontier, assumptions, and predicted results.
 - A **capacity model version** identifies resource types, units, horizons, feasibility rules, estimator rules, and assumption schema.
 - A **capacity plan version** assigns concrete capacity values and permitted bounds to one capacity-model version. Owner-approved expansion creates a new capacity-plan version; it does not rewrite the old version.
+- An **authorization state version** is the single monotonically advancing version of the admission-relevant grant and denial state. Any grant or denial transition that could change admission feasibility or authorization MUST advance `authorization_state_version`, including grant issuance, activation, revocation, expiry, execution-slot consumption or exhaustion, and denial creation, supersession, or mission closure when admission-relevant. Immutable evidence artifacts and unchanged static action bundles do not advance it unless their admission-relevant authorization semantics change.
 - **Criticality** is one of `protected`, `important`, or `best_effort`. Protected service is a hard constraint in the permitted v0.1 replan search.
 
-Evaluation is side-effect free. Merely evaluating, ranking, or displaying a candidate MUST NOT mutate a portfolio, capacity plan, grant, denial, or external system. An `ADMITTABLE` result is valid only for its complete evaluated state tuple and carries `expected_portfolio_version`, `expected_capacity_model_version`, and `expected_capacity_plan_version` for acceptance.
+Evaluation is side-effect free. Merely evaluating, ranking, or displaying a candidate MUST NOT mutate a portfolio, capacity plan, grant, denial, or external system. An `ADMITTABLE` result is valid only for its complete evaluated state tuple and carries `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, and `expected_authorization_state_version` for acceptance.
 
 ### 3.2 Declared capacity resources
 
@@ -236,9 +237,9 @@ material_parameters:
 
 `effect_type`, `target_type`, `operation`, and the required typed keys in `material_parameters` come from the bounded domain schema identified by `effect_schema_version`. For example, a schedule reservation fingerprint identifies the synthetic factory, order, production cell, operation, start and end times, and quantity.
 
-The stable fingerprint is the canonical, type-preserving serialization of those fields in schema order. A digest MAY be stored as an index, but the typed fields are authoritative. Display name, action ID, graph position, agent, MCP server, and tool name are deliberately excluded. Target aliases MUST be resolved through a versioned authoritative alias table; an unknown alias fails closed.
+The stable full fingerprint is the canonical, type-preserving serialization of those submitted fields in declared-schema order after target-alias resolution. It includes the raw `effect_schema_version`, which remains audit and provenance metadata. A digest MAY be stored as an index, but the typed fields are authoritative. Display name, action ID, graph position, agent, MCP server, and tool name are deliberately excluded. Target aliases MUST be resolved through a versioned authoritative alias table; an unknown alias fails closed.
 
-Two effects are **equivalent** exactly when their supported schema versions normalize to the same canonical typed fingerprint. Renaming an action, moving it in the graph, or using a different agent, MCP, or tool does not change equivalence. Changing a material parameter creates a different full fingerprint. Full fingerprints remain immutable effect identity and audit anchors, but Section 5.4 deliberately does not require full-fingerprint equality when matching future effects to a scoped denial.
+Every supported effect-schema version MUST declare a deterministic normalizer to a common canonical typed semantic form containing a `canonical_effect_class`, environment, target type, canonical target ID, operation, and normalized material parameters. The normalizer MUST preserve every material distinction. Two effects are **equivalent** exactly when their supported representations normalize to the same canonical semantic form; their raw schema versions and full fingerprints may differ. Renaming an action, moving it in the graph, using a different agent, MCP, or tool, or using an alternate supported serialization does not change equivalence. Changing a material parameter creates a different full fingerprint and canonical effect identity, while the canonical effect class remains the typed basis for scoped matching. Full fingerprints remain immutable representation-identity and audit anchors, but Section 5.4 deliberately does not require full-fingerprint equality when matching future effects to a scoped denial.
 
 Missing required fingerprint fields, unknown field types, unsupported schema versions, unresolved aliases, and unrecognized material parameters fail closed.
 
@@ -341,11 +342,10 @@ denied_scope:
 denied_scope_predicate:
   scope_schema_version:
   environment_id:
-  allowed_effect_schema_versions: []
-  allowed_effect_types: []
-  allowed_target_types: []
+  allowed_canonical_effect_classes: []
+  allowed_canonical_target_types: []
   allowed_target_ids: []
-  allowed_operations: []
+  allowed_canonical_operations: []
   material_parameter_constraints: {}
   resource_constraints: {}
   objective_id:
@@ -358,17 +358,19 @@ reason:
 status: active | superseded | mission_closed
 ```
 
-The originally denied full fingerprint and scope are both required and remain immutable audit and identity anchors. `denied_scope` is the complete rejected typed scope used for owner display and strict-subset checks. `denied_scope_predicate` is its canonical effect-relevant projection with exactly the fields shown above, and its `objective_id` MUST equal the outer denial `objective_id`. Denial record identity is the tuple of the original stable full fingerprint and canonical denied-scope predicate; future denial matching is determined by the predicate, not equality with the anchor fingerprint. A malformed denial cannot be created; if malformed active denial data is encountered, authorization for its objective fails closed until authoritative state is repaired.
+The originally denied full fingerprint and scope are both required and remain immutable audit and representation-identity anchors. `denied_scope` is the complete rejected typed scope used for owner display and strict-subset checks. `denied_scope_predicate` is its canonical effect-relevant projection with exactly the fields shown above, and its `objective_id` MUST equal the outer denial `objective_id`. Construction of the predicate MUST deterministically normalize every supported effect-schema representation admitted by the denied scope into its canonical effect class; raw effect-schema versions are retained in the original scope and fingerprint for audit, not copied into the matching predicate. Denial record identity is the tuple of the original stable full fingerprint and canonical denied-scope predicate; future denial matching is determined by the predicate, not equality with the anchor fingerprint. A malformed or non-normalizable denial cannot be created; if malformed active denial data is encountered, authorization for its objective fails closed until authoritative state is repaired.
 
-There is one denial-match rule. An active denial matches an attempted effect if and only if:
+Before denial matching, FlakeBrake MUST normalize the attempted supported representation through the declared deterministic canonicalization rules. For any active denial in the same environment and objective, if FlakeBrake cannot establish whether the attempted representation has the denied canonical effect identity, consequential authorization fails closed; it MUST NOT classify the uncertain representation as non-matching.
+
+There is one denial-match rule. An active denial matches a canonically normalized attempted effect if and only if:
 
 1. environment and objective exactly match the denied-scope predicate;
-2. effect schema version, effect type, target type, canonical target ID, and operation belong to the predicate's finite allowed sets; and
+2. canonical effect class, normalized target type, canonical target ID, and normalized operation belong to the predicate's finite allowed sets; and
 3. every material parameter and relevant resource claim satisfies its corresponding typed denied constraint.
 
-Full-fingerprint equality is not a match condition. Material parameters are tested through the typed denied-scope predicate. Therefore, an effect of a denied class on the denied target/resource with a parameter inside a denied set or range matches even when that parameter produces a different full fingerprint. An unrelated effect schema, type, target, or operation does not match merely because a parameter value overlaps.
+Full-fingerprint equality and raw effect-schema-version equality are not match conditions. Material parameters are tested through the typed denied-scope predicate. Therefore, if supported schema versions V1 and V2 normalize to the same canonical effect class, target, and operation, an in-scope effect represented by either version matches even when its full fingerprint differs. A genuinely different canonical effect class does not match merely because a parameter value overlaps.
 
-This matcher does not call `covers` and does not compare `promise_basis_id`, approver, approval-validity interval, or grant execution count; denial lifetime is governed only by the rule below. Action names, tool or MCP names, labels, and plan-node names are non-authoritative metadata and never participate in denial identity or matching. Renaming an action or selecting an alternate tool cannot evade a matching denial.
+This matcher does not call `covers` and does not compare `promise_basis_id`, approver, approval-validity interval, or grant execution count; denial lifetime is governed only by the rule below. Action names, tool or MCP names, labels, plan-node names, raw schema versions, and serialization choices are non-authoritative for denial matching. Renaming an action, selecting an alternate tool, or submitting an equivalent supported schema representation cannot evade a matching denial.
 
 In v0.1 a denial remains active through graph rewrites, renamed actions, alternate agents, alternate MCPs or tools, session reconnects, and portfolio replans. Time passage alone does not expire it. It ends only when the mission is closed or the owner explicitly supersedes it through a valid re-request decision. The old denial record remains immutable.
 
@@ -377,7 +379,7 @@ A re-request MUST reference the prior `denial_id`, declare its change class, and
 - **narrower scope:** `scope_contained(requested_scope, denied_scope)` is true under Section 5.2 and at least one typed permission dimension is properly narrower; or
 - **materially new basis:** new post-denial evidence or a changed precondition alters at least one domain field predeclared as material in the Promise Basis schema, and the domain verifier validates the new evidence receipt.
 
-A renamed action, alternate tool, changed plan node, different full fingerprint, or material-parameter change that remains inside the denied scope is neither a bypass nor a material change for re-request. New prose rationale or repeated identical evidence is also insufficient. Until the owner explicitly approves a valid re-request, the denial continues to block matching approval requests and execution. Supersession is recorded by an append-only event linked to both the denial and the new decision.
+A renamed action, alternate tool, changed plan node, different full fingerprint, equivalent raw schema version or serialization, or material-parameter change that remains inside the denied scope is neither a bypass nor a material change for re-request. New prose rationale or repeated identical evidence is also insufficient. Until the owner explicitly approves a valid re-request, the denial continues to block matching approval requests and execution. Supersession is recorded by an append-only event linked to both the denial and the new decision.
 
 ## 6. Deterministic admission kernel
 
@@ -387,10 +389,10 @@ The deterministic kernel receives:
 
 - the proposal and selected `portfolio_version`;
 - the `capacity_model_version` and `capacity_plan_version`;
+- the `authorization_state_version` and the active grants and denials at that version;
 - the complete accepted portfolio and reservations;
 - typed action graphs, effects, dependencies, and complete branch records with selectors and exclusivity linkage;
 - proposed decisions and approval scopes;
-- active grants and denials;
 - evidence receipts and comparable immutable admission history.
 
 It independently validates schemas and recomputes the portfolio schedule, resource demand, protected slack, meaningful-decision frontier, effect equivalence, scope coverage, and denial matches. LLM judgment can propose inputs but cannot declare feasibility, safety, coverage, equivalence, or authorization.
@@ -413,13 +415,14 @@ Every evaluation emits exactly one immutable AdmissionRecord as specified in Sec
 
 ### 6.3 `ADMITTABLE`
 
-`ADMITTABLE` means the proposal can fit under the exact declared versions and assumptions. It is valid only for the complete immutable evaluated state tuple `(portfolio_version, capacity_model_version, capacity_plan_version)`. It does not accept the promise and does not authorize execution.
+`ADMITTABLE` means the proposal can fit under the exact declared versions and assumptions. It is valid only for the complete immutable evaluated state tuple `(portfolio_version, capacity_model_version, capacity_plan_version, authorization_state_version)`. It does not accept the promise and does not authorize execution.
 
 Every `ADMITTABLE` result MUST declare:
 
 - portfolio version, also emitted as `expected_portfolio_version` for acceptance;
 - capacity-model version, also emitted as `expected_capacity_model_version` for acceptance;
 - capacity-plan version, also emitted as `expected_capacity_plan_version` for acceptance;
+- authorization-state version, also emitted as `expected_authorization_state_version` for acceptance;
 - every relevant capacity constraint;
 - all feasibility and estimator assumptions;
 - capacity before admission, by resource;
@@ -430,15 +433,18 @@ Every `ADMITTABLE` result MUST declare:
 - the complete domain-specific Promise Basis; and
 - the explicit owner choices **ACCEPT PROMISE**, **MODIFY**, and **DECLINE**.
 
-An `ACCEPT PROMISE` request MUST carry `expected_portfolio_version`, `expected_capacity_model_version`, and `expected_capacity_plan_version` from the selected `ADMITTABLE` AdmissionRecord. Portfolio activation uses one atomic compare-and-swap/precondition operation. Acceptance succeeds only if all three equal current authoritative state:
+An `ACCEPT PROMISE` request MUST carry `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, and `expected_authorization_state_version` from the selected `ADMITTABLE` AdmissionRecord. Portfolio activation uses one atomic compare-and-swap/precondition operation. Acceptance succeeds only if all four equal current authoritative state:
 
 ```text
 expected_portfolio_version      == current_portfolio_version
 expected_capacity_model_version == current_capacity_model_version
 expected_capacity_plan_version  == current_capacity_plan_version
+expected_authorization_state_version == current_authorization_state_version
 ```
 
-The same operation validates that every specifically approved bounded modification remains applicable and writes the resulting portfolio as one new version. If any version comparison or validation fails, FlakeBrake fails closed, performs no portfolio mutation, appends a stale/superseded acceptance result to the prior immutable AdmissionRecord without rewriting it, and reruns admission against the current portfolio, capacity model, and capacity plan. Any concurrent change to one component of the evaluated state tuple therefore prevents the stale admission from committing.
+The same operation validates that every specifically approved bounded modification remains applicable and writes the resulting portfolio as one new version. If any version comparison or validation fails, FlakeBrake fails closed, performs no portfolio mutation, preserves the prior AdmissionRecord without rewriting it, appends a stale/superseded acceptance result, and reruns admission against the current portfolio, capacity model, capacity plan, and authorization state. Any concurrent change to one component of the evaluated state tuple therefore prevents the stale admission from committing.
+
+This acceptance precondition prevents a promise from committing against already-stale authorization assumptions. It does not issue a grant and does not replace the execution-time authorization recomputation, version validation, denial matching, or atomic grant-slot claim required by Sections 5.2 and 7.2.
 
 On a successful compare-and-swap, `ACCEPT PROMISE` creates one new portfolio version containing the promise and only those modifications to existing obligations that received explicit conforming owner decisions. `MODIFY` creates a new proposal and reruns evaluation. `DECLINE` records the owner's choice without adding the promise; it is not a kernel `REJECT`.
 
@@ -503,14 +509,14 @@ Every consequential effect has the stable typed fingerprint in Section 5.1. Ever
 
 Immediately before execution, deterministic code MUST recompute portfolio feasibility, capacity remaining, protected slack, the selected bundle, effect identity, scope coverage, and active-denial matches from authoritative state. This final recomputation and the execution-slot claim MUST occur in the same atomic fail-closed operation defined in Section 5.2; a separate check followed by a later claim is insufficient. Agent-supplied `safe`, `covered`, `equivalent`, or similar claims cannot substitute for recomputation.
 
-If the portfolio, capacity model, capacity plan, Promise Basis, evidence, grant, denial set, or expected effect has materially changed since admission, execution pauses and admission reruns against new versions.
+If the portfolio, capacity model, capacity plan, authorization state (including grants and denials), Promise Basis, evidence, or expected effect has materially changed since admission, execution pauses and admission reruns against current versions. This execution-time rule remains required even when the acceptance precondition in Section 6.3 succeeded.
 
 ### 7.3 Domain-specific pre-approval Promise Basis
 
 Every proposed promise and consequential portfolio change presented for approval MUST include a versioned microfactory Promise Basis containing:
 
 - proposed order quantity, service level, beneficiary, and deadline;
-- evaluated portfolio, capacity-model, and capacity-plan versions together with `expected_portfolio_version`, `expected_capacity_model_version`, and `expected_capacity_plan_version` acceptance preconditions;
+- evaluated portfolio, capacity-model, capacity-plan, and authorization-state versions together with `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, and `expected_authorization_state_version` acceptance preconditions;
 - resource capacity before, predicted consumption, capacity after, and calibration corrections;
 - assumptions and evidence receipts, including deterministic schedule/simulation results;
 - every affected accepted obligation, its modification policy and minimum-service floor, each exact proposed term change, and normalized degradation;
@@ -568,6 +574,8 @@ capacity_model_version:
 expected_capacity_model_version:
 capacity_plan_version:
 expected_capacity_plan_version:
+authorization_state_version:
+expected_authorization_state_version:
 proposal:
 candidate_plans:
 selected_plan:
@@ -710,15 +718,15 @@ FlakeBrake v0.1 is not complete unless all of the following pass:
 
 - [ ] The microfactory rush-order mission starts with a versioned portfolio containing protected, important, and best-effort accepted obligations.
 - [ ] The deterministic direct plan exceeds both a declared human-review constraint and a declared agent-work constraint.
-- [ ] `ADMITTABLE` contains every required version, constraint, assumption, before/consumed/after value, protected slack, limiting resource, Promise Basis, and owner choice; a mismatch in any expected portfolio, capacity-model, or capacity-plan version fails the atomic acceptance precondition without mutation, appends a stale/superseded result, and triggers readmission.
+- [ ] `ADMITTABLE` contains every required version, constraint, assumption, before/consumed/after value, protected slack, limiting resource, Promise Basis, and owner choice; a mismatch in any expected portfolio, capacity-model, capacity-plan, or authorization-state version fails the atomic acceptance precondition without mutation, appends a stale/superseded result, and triggers readmission.
 - [ ] `REPLAN` evaluates and displays both modification strategy families; every proposed accepted-obligation change is non-protected, policy-bounded, at or above its minimum-service floor, scored as degradation, and specifically owner-approved before activation.
 - [ ] Mechanical tests verify the exact lexicographic recommendation order and structural-difference rule.
 - [ ] `REJECT` occurs only after direct and replan failure and reports Pareto-minimal targeted changes where calculable.
 - [ ] Owner-approved capacity expansion creates a new capacity-plan version and a fresh admission evaluation.
-- [ ] Effect fingerprints remain equivalent across action renames and alternate tools.
+- [ ] Effect equivalence survives action renames, alternate tools, and equivalent supported schema representations under the declared deterministic normalizers.
 - [ ] Scope coverage and scope-to-scope containment fail closed for every missing, unknown, expired, exhausted, incomparable, or out-of-bounds field; strict-subset tests exercise sets, values, ranges, resources, time, and execution count.
 - [ ] Mechanical tests prevent unrelated effects from sharing a decision and grant exclusive accounting only to branch records with stable IDs, disjoint guards, shared exclusivity linkage, and complete downstream links.
-- [ ] The canonical typed denied-scope predicate blocks in-scope material-parameter variants, renamed actions, alternate tools, and changed plan nodes without requiring full-fingerprint equality, while unrelated effect schemas and classes remain distinct.
+- [ ] The canonical typed denied-scope predicate blocks in-scope material-parameter variants, renamed actions, alternate tools, changed plan nodes, and equivalent supported schema representations without requiring full-fingerprint or raw-schema-version equality, while genuinely different canonical effect classes remain distinct and uncertain equivalence fails closed.
 - [ ] Portfolio feasibility, decision demand, effect coverage, and denial matches are recomputed by deterministic code.
 - [ ] Concurrent or repeated execution attempts cannot claim the same grant ordinal; validation, version checks, and slot claim are one atomic fail-closed operation.
 - [ ] Duplicate delivery of one `execution_attempt_id` returns the recorded result without repeating the consequential effect or creating a second logical receipt.
@@ -763,7 +771,7 @@ Owner review 0001 changes the center of gravity from a single human-review budge
 
 The specification MUST NOT be locked until the owner can answer yes to all of these:
 
-1. Is every feasibility claim explicitly limited to the declared portfolio, capacity versions, estimator, evidence, and assumptions?
+1. Is every feasibility claim explicitly limited to the declared portfolio, capacity versions, authorization-state version, estimator, evidence, and assumptions?
 2. Do simultaneous human and agent capacity constraints materially change the portfolio plan?
 3. Are effects, scopes, meaningful decisions, mutually exclusive branches, and denials mechanically decidable and fail-closed?
 4. Does every outcome preserve immutable predicted-versus-actual history, and does every consequential completion have a verified durable receipt?

@@ -1,5 +1,11 @@
 # FlakeBrake Decision Log
 
+## 2026-08-26 — Owner review 0004 closes authorization-state and schema-representation gaps
+
+**Status:** Accepted as two semantic corrections; no v0.1 scope expansion.
+
+Admission acceptance now validates admission-relevant authorization state as part of the complete evaluated-state tuple. Denial matching now follows canonical normalized effect identity across equivalent supported schema versions while retaining raw schema versions and full fingerprints as audit and provenance anchors.
+
 ## 2026-08-26 — Owner review 0003 corrects admission and denial matching
 
 **Status:** Accepted as two semantic corrections; no v0.1 scope expansion.
