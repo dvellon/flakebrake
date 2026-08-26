@@ -1,6 +1,6 @@
 # FlakeBrake Product Specification v0.1
 
-**Status:** DRAFT — owner reviews 0001–0004 incorporated; pending owner lock
+**Status:** DRAFT — owner reviews 0001–0005 incorporated; pending owner lock
 
 **Date:** 2026-08-26
 
@@ -24,7 +24,7 @@ Demo hook:
 
 > Your human is not an infinite API—and neither is your agent.
 
-FlakeBrake v0.1 proves only that a proposal is feasible under the declared capacity model, capacity plan, authorization state, estimator, evidence, and assumptions evaluated at a specific portfolio, capacity-model, capacity-plan, and authorization-state version tuple. `ADMITTABLE` is not a guarantee that every accepted promise will be fulfilled. Unmodeled failures, invalid assumptions, and post-admission changes can still prevent fulfillment and MUST be reported rather than hidden.
+FlakeBrake v0.1 proves only that a proposal is feasible under the declared capacity model, capacity plan, authorization state, estimator, evidence, assumptions, and calibration frontier evaluated at a specific portfolio, capacity-model, capacity-plan, and authorization-state version tuple plus its calibration-frontier digest. `ADMITTABLE` is not a guarantee that every accepted promise will be fulfilled. Unmodeled failures, invalid assumptions, and post-admission changes can still prevent fulfillment and MUST be reported rather than hidden.
 
 ## 2. v0.1 user job and demonstration domain
 
@@ -61,14 +61,20 @@ The deterministic demo fixture MUST make the direct rush-order plan exceed both 
 
 - An **obligation** is a promise with a stable ID, beneficiary, objective, service level, deadline or horizon, criticality, required resources, and expected consequential effects.
 - The **accepted portfolio** is the immutable snapshot of all currently accepted obligations and their predicted resource reservations. A `portfolio_version` changes only after an explicit owner decision atomically accepts a new promise or approves a bounded modification to an existing promise.
-- A **proposal** is a not-yet-accepted obligation or portfolio change evaluated against one complete portfolio, capacity-model, capacity-plan, and authorization-state version tuple.
+- A **proposal** is a not-yet-accepted obligation or portfolio change evaluated against one complete portfolio, capacity-model, capacity-plan, and authorization-state version tuple plus its reproducible calibration frontier.
 - A **candidate plan** is a complete proposed portfolio state plus its action graph, resource allocations, decision frontier, assumptions, and predicted results.
 - A **capacity model version** identifies resource types, units, horizons, feasibility rules, estimator rules, and assumption schema.
 - A **capacity plan version** assigns concrete capacity values and permitted bounds to one capacity-model version. Owner-approved expansion creates a new capacity-plan version; it does not rewrite the old version.
-- An **authorization state version** is the single monotonically advancing version of the admission-relevant grant and denial state. Any grant or denial transition that could change admission feasibility or authorization MUST advance `authorization_state_version`, including grant issuance, activation, revocation, expiry, execution-slot consumption or exhaustion, and denial creation, supersession, or mission closure when admission-relevant. Immutable evidence artifacts and unchanged static action bundles do not advance it unless their admission-relevant authorization semantics change.
+- An **authorization state version** is the single monotonically advancing version of admission-relevant grants, denials, grant allowances, scoped denial exceptions, and in-flight execution reservations. Any transition among those records that could change admission feasibility or authorization MUST advance `authorization_state_version`, including first grant issuance, activation, revocation, expiry, shared-allowance slot consumption or exhaustion, denial creation or supersession, scoped-exception creation or termination, mission closure when admission-relevant, and creation, material change, or terminal release of an in-flight reservation. An idempotent duplicate grant lookup that creates no state does not advance the version. Immutable evidence artifacts and unchanged static action bundles do not advance it unless their admission-relevant authorization semantics change.
 - **Criticality** is one of `protected`, `important`, or `best_effort`. Protected service is a hard constraint in the permitted v0.1 replan search.
 
-Evaluation is side-effect free. Merely evaluating, ranking, or displaying a candidate MUST NOT mutate a portfolio, capacity plan, grant, denial, or external system. An `ADMITTABLE` result is valid only for its complete evaluated state tuple and carries `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, and `expected_authorization_state_version` for acceptance.
+Evaluation is side-effect free. Merely evaluating, ranking, or displaying a candidate MUST NOT mutate a portfolio, capacity plan, authorization record, or external system. An `ADMITTABLE` result is valid only for its complete evaluated state tuple and calibration frontier. It carries `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, `expected_authorization_state_version`, and `expected_calibration_frontier_digest` for acceptance.
+
+General admission-basis invariant:
+
+> No mutable input required by the normative feasibility calculation may change between `ADMITTABLE` evaluation and `ACCEPT PROMISE` without invalidating that admission basis.
+
+The four version comparisons protect their respective authoritative state. For v0.1, `calibration_frontier_digest` additionally protects the mandatory estimator-history input without introducing another general version counter.
 
 ### 3.2 Declared capacity resources
 
@@ -133,6 +139,14 @@ additive_correction = calibrated_estimate - declared_base_estimate
 If no comparable actual exists, the declared base estimate is used. Work-class keys and the selected history records MUST be shown in the Promise Basis. v0.1 does not automatically reduce an estimate below its declared base. A changed estimator, work-class definition, or assumption requires a new capacity-model version.
 
 Predicted and actual consumption MUST remain separate values. Later observations append calibration facts; they never overwrite the prediction that supported an earlier decision. Counts of recent binding or limiting resources MAY drive targeted suggestions such as, "Human review was the binding resource in 7 of the last 10 constrained admissions."
+
+For every evaluation, the kernel MUST construct deterministic `calibration_frontier_provenance` containing, for each calibrated resource and work class:
+
+- the stable identities of the exact comparable AdmissionRecords selected under the rule above;
+- the stable identities and typed values of every calibration-relevant actual-consumption and outcome addendum read from those records; and
+- the capacity-model version, deterministic calibration-rule identifier/version, and digest-algorithm/serialization identifier used to derive and reproduce the frontier.
+
+`calibration_frontier_digest` is the digest of the canonical, type-preserving serialization of that complete provenance in stable resource, work-class, record, and addendum order using the declared digest algorithm. Empty comparable sets are represented explicitly. An `ADMITTABLE` AdmissionRecord MUST preserve both the digest and enough provenance to reproduce it exactly. A later actual, outcome, correction, or newly completed comparable item never rewrites an earlier frontier; it creates a different current frontier when the mandatory selected inputs or their calibration-relevant facts differ.
 
 ## 4. Portfolio and action representation
 
@@ -267,16 +281,34 @@ max_executions:
 
 All lists are explicit, finite, nonempty sets. v0.1 supports no wildcard. Each material parameter and relevant resource required by an allowed effect type MUST have an equality, finite-set, or closed-range constraint of the correct type. `valid_until` and `max_executions` make the scope time- and count-bounded. Missing fields or constraints fail closed.
 
-An issued `ApprovalGrant` wraps exactly one scope and MUST also contain `grant_id`, `grant_version`, `authorization_state_version`, `decision_id`, `selected_bundle_id`, `portfolio_version`, `capacity_model_version`, `capacity_plan_version`, `issued_at`, `status`, and the durable set of claimed execution slots. It cannot authorize a bundle other than the one selected by its referenced decision.
+The canonical approved scope is the complete type-preserving serialization of the approved scope in schema order. The stable `grant_allowance_key` is derived deterministically from at least `decision_id`, `selected_bundle_id`, that canonical approved scope, and `approver_id`. A genuinely fresh owner decision naturally produces a different key.
 
-An effect occurrence is the typed fingerprint plus its `objective_id`, `promise_basis_id`, typed resource claims, attempted execution time, and atomically assigned grant execution ordinal. For an effect occurrence `e` and scope `s`, `covers(s, e)` is true if and only if all of the following are true:
+The authorization ledger MUST maintain one logical `GrantAllowance` per key:
+
+```yaml
+grant_allowance_key:
+decision_id:
+selected_bundle_id:
+canonical_approved_scope:
+approver_id:
+max_executions:
+claimed_execution_slots:
+grant_ids:
+status: live | revoked | expired | exhausted
+```
+
+Grant issuance is idempotent for a `grant_allowance_key`. Duplicate issuance returns or references the existing logical allowance and MUST NOT create execution budget. Replacement or reissued grant records for the same key join the same cumulative `claimed_execution_slots`; a different grant ID, retry, replacement record, serialization, or tool path cannot reset or multiply the allowance. `max_executions` applies to the allowance, not independently to its grant records. Once exhausted, the allowance remains exhausted unless a genuinely new qualifying owner decision creates a different key.
+
+An issued `ApprovalGrant` wraps exactly one scope and MUST also contain `grant_id`, `grant_version`, `grant_allowance_key`, `authorization_state_version`, `decision_id`, `selected_bundle_id`, `portfolio_version`, `capacity_model_version`, `capacity_plan_version`, `issued_at`, and `status`. Its scope, decision, bundle, approver, and `max_executions` MUST exactly reproduce its allowance inputs. It cannot authorize a bundle other than the one selected by its referenced decision and cannot own an independent execution counter.
+
+An effect occurrence is the typed fingerprint plus its `objective_id`, `promise_basis_id`, typed resource claims, attempted execution time, and atomically assigned allowance execution ordinal. For an effect occurrence `e` and scope `s`, `covers(s, e)` is true if and only if all of the following are true:
 
 1. both schemas are supported and every required typed field is present;
 2. `environment_id`, `objective_id`, and `promise_basis_id` exactly match;
 3. the effect schema version, effect type, target type, canonical target ID, and operation are members of their corresponding finite allowed sets;
 4. every material effect parameter and relevant resource claim satisfies its named typed constraint, with no unconstrained material parameter or resource;
 5. the attempted execution time is within the closed validity interval; and
-6. the atomically assigned grant execution ordinal is positive and does not exceed `max_executions`.
+6. the atomically assigned shared allowance execution ordinal is positive and does not exceed `max_executions`.
 
 For two scopes `A` and `B`, `scope_contained(A, B)` is true only when every typed permission represented by `A` is contained by `B`:
 
@@ -289,23 +321,47 @@ For two scopes `A` and `B`, `scope_contained(A, B)` is true only when every type
 
 Unknown types, incomparable constraint forms, extra unconstrained dimensions, or a missing required dimension fail closed. `A` is a **strict subset** of `B` only when `scope_contained(A, B)` is true and at least one set, value domain, range, resource bound, time bound, or execution bound is properly narrower. Different labels do not affect containment.
 
-An effect is **authorized** only when a live grant references the selected decision bundle and approver, its scope covers the effect occurrence, the grant has not been revoked or exhausted, and no active denial matches. A broad textual approval, agent claim, or similar prior action is not coverage.
+An effect is **authorized** only when a live grant references the selected decision bundle and approver, its scope covers the effect occurrence, its shared allowance is live and unexhausted, and no active denial blocks it under Section 5.4. A broad textual approval, agent claim, or similar prior action is not coverage.
 
 Core safety invariant:
 
 > No path to a consequential external effect may execute without crossing a live approval grant whose typed bounded scope covers that exact effect occurrence and whose selected action bundle remains admission-feasible.
 
-Before any consequential effect, the authoritative authorization ledger MUST atomically claim one grant execution slot. The indivisible claim operation receives a stable `execution_attempt_id`, the exact effect occurrence, and expected grant, authorization-state, portfolio, capacity-model, and capacity-plan versions. In the same fail-closed operation it MUST:
+Before any consequential effect, the authoritative authorization ledger MUST atomically claim one execution slot from the grant's shared allowance. The indivisible claim operation receives a stable `execution_attempt_id`, the exact effect occurrence, `grant_allowance_key`, and expected grant, authorization-state, portfolio, capacity-model, and capacity-plan versions. In the same fail-closed operation it MUST:
 
 1. compare every expected version with current authoritative state;
-2. validate that the grant is live, unrevoked, unexpired, and bound to the selected decision bundle;
-3. recompute scope coverage and active-denial matching;
-4. recompute that the selected bundle remains admission-feasible; and
-5. allocate one previously unclaimed execution ordinal not greater than `max_executions` and bind it permanently to `execution_attempt_id`.
+2. validate that the grant and its keyed allowance are live, unrevoked, unexpired, mutually consistent, and bound to the selected decision bundle and approver;
+3. recompute scope coverage and active-denial matching, including any qualifying scoped exception;
+4. recompute that the selected bundle remains admission-feasible together with every existing fixed in-flight reservation;
+5. allocate one previously unclaimed ordinal from the shared allowance, not greater than its `max_executions`, and bind it permanently to `execution_attempt_id`; and
+6. durably create the fixed in-flight reservation defined below before reporting claim success.
 
-The claim is the authorization linearization point: claim and revocation serialize, only a successful claimant may invoke the controlled effect, and concurrent or repeated attempts cannot consume the same slot. Failure of any validation creates no claim and permits no effect. The controlled executor MUST validate the resulting claim before mutation.
+The claim is the authorization linearization point: claim, allowance exhaustion, revocation, and denial transitions serialize; only a successful claimant may invoke the controlled effect; and concurrent or repeated attempts cannot consume the same shared slot. The shared allowance update and in-flight-reservation creation are one atomic authorization-state transition and advance `authorization_state_version`. Failure of any validation creates neither a claim nor a reservation and permits no effect. The controlled executor MUST validate the resulting claim before mutation.
 
-Every consequential attempt MUST use its `execution_attempt_id` as the idempotency key across the slot claim, controlled MCP call, read-back, and receipt. Replaying the same ID with the same canonical effect and grant returns the already recorded claim and result; it MUST NOT claim another slot or repeat the consequential effect. Reuse of that ID with a different grant, effect, or material payload fails closed. A different ID cannot take a slot already bound to another attempt.
+Every successful claim MUST create this durable `InFlightExecutionReservation` before success is visible:
+
+```yaml
+execution_attempt_id:
+grant_allowance_key:
+grant_id:
+canonical_normalized_effect:
+affected_obligation_ids:
+affected_resource_ids:
+resource_capacity_claims:
+selected_bundle_id:
+selected_plan_id:
+claim_state: claimed_nonterminal | terminal_verified | terminal_failed_before_mutation | terminal_reconciled
+expected_effect:
+expected_after_state:
+created_at:
+terminal_addenda:
+```
+
+A `claimed_nonterminal` reservation is a fixed admission input. Every later admission evaluation and replan MUST carry it unchanged into each candidate, count its resource claims exactly once, preserve its selected effect, bundle, branch, schedule, affected obligations, and expected postcondition, and reject any candidate incompatible with them. If a claim is already represented by an accepted-portfolio reservation, the kernel locks and counts that reservation once rather than adding a duplicate; it MUST NOT make the capacity available to another promise.
+
+The reservation remains binding until a durable terminal transition under Section 7.5. Verification `mismatch` or `unavailable` does not silently release it; release requires an additive reconciliation that establishes the authoritative realized state, or a durable `terminal_failed_before_mutation` fact proving that no external mutation occurred. Terminalization removes only the in-flight overlay: any realized effect and actual resource consumption remain represented by authoritative portfolio, capacity, and receipt state. Reservation creation, material correction, terminalization, or release is append-only, auditable, and advances `authorization_state_version`. An unresolved claim is never deleted or forgotten.
+
+Every consequential attempt MUST use its `execution_attempt_id` as the idempotency key across the shared-allowance slot claim, in-flight reservation, controlled MCP call, read-back, and receipt. Replaying the same ID with the same canonical effect and grant returns the already recorded claim and result; it MUST NOT claim another slot or repeat the consequential effect. Reuse of that ID with a different grant, effect, or material payload fails closed. A different ID cannot take a shared allowance slot already bound to another attempt.
 
 ### 5.3 Meaningful decisions and mutually exclusive branches
 
@@ -360,6 +416,22 @@ status: active | superseded | mission_closed
 
 The originally denied full fingerprint and scope are both required and remain immutable audit and representation-identity anchors. `denied_scope` is the complete rejected typed scope used for owner display and strict-subset checks. `denied_scope_predicate` is its canonical effect-relevant projection with exactly the fields shown above, and its `objective_id` MUST equal the outer denial `objective_id`. Construction of the predicate MUST deterministically normalize every supported effect-schema representation admitted by the denied scope into its canonical effect class; raw effect-schema versions are retained in the original scope and fingerprint for audit, not copied into the matching predicate. Denial record identity is the tuple of the original stable full fingerprint and canonical denied-scope predicate; future denial matching is determined by the predicate, not equality with the anchor fingerprint. A malformed or non-normalizable denial cannot be created; if malformed active denial data is encountered, authorization for its objective fails closed until authoritative state is repaired.
 
+A valid owner-approved strict-subset re-request creates a separate scoped exception:
+
+```yaml
+denial_exception_id:
+parent_denial_id:
+owner_decision_id:
+grant_allowance_key:
+approved_canonical_effect_classes: []
+approved_effect_schema_versions: []
+approved_scope:
+created_at:
+status: active | revoked | expired | exhausted | mission_closed
+```
+
+At creation, `approved_scope` MUST be the exact scope approved by `owner_decision_id`, MUST be a strict subset of the parent `denied_scope` under Section 5.2, and MUST exactly match the `canonical_approved_scope` of the new decision's `GrantAllowance`. The canonical class and raw supported-schema sets are explicit, finite, nonempty, and derived deterministically from that approved scope. Missing links, mismatched allowance inputs, or uncertain normalization fail closed and create no exception.
+
 Before denial matching, FlakeBrake MUST normalize the attempted supported representation through the declared deterministic canonicalization rules. For any active denial in the same environment and objective, if FlakeBrake cannot establish whether the attempted representation has the denied canonical effect identity, consequential authorization fails closed; it MUST NOT classify the uncertain representation as non-matching.
 
 There is one denial-match rule. An active denial matches a canonically normalized attempted effect if and only if:
@@ -370,16 +442,27 @@ There is one denial-match rule. An active denial matches a canonically normalize
 
 Full-fingerprint equality and raw effect-schema-version equality are not match conditions. Material parameters are tested through the typed denied-scope predicate. Therefore, if supported schema versions V1 and V2 normalize to the same canonical effect class, target, and operation, an in-scope effect represented by either version matches even when its full fingerprint differs. A genuinely different canonical effect class does not match merely because a parameter value overlaps.
 
-This matcher does not call `covers` and does not compare `promise_basis_id`, approver, approval-validity interval, or grant execution count; denial lifetime is governed only by the rule below. Action names, tool or MCP names, labels, plan-node names, raw schema versions, and serialization choices are non-authoritative for denial matching. Renaming an action, selecting an alternate tool, or submitting an equivalent supported schema representation cannot evade a matching denial.
+This matcher does not call `covers` and does not compare `promise_basis_id`, approver, approval-validity interval, or shared-allowance execution count; denial lifetime is governed only by the rule below. Action names, tool or MCP names, labels, plan-node names, raw schema versions, and serialization choices are non-authoritative for denial matching. Renaming an action, selecting an alternate tool, or submitting an equivalent supported schema representation cannot evade a matching denial.
 
-In v0.1 a denial remains active through graph rewrites, renamed actions, alternate agents, alternate MCPs or tools, session reconnects, and portfolio replans. Time passage alone does not expire it. It ends only when the mission is closed or the owner explicitly supersedes it through a valid re-request decision. The old denial record remains immutable.
+A matching active parent denial blocks authorization unless one active scoped exception satisfies every condition below for the exact attempted effect occurrence:
+
+1. its `parent_denial_id` references that denial and its `owner_decision_id` references the new explicit owner approval;
+2. the attempted canonical effect class and supported raw representation belong to the exception's declared class and schema sets;
+3. `covers(exception.approved_scope, effect_occurrence)` is true, so every material parameter, resource claim, target, operation, time, and execution bound is inside the approved strict subset; and
+4. the live grant used for the attempt references the exception's exact `grant_allowance_key` and otherwise authorizes the effect under Section 5.2.
+
+The exception permits only that new allowance; a grant that predated the denial or is linked to another allowance remains blocked even if its scope would cover the effect. An effect that matches the parent but falls outside every active qualifying exception remains denied and fails closed. For example, a parent denial over quantity `[1,100]` plus an active approved exception over `[1,10]` still denies quantity `90`.
+
+In v0.1 a denial remains active through graph rewrites, renamed actions, alternate agents, alternate MCPs or tools, session reconnects, and portfolio replans. Time passage alone does not expire it. It ends only when the mission is closed or the owner explicitly supersedes it after a valid materially-new-basis re-request. A strict-subset approval never changes the parent denial's active status. The old denial and every exception record remain immutable.
 
 A re-request MUST reference the prior `denial_id`, declare its change class, and pass one of these deterministic conditions:
 
 - **narrower scope:** `scope_contained(requested_scope, denied_scope)` is true under Section 5.2 and at least one typed permission dimension is properly narrower; or
 - **materially new basis:** new post-denial evidence or a changed precondition alters at least one domain field predeclared as material in the Promise Basis schema, and the domain verifier validates the new evidence receipt.
 
-A renamed action, alternate tool, changed plan node, different full fingerprint, equivalent raw schema version or serialization, or material-parameter change that remains inside the denied scope is neither a bypass nor a material change for re-request. New prose rationale or repeated identical evidence is also insufficient. Until the owner explicitly approves a valid re-request, the denial continues to block matching approval requests and execution. Supersession is recorded by an append-only event linked to both the denial and the new decision.
+A renamed action, alternate tool, changed plan node, different full fingerprint, equivalent raw schema version or serialization, or material-parameter change that remains inside the denied scope is neither a bypass nor a material change for re-request. New prose rationale or repeated identical evidence is also insufficient. Until the owner explicitly approves a valid re-request, the denial continues to block matching approval requests and execution.
+
+Approval of a narrower-scope path creates only the scoped exception above; it does not supersede the parent. Revocation, expiry, exhaustion, or mission closure of an exception removes only that exception and never removes or shortens the parent denial. Approval of a materially-new-basis path MAY explicitly supersede the parent denial; that supersession is an append-only event linked to the denial, new evidence, and new owner decision. Every exception creation or terminal transition and every parent supersession advances `authorization_state_version`.
 
 ## 6. Deterministic admission kernel
 
@@ -389,13 +472,16 @@ The deterministic kernel receives:
 
 - the proposal and selected `portfolio_version`;
 - the `capacity_model_version` and `capacity_plan_version`;
-- the `authorization_state_version` and the active grants and denials at that version;
+- the `authorization_state_version` and the active grants, grant allowances, denials, scoped exceptions, and in-flight execution reservations at that version;
 - the complete accepted portfolio and reservations;
 - typed action graphs, effects, dependencies, and complete branch records with selectors and exclusivity linkage;
 - proposed decisions and approval scopes;
-- evidence receipts and comparable immutable admission history.
+- evidence receipts and comparable immutable admission history; and
+- the reproducible `calibration_frontier_provenance` and `calibration_frontier_digest` derived from that history.
 
 It independently validates schemas and recomputes the portfolio schedule, resource demand, protected slack, meaningful-decision frontier, effect equivalence, scope coverage, and denial matches. LLM judgment can propose inputs but cannot declare feasibility, safety, coverage, equivalence, or authorization.
+
+Every successfully claimed nonterminal in-flight reservation is a fixed kernel input. Direct admission, every `REPLAN` candidate, and every `ADMITTABLE` result MUST preserve its exact effect, affected obligations, branch and schedule commitments, expected postcondition, and resource claims. Those claims count once against capacity and cannot be reassigned to the proposal or another obligation.
 
 During admission, coverage analysis proves that the proposed decision frontier and scopes can cover every consequential path and includes those decisions in predicted human demand; a proposed scope is not a grant. During execution, only issued live grants count as authorization.
 
@@ -415,7 +501,7 @@ Every evaluation emits exactly one immutable AdmissionRecord as specified in Sec
 
 ### 6.3 `ADMITTABLE`
 
-`ADMITTABLE` means the proposal can fit under the exact declared versions and assumptions. It is valid only for the complete immutable evaluated state tuple `(portfolio_version, capacity_model_version, capacity_plan_version, authorization_state_version)`. It does not accept the promise and does not authorize execution.
+`ADMITTABLE` means the proposal can fit under the exact declared versions, calibration frontier, and assumptions. It is valid only for the complete immutable evaluated basis: state tuple `(portfolio_version, capacity_model_version, capacity_plan_version, authorization_state_version)` plus `calibration_frontier_digest`. It does not accept the promise and does not authorize execution.
 
 Every `ADMITTABLE` result MUST declare:
 
@@ -423,6 +509,7 @@ Every `ADMITTABLE` result MUST declare:
 - capacity-model version, also emitted as `expected_capacity_model_version` for acceptance;
 - capacity-plan version, also emitted as `expected_capacity_plan_version` for acceptance;
 - authorization-state version, also emitted as `expected_authorization_state_version` for acceptance;
+- calibration-frontier digest, also emitted as `expected_calibration_frontier_digest` for acceptance, with reproducible provenance;
 - every relevant capacity constraint;
 - all feasibility and estimator assumptions;
 - capacity before admission, by resource;
@@ -433,18 +520,21 @@ Every `ADMITTABLE` result MUST declare:
 - the complete domain-specific Promise Basis; and
 - the explicit owner choices **ACCEPT PROMISE**, **MODIFY**, and **DECLINE**.
 
-An `ACCEPT PROMISE` request MUST carry `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, and `expected_authorization_state_version` from the selected `ADMITTABLE` AdmissionRecord. Portfolio activation uses one atomic compare-and-swap/precondition operation. Acceptance succeeds only if all four equal current authoritative state:
+An `ACCEPT PROMISE` request MUST carry `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, `expected_authorization_state_version`, and `expected_calibration_frontier_digest` from the selected `ADMITTABLE` AdmissionRecord. Portfolio activation uses one atomic compare-and-swap/precondition operation. Acceptance succeeds only if all four versions match current authoritative state and the expected digest equals a deterministic recomputation of the currently required calibration frontier:
 
 ```text
 expected_portfolio_version      == current_portfolio_version
 expected_capacity_model_version == current_capacity_model_version
 expected_capacity_plan_version  == current_capacity_plan_version
 expected_authorization_state_version == current_authorization_state_version
+expected_calibration_frontier_digest == recompute_current_calibration_frontier_digest()
 ```
 
-The same operation validates that every specifically approved bounded modification remains applicable and writes the resulting portfolio as one new version. If any version comparison or validation fails, FlakeBrake fails closed, performs no portfolio mutation, preserves the prior AdmissionRecord without rewriting it, appends a stale/superseded acceptance result, and reruns admission against the current portfolio, capacity model, capacity plan, and authorization state. Any concurrent change to one component of the evaluated state tuple therefore prevents the stale admission from committing.
+The digest recomputation MUST use the exact selection rule in Section 3.3 and compare all record identities, calibration-relevant actual/outcome facts, and calibration-rule/version inputs committed by the stored provenance. The same atomic operation validates that every current nonterminal in-flight reservation is present unchanged and compatible with the selected plan, validates that every specifically approved bounded modification remains applicable, and writes the resulting portfolio as one new version.
 
-This acceptance precondition prevents a promise from committing against already-stale authorization assumptions. It does not issue a grant and does not replace the execution-time authorization recomputation, version validation, denial matching, or atomic grant-slot claim required by Sections 5.2 and 7.2.
+If any version comparison, calibration-frontier comparison, fixed-reservation validation, or modification validation fails, FlakeBrake fails closed, performs no portfolio mutation, preserves the prior AdmissionRecord without rewriting it, appends a stale/superseded acceptance result, and reruns admission against the current portfolio, capacity model, capacity plan, authorization state, and calibration frontier. Any concurrent change to a protected state component or mandatory calibration input therefore prevents the stale admission from committing.
+
+These acceptance preconditions prevent a promise from committing against already-stale feasibility, calibration, or authorization assumptions. They do not issue a grant and do not replace the execution-time authorization recomputation, version validation, denial matching, shared-allowance slot claim, or in-flight reservation required by Sections 5.2 and 7.2.
 
 On a successful compare-and-swap, `ACCEPT PROMISE` creates one new portfolio version containing the promise and only those modifications to existing obligations that received explicit conforming owner decisions. `MODIFY` creates a new proposal and reruns evaluation. `DECLINE` records the owner's choice without adding the promise; it is not a kernel `REJECT`.
 
@@ -452,7 +542,7 @@ The predicted human consumption includes the pending owner choice and any separa
 
 ### 6.4 `REPLAN`
 
-`REPLAN` evaluates the entire accepted portfolio plus the proposal. It MUST always evaluate both strategy families, recording infeasibility reasons when a family has no constructible candidate:
+`REPLAN` evaluates the entire accepted portfolio plus the proposal while treating every nonterminal in-flight execution reservation as fixed. It MUST always evaluate both strategy families, recording infeasibility reasons when a family has no constructible candidate:
 
 1. modify the new proposal's quantity, deadline, service level, action structure, or resource demand within declared bounds; and
 2. modify one or more existing non-protected `important` or `best_effort` obligations within their declared modification policies.
@@ -462,10 +552,11 @@ Portfolio-wide replanning is required and MUST NOT be simplified to changing onl
 1. `protected` is false and `criticality` is not `protected`;
 2. its declared `modification_policy` names every changed field and the proposed value is within that field's allowed bounds;
 3. every resulting service dimension remains at or above `minimum_service`;
-4. its exact rational `obligation_service_loss` from Section 4.1 is included in the criticality-weighted degradation objective; and
-5. the owner explicitly approves the specific old-to-new field changes before the compare-and-swap activates the new portfolio version.
+4. its exact rational `obligation_service_loss` from Section 4.1 is included in the criticality-weighted degradation objective;
+5. the owner explicitly approves the specific old-to-new field changes before the compare-and-swap activates the new portfolio version; and
+6. the changes preserve every nonterminal in-flight reservation affecting the obligation, its resources, schedule, selected branch, effect, or expected postcondition.
 
-Protected obligations cannot be degraded by the permitted v0.1 search. Accepted promises are never rewritten by search or recommendation. A missing policy, unspecified bound, below-floor result, or unapproved field change makes that candidate infeasible.
+Protected obligations cannot be degraded by the permitted v0.1 search. Accepted promises are never rewritten by search or recommendation. A missing policy, unspecified bound, below-floor result, unapproved field change, or conflict with a nonterminal in-flight reservation makes that candidate infeasible.
 
 A replan is structurally different only if it changes at least one obligation term, resource allocation, effect set, dependency, enforced branch, or all-or-none execution boundary. Renaming actions, changing tools, reformatting prompts, or summarizing the same approvals is not structural change.
 
@@ -479,7 +570,7 @@ Feasible candidates are ordered lexicographically, not by a blended opaque score
 
 Candidates tied on all five criteria use stable candidate-plan ID order. If added-capacity choices lack a declared comparable cost, the kernel reports the nondominated alternatives and does not invent a scalar cost. Any capacity increase remains hypothetical until owner approval creates a new capacity-plan version and admission is rerun.
 
-The `REPLAN` result MUST show the direct-plan failure, candidates from both required strategy families, the selected recommendation, complete portfolio diffs, resource before/after values, protected slack, decision requirements, and all assumptions. Selecting a replan does not itself mutate the portfolio.
+The `REPLAN` result MUST show the direct-plan failure, candidates from both required strategy families, the selected recommendation, complete portfolio diffs, fixed in-flight reservation IDs and constraints, resource before/after values, protected slack, decision requirements, and all assumptions. Selecting a replan does not itself mutate the portfolio.
 
 ### 6.5 `REJECT` and capacity-expansion sensitivity
 
@@ -503,13 +594,13 @@ Admission feasibility is necessary but never sufficient for consequential execut
 
 ### 7.1 Typed effects and scoped grants
 
-Every consequential effect has the stable typed fingerprint in Section 5.1. Every grant has the typed bounded scope in Section 5.2. The exact effect occurrence MUST be covered by a live grant, and its execution attempt MUST own the atomically claimed grant slot before controlled execution begins.
+Every consequential effect has the stable typed fingerprint in Section 5.1. Every grant has the typed bounded scope and shared logical allowance in Section 5.2. The exact effect occurrence MUST be covered by a live grant, its execution attempt MUST own the atomically claimed shared-allowance slot, and its durable in-flight reservation MUST exist before controlled execution begins.
 
 ### 7.2 Deterministic portfolio and effect recomputation
 
-Immediately before execution, deterministic code MUST recompute portfolio feasibility, capacity remaining, protected slack, the selected bundle, effect identity, scope coverage, and active-denial matches from authoritative state. This final recomputation and the execution-slot claim MUST occur in the same atomic fail-closed operation defined in Section 5.2; a separate check followed by a later claim is insufficient. Agent-supplied `safe`, `covered`, `equivalent`, or similar claims cannot substitute for recomputation.
+Immediately before execution, deterministic code MUST recompute portfolio feasibility, capacity remaining, protected slack, fixed in-flight reservations, the selected bundle, effect identity, scope coverage, shared-allowance state, and active-denial and scoped-exception matches from authoritative state. This final recomputation, shared-slot claim, and in-flight-reservation creation MUST occur in the same atomic fail-closed operation defined in Section 5.2; a separate check followed by a later claim is insufficient. Agent-supplied `safe`, `covered`, `equivalent`, or similar claims cannot substitute for recomputation.
 
-If the portfolio, capacity model, capacity plan, authorization state (including grants and denials), Promise Basis, evidence, or expected effect has materially changed since admission, execution pauses and admission reruns against current versions. This execution-time rule remains required even when the acceptance precondition in Section 6.3 succeeded.
+If the portfolio, capacity model, capacity plan, authorization state (including grants, allowances, denials, scoped exceptions, and in-flight reservations), Promise Basis, evidence, or expected effect has materially changed since admission, execution pauses and admission reruns against current versions. This execution-time rule remains required even when the acceptance preconditions in Section 6.3 succeeded.
 
 ### 7.3 Domain-specific pre-approval Promise Basis
 
@@ -517,11 +608,12 @@ Every proposed promise and consequential portfolio change presented for approval
 
 - proposed order quantity, service level, beneficiary, and deadline;
 - evaluated portfolio, capacity-model, capacity-plan, and authorization-state versions together with `expected_portfolio_version`, `expected_capacity_model_version`, `expected_capacity_plan_version`, and `expected_authorization_state_version` acceptance preconditions;
+- `calibration_frontier_digest`, `expected_calibration_frontier_digest`, and the complete reproducible calibration-frontier provenance;
 - resource capacity before, predicted consumption, capacity after, and calibration corrections;
 - assumptions and evidence receipts, including deterministic schedule/simulation results;
 - every affected accepted obligation, its modification policy and minimum-service floor, each exact proposed term change, and normalized degradation;
 - protected obligations and their post-plan slack;
-- consequential effect fingerprints, proposed scopes, decision bundles, branch guards and exclusivity proofs, and active denials;
+- consequential effect fingerprints, proposed scopes, decision bundles, grant allowance identities, branch guards and exclusivity proofs, active denials and scoped exceptions, and fixed in-flight reservations;
 - binding or limiting resources; and
 - authorized expected post-execution state and verification method.
 
@@ -529,7 +621,7 @@ The Promise Basis is computed from authoritative portfolio, ledger, and syntheti
 
 ### 7.4 Denial-resistant replanning
 
-Every replan and pre-execution check MUST include active `DenialConstraint` records. Matching effects remain blocked across renamed actions, graph changes, alternate tools, and alternate agents unless the re-request and explicit supersession rules in Section 5.4 are satisfied.
+Every replan and pre-execution check MUST include active `DenialConstraint` and scoped-exception records. Matching effects remain blocked across renamed actions, graph changes, alternate tools, and alternate agents unless an exact active scoped exception or the materially-new-basis supersession rule in Section 5.4 applies. A narrower exception never disables its parent outside the approved strict subset.
 
 ### 7.5 Post-execution verification and durable receipt
 
@@ -545,6 +637,7 @@ portfolio_version:
 effect_fingerprint:
 decision_id:
 grant_id:
+grant_allowance_key:
 grant_execution_ordinal:
 before_state_ref:
 expected_after_state:
@@ -555,9 +648,9 @@ evidence_refs:
 recorded_at:
 ```
 
-The controlled mutation service MUST durably bind `execution_attempt_id` to the claimed grant ordinal and mutation result before acknowledging the write. A retry or duplicate delivery with the same ID returns that recorded result and receipt identity without repeating the effect; a different ID cannot reuse the ordinal. If a response is lost, FlakeBrake recovers the prior result by attempt ID and completes read-back rather than issuing a new mutation.
+`grant_execution_ordinal` is the ordinal from the shared `GrantAllowance`, not a per-record counter. The controlled mutation service MUST durably bind `execution_attempt_id` to that allowance ordinal and mutation result before acknowledging the write. A retry or duplicate delivery with the same ID returns that recorded result and receipt identity without repeating the effect; a different ID cannot reuse the ordinal. If a response is lost, FlakeBrake recovers the prior result by attempt ID and completes read-back rather than issuing a new mutation.
 
-Only `verified` may be reported as completed. `mismatch` or `unavailable` records the observed result, keeps the promise outcome open or failed as appropriate, and triggers safe replanning or escalation; it MUST NOT be relabeled as success.
+Only `verified` may be reported as completed. A durable verified receipt appends the reservation's `terminal_verified` transition; authoritative realized effects and consumption continue to count after the in-flight overlay ends. `mismatch` or `unavailable` records the observed result, keeps the promise outcome and reservation nonterminal as appropriate, and triggers safe replanning or escalation; it MUST NOT be relabeled as success or release capacity. If authoritative execution evidence proves no external mutation occurred, FlakeBrake MAY append `terminal_failed_before_mutation` and release only the in-flight reservation. Every terminal transition and release is additive, auditable, and advances `authorization_state_version`.
 
 Broader certificate frameworks, generalized change taxonomies, hash chains, and similar assurance expansion are outside v0.1 unless every required core capability is already complete and reliable.
 
@@ -576,6 +669,10 @@ capacity_plan_version:
 expected_capacity_plan_version:
 authorization_state_version:
 expected_authorization_state_version:
+calibration_frontier_digest:
+expected_calibration_frontier_digest:
+calibration_frontier_provenance:
+fixed_in_flight_execution_reservations:
 proposal:
 candidate_plans:
 selected_plan:
@@ -592,9 +689,9 @@ outcome:
 additive_corrections:
 ```
 
-`decision` is the kernel result; `owner_choice` is the later human response; and `outcome` is the eventual operational result. For `ADMITTABLE`, each `expected_*_version` equals its corresponding evaluated version; for other outcomes each is `NOT_APPLICABLE`. At evaluation time, unavailable later facts use explicit sentinel values such as `PENDING_OWNER_CHOICE` and `NOT_YET_KNOWN`; `selected_plan` uses `NO_FEASIBLE_PLAN` for a rejection. Fields are never omitted. Owner choices, compare-and-swap results, stale/superseded markers, execution-attempt IDs, actual consumption, verification outcomes, corrected evidence, and supersession facts are appended as immutable addenda with their own IDs, timestamps, source receipts, and reference to `record_id`. A materialized view MAY project the base record plus addenda, but it MUST preserve and expose every prior value. No record, prediction, candidate, decision, denial, or outcome may be silently rewritten or deleted.
+`decision` is the kernel result; `owner_choice` is the later human response; and `outcome` is the eventual operational result. Every evaluation records the digest and complete provenance of the calibration frontier it used. For `ADMITTABLE`, each `expected_*_version` equals its corresponding evaluated version and `expected_calibration_frontier_digest` equals `calibration_frontier_digest`; for other outcomes the expected precondition fields are `NOT_APPLICABLE`. `fixed_in_flight_execution_reservations` lists the stable IDs and committed constraints of every nonterminal reservation treated as fixed by that evaluation, or an explicit empty list. At evaluation time, unavailable later facts use explicit sentinel values such as `PENDING_OWNER_CHOICE` and `NOT_YET_KNOWN`; `selected_plan` uses `NO_FEASIBLE_PLAN` for a rejection. Fields are never omitted. Owner choices, compare-and-swap results, stale/superseded markers, execution-attempt IDs, in-flight reservation transitions, actual consumption, verification outcomes, corrected evidence, scoped denial exceptions, and supersession facts are appended as immutable addenda with their own IDs, timestamps, source receipts, and reference to `record_id`. A materialized view MAY project the base record plus addenda, but it MUST preserve and expose every prior value. No record, prediction, candidate, decision, denial, exception, grant allowance, in-flight reservation, or outcome may be silently rewritten or deleted.
 
-Calibration reads only transparent prior records and their addenda under Section 3.3. It MUST preserve predicted versus actual demand and the exact additive correction used for each later estimate. Recurring binding-resource counts MAY inform the targeted expansion analysis in Section 6.5, but historical correlation is not a fulfillment guarantee.
+Calibration reads only transparent prior records and their addenda under Section 3.3. It MUST preserve predicted versus actual demand, the exact additive correction used for each later estimate, and the reproducible frontier provenance and digest. New history creates a new current frontier; it never mutates a prior digest or its source facts. Recurring binding-resource counts MAY inform the targeted expansion analysis in Section 6.5, but historical correlation is not a fulfillment guarantee.
 
 ## 9. Synthetic microfactory environment and TrueForge
 
@@ -605,7 +702,7 @@ The demo MUST genuinely use at least three MCP servers. The selected environment
 - **factory-orders** — read accepted orders, service levels, deadlines, and immutable portfolio versions;
 - **factory-capacity** — read human, agent, and production-cell capacity plans plus actual consumption;
 - **factory-simulator** — deterministically evaluate candidate schedules and return evidence receipts without external mutation;
-- **factory-change-control** — atomically validate the claimed grant slot, idempotently create the explicitly approved synthetic schedule reservation or change request by `execution_attempt_id`, return any previously recorded result for a replay, and read state back.
+- **factory-change-control** — atomically validate the claimed shared-allowance slot and durable in-flight reservation, idempotently create the explicitly approved synthetic schedule reservation or change request by `execution_attempt_id`, return any previously recorded result for a replay, and read state back.
 
 The final approved action changes real state in the owned synthetic environment only. No real factory or production integration is required or permitted for v0.1.
 
@@ -628,7 +725,7 @@ Each subagent returns findings, evidence references, proposed actions, dependenc
 - sandboxed Code Mode or generated-code execution for meaningful analysis;
 - human approval pauses;
 - persisted session state; and
-- reconnect/resume behavior that preserves the mission, portfolio, graph, evidence, AdmissionRecords, grants, and denials.
+- reconnect/resume behavior that preserves the mission, portfolio, graph, evidence, AdmissionRecords, grants, shared allowances, denials, scoped exceptions, and in-flight execution reservations.
 
 FlakeBrake MUST use rather than recreate these harness functions.
 
@@ -718,8 +815,9 @@ FlakeBrake v0.1 is not complete unless all of the following pass:
 
 - [ ] The microfactory rush-order mission starts with a versioned portfolio containing protected, important, and best-effort accepted obligations.
 - [ ] The deterministic direct plan exceeds both a declared human-review constraint and a declared agent-work constraint.
-- [ ] `ADMITTABLE` contains every required version, constraint, assumption, before/consumed/after value, protected slack, limiting resource, Promise Basis, and owner choice; a mismatch in any expected portfolio, capacity-model, capacity-plan, or authorization-state version fails the atomic acceptance precondition without mutation, appends a stale/superseded result, and triggers readmission.
-- [ ] `REPLAN` evaluates and displays both modification strategy families; every proposed accepted-obligation change is non-protected, policy-bounded, at or above its minimum-service floor, scored as degradation, and specifically owner-approved before activation.
+- [ ] `ADMITTABLE` contains every required version, calibration-frontier digest and provenance, constraint, assumption, before/consumed/after value, protected slack, limiting resource, Promise Basis, and owner choice; a mismatch in any expected portfolio, capacity-model, capacity-plan, or authorization-state version or in `expected_calibration_frontier_digest` fails the atomic acceptance precondition without mutation, appends a stale/superseded result, and triggers readmission.
+- [ ] A newly completed comparable outcome or changed calibration-relevant addendum between evaluation and acceptance changes the recomputed frontier digest and blocks the stale acceptance.
+- [ ] `REPLAN` evaluates and displays both modification strategy families; every proposed accepted-obligation change is non-protected, policy-bounded, at or above its minimum-service floor, scored as degradation, specifically owner-approved before activation, and compatible with all fixed nonterminal in-flight reservations.
 - [ ] Mechanical tests verify the exact lexicographic recommendation order and structural-difference rule.
 - [ ] `REJECT` occurs only after direct and replan failure and reports Pareto-minimal targeted changes where calculable.
 - [ ] Owner-approved capacity expansion creates a new capacity-plan version and a fresh admission evaluation.
@@ -727,17 +825,22 @@ FlakeBrake v0.1 is not complete unless all of the following pass:
 - [ ] Scope coverage and scope-to-scope containment fail closed for every missing, unknown, expired, exhausted, incomparable, or out-of-bounds field; strict-subset tests exercise sets, values, ranges, resources, time, and execution count.
 - [ ] Mechanical tests prevent unrelated effects from sharing a decision and grant exclusive accounting only to branch records with stable IDs, disjoint guards, shared exclusivity linkage, and complete downstream links.
 - [ ] The canonical typed denied-scope predicate blocks in-scope material-parameter variants, renamed actions, alternate tools, changed plan nodes, and equivalent supported schema representations without requiring full-fingerprint or raw-schema-version equality, while genuinely different canonical effect classes remain distinct and uncertain equivalence fails closed.
+- [ ] A strict-subset denial approval creates only a linked scoped exception: for a parent denial `[1,100]` and exception `[1,10]`, quantity `90` remains blocked, and expiry, revocation, or exhaustion of the exception leaves the parent active.
 - [ ] Portfolio feasibility, decision demand, effect coverage, and denial matches are recomputed by deterministic code.
-- [ ] Concurrent or repeated execution attempts cannot claim the same grant ordinal; validation, version checks, and slot claim are one atomic fail-closed operation.
+- [ ] Duplicate or replacement grant records from one owner decision, selected bundle, canonical scope, and approver resolve to one `grant_allowance_key`, share one cumulative `max_executions`, and cannot reset or multiply execution budget.
+- [ ] Concurrent or repeated execution attempts cannot claim the same shared allowance ordinal; validation, version checks, slot claim, and durable in-flight-reservation creation are one atomic fail-closed operation.
 - [ ] Duplicate delivery of one `execution_attempt_id` returns the recorded result without repeating the consequential effect or creating a second logical receipt.
-- [ ] Every outcome creates an immutable AdmissionRecord; later owner choices, actuals, outcomes, and corrections are append-only.
-- [ ] Calibration is transparent, preserves predicted and actual demand, and uses only declared bases plus comparable observed history.
+- [ ] Every successfully claimed nonterminal attempt is a fixed input to later `ADMITTABLE`, `REPLAN`, and `ACCEPT PROMISE` calculations; its effect, affected obligations, branch and schedule commitments, expected state, and resource capacity cannot be invalidated or reassigned.
+- [ ] Creating, materially correcting, terminalizing, or releasing an in-flight reservation advances `authorization_state_version`; unresolved claims survive reconnect and are never silently removed.
+- [ ] Every outcome creates an immutable AdmissionRecord; later owner choices, actuals, outcomes, calibration facts, scoped exceptions, allowance facts, and in-flight reservation transitions are append-only.
+- [ ] Calibration is transparent, preserves predicted and actual demand, uses only declared bases plus comparable observed history, and records a reproducible frontier digest and provenance.
 - [ ] Every approval displays a complete microfactory Promise Basis.
 - [ ] No consequential path executes without an exact live scoped grant, and uncovered consequential paths equal zero.
 - [ ] The final consequential action waits for explicit TrueForge approval, changes controlled synthetic state, is read back, and has a durable verified receipt before completion is reported.
 - [ ] The mission uses a TrueForge root agent, at least three visible subagent threads, at least three genuine MCP servers, and meaningful sandbox execution.
-- [ ] Refresh/reconnect preserves the mission, portfolio, graph, evidence, records, grants, and denial constraints.
+- [ ] Refresh/reconnect preserves the mission, portfolio, graph, evidence, records, grants, shared allowances, denial constraints and exceptions, and nonterminal in-flight reservations.
 - [ ] The focused UI makes capacity, portfolio diffs, recommendation rationale, owner choices, and history legible.
+- [ ] Mechanical tests replay all four Owner Review 0005 counterexamples and prove that the calibration digest, parent denial, shared allowance, and fixed in-flight reservation respectively block each invalid transition.
 - [ ] Tests include no silent dropped obligations, denial-bypass, record immutability, predicted-versus-actual, and verification-mismatch cases.
 - [ ] Substantive code is merged only after required review and follow-up.
 - [ ] A clean clone reproduces mechanical tests and the complete causal story fits comfortably within three minutes.
@@ -771,7 +874,7 @@ Owner review 0001 changes the center of gravity from a single human-review budge
 
 The specification MUST NOT be locked until the owner can answer yes to all of these:
 
-1. Is every feasibility claim explicitly limited to the declared portfolio, capacity versions, authorization-state version, estimator, evidence, and assumptions?
+1. Is every feasibility claim explicitly limited to the declared portfolio, capacity versions, authorization-state version, calibration frontier, estimator, evidence, and assumptions?
 2. Do simultaneous human and agent capacity constraints materially change the portfolio plan?
 3. Are effects, scopes, meaningful decisions, mutually exclusive branches, and denials mechanically decidable and fail-closed?
 4. Does every outcome preserve immutable predicted-versus-actual history, and does every consequential completion have a verified durable receipt?

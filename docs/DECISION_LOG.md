@@ -1,5 +1,11 @@
 # FlakeBrake Decision Log
 
+## 2026-08-26 — Owner review 0005 closes final state-machine races
+
+**Status:** Accepted as four bounded semantic corrections; no v0.1 scope expansion.
+
+Mandatory calibration history is now commit-protected by a reproducible calibration frontier digest. Narrower denial re-requests create scoped exceptions while the parent denial remains active. Execution allowance is cumulative and idempotent per owner-approved decision, bundle, scope, and approver rather than per grant record. Successfully claimed nonterminal effects become durable fixed admission inputs until terminal resolution.
+
 ## 2026-08-26 — Owner review 0004 closes authorization-state and schema-representation gaps
 
 **Status:** Accepted as two semantic corrections; no v0.1 scope expansion.
