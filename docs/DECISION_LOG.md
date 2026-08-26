@@ -1,5 +1,11 @@
 # FlakeBrake Decision Log
 
+## 2026-08-26 — Owner review 0002 closes execution and replan ambiguities
+
+**Status:** Accepted into specification clarification; no v0.1 scope expansion.
+
+Implementation-oriented review identified ambiguous concurrency, replay/idempotency, denial matching, scope containment, branch accounting, and accepted-obligation modification mechanics. The specification now requires portfolio-version compare-and-swap on acceptance, atomic versioned grant-slot claims, stable idempotent execution-attempt IDs, one canonical fingerprint-plus-scope denial rule, mechanical strict scope containment, explicit branch guards and linkage, and policy-bounded owner-approved portfolio modifications above declared service floors. These rules refine the existing admission and five-part assurance contract; portfolio-wide `REPLAN` remains required.
+
 ## 2026-08-26 — Owner review 0001 incorporated into the v0.1 draft
 
 **Status:** Accepted into specification; owner lock still pending.
