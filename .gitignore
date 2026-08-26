@@ -21,3 +21,6 @@ artifacts/private/
 .DS_Store
 .vscode/
 .idea/
+.agents/skills/qodo-get-rules/
+.agents/skills/qodo-pr-resolver/
+skills-lock.json
