@@ -27,6 +27,7 @@ export interface CreateStoreOptions {
   readonly path: string;
   readonly initialState?: StatefulInitialState;
   readonly now?: () => string;
+  readonly authoritativeFactoryDatabasePath?: string;
 }
 
 export interface AdmissionRequest {
@@ -388,6 +389,68 @@ export interface ExecutionAttemptReadModel {
   readonly createdAt: string;
   readonly input: ClaimExecutionInput;
   readonly result: ExecutionClaimResult;
+}
+
+export interface CreateExecutionFenceInput {
+  readonly executionAttemptId: string;
+  readonly expectedCommandDigest: string;
+  readonly executorAuthority: "factory-change-control/v1";
+  readonly environmentId: string;
+}
+
+export interface ExecutionFenceResultBinding {
+  readonly schemaVersion: "flakebrake-execution-fence-result/v1";
+  readonly fenceId: string;
+  readonly executionAttemptId: string;
+  readonly environmentId: string;
+  readonly receiptId: string;
+  readonly factoryResultDigest: string;
+}
+
+export interface ExecutionFenceReadModel {
+  readonly schemaVersion: "flakebrake-execution-fence/v1";
+  readonly fenceId: string;
+  readonly executionAttemptId: string;
+  readonly reservationId: string;
+  readonly grantAllowanceKey: string;
+  readonly grantExecutionOrdinal: number;
+  readonly admissionRecordId: string;
+  readonly promiseBasisId: string;
+  readonly acceptedOwnerDecisionId: string;
+  readonly grantOwnerDecisionId: string;
+  readonly selectedBundleId: string;
+  readonly selectedPlanId: string;
+  readonly canonicalNormalizedEffect: CanonicalNormalizedEffect;
+  readonly expectedCommandDigest: string;
+  readonly executorAuthority: "factory-change-control/v1";
+  readonly environmentId: string;
+  readonly createdAt: string;
+  readonly createdAuthorizationStateVersion: string;
+  readonly status:
+    | "active"
+    | "factory_result_bound"
+    | "released_without_mutation";
+  readonly resultBinding: ExecutionFenceResultBinding | null;
+}
+
+export interface ExecutionFenceOperationResult<T> {
+  readonly value: T;
+  readonly binding: ExecutionFenceResultBinding;
+}
+
+export interface ExecutionFenceRecoveryResult {
+  readonly executionAttemptId: string;
+  readonly fenceId: string;
+  readonly status: "factory_result_bound" | "terminal_failed_before_mutation";
+  readonly receiptId: string | null;
+  readonly versions: VersionTuple;
+}
+
+export interface AuthoritativeExecutionVerificationResult
+  extends ExecutionTerminalResult {
+  readonly fenceId: string;
+  readonly receiptId: string;
+  readonly actualConsumption: readonly ActualConsumptionValue[];
 }
 
 export interface InFlightExecutionReservation {

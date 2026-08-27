@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   canonicalClone,
@@ -36,6 +36,12 @@ import {
 import { stableTupleId } from "./identity.js";
 import { evaluateAdmission } from "./kernel.js";
 import {
+  claimedExecutionReference,
+  readAuthoritativeFactoryExecution,
+  readAuthoritativeFactoryState,
+} from "./factory-environment.js";
+import type { AuthoritativeFactoryExecutionEvidence } from "./factory-environment.js";
+import {
   canonicalJson,
   inImmediateTransaction,
   openSqlite,
@@ -59,13 +65,19 @@ import type {
   ClaimExecutionInput,
   CreateDenialExceptionInput,
   CreateDenialInput,
+  CreateExecutionFenceInput,
   CreateStoreOptions,
   DenialConstraint,
   DenialExceptionReadModel,
   ExecutionClaimResult,
   ExecutionAttemptReadModel,
+  ExecutionFenceOperationResult,
+  ExecutionFenceReadModel,
+  ExecutionFenceRecoveryResult,
+  ExecutionFenceResultBinding,
   ExecutionTerminalInput,
   ExecutionTerminalResult,
+  AuthoritativeExecutionVerificationResult,
   GrantAllowanceReadModel,
   InFlightExecutionReservation,
   IssueGrantInput,
@@ -151,9 +163,15 @@ interface AdmissionBasisValues {
   readonly calibrationFrontierDigest: string;
 }
 
+type ExecutionFenceBase = Omit<
+  ExecutionFenceReadModel,
+  "status" | "resultBinding"
+>;
+
 export class FlakeBrakeStore {
   readonly #database: SqliteDatabase;
   readonly #now: () => string;
+  readonly #authoritativeFactoryDatabasePath: string | null;
 
   public constructor(options: CreateStoreOptions) {
     if (typeof options.path !== "string" || options.path.length === 0) {
@@ -161,6 +179,19 @@ export class FlakeBrakeStore {
     }
     this.#database = openSqlite(options.path);
     this.#now = options.now ?? (() => new Date().toISOString());
+    this.#authoritativeFactoryDatabasePath =
+      options.authoritativeFactoryDatabasePath ?? null;
+    if (
+      this.#authoritativeFactoryDatabasePath !== null &&
+      (this.#authoritativeFactoryDatabasePath.length === 0 ||
+        this.#authoritativeFactoryDatabasePath === ":memory:")
+    ) {
+      this.#database.close();
+      throw new StatefulInputError(
+        "authoritativeFactoryDatabasePath",
+        "must identify a durable factory SQLite database",
+      );
+    }
     const initialized = this.#database
       .prepare("SELECT 1 AS initialized FROM state_versions WHERE singleton = 1")
       .get() as Record<string, unknown> | undefined;
@@ -210,6 +241,27 @@ export class FlakeBrakeStore {
       const input = this.#buildAdmissionInput(request, null);
       const result = evaluateAdmission(input);
       return this.#insertAdmissionRecord(result);
+    });
+  }
+
+  public evaluateCurrentAdmission(request: AdmissionRequest): {
+    readonly evaluationInput: AdmissionEvaluationInput;
+    readonly result: AdmissionResult;
+  } {
+    return inImmediateTransaction(this.#database, () => {
+      const proposalAlreadyAccepted = this.#readAcceptedObligations().some(
+        (obligation) =>
+          obligation.obligationId === request.proposal.obligationId,
+      );
+      const evaluationInput = this.#buildAdmissionInput(
+        request,
+        null,
+        proposalAlreadyAccepted,
+      );
+      return deepFreeze({
+        evaluationInput,
+        result: evaluateAdmission(evaluationInput),
+      });
     });
   }
 
@@ -1242,17 +1294,386 @@ export class FlakeBrakeStore {
     return deepFreeze(this.#readReservations(includeTerminal));
   }
 
+  public createExecutionFence(
+    inputValue: CreateExecutionFenceInput,
+  ): ExecutionFenceReadModel {
+    const input = canonicalClone<CreateExecutionFenceInput>(inputValue);
+    validateCreateExecutionFenceInput(input);
+    const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
+    return inImmediateTransaction(this.#database, () => {
+      const attempt = this.#executionAttempt(input.executionAttemptId);
+      if (attempt === null) {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must reference an authoritative M2 claimed attempt",
+        );
+      }
+      const existing = this.#executionFenceByAttempt(input.executionAttemptId);
+      if (existing !== null) {
+        assertFenceCreationMatches(existing, input);
+        return deepFreeze(existing);
+      }
+      const reservation = this.#reservationReadModel(
+        this.#reservationByAttempt(input.executionAttemptId),
+      );
+      if (reservation.claimState !== "claimed_nonterminal") {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must retain an exact nonterminal M2 reservation",
+        );
+      }
+      const allowance = this.getGrantAllowance(reservation.grantAllowanceKey);
+      if (
+        !allowance.claimedExecutionSlots.includes(
+          attempt.result.grantExecutionOrdinal,
+        )
+      ) {
+        throw new StatefulInputError(
+          "grantExecutionOrdinal",
+          "must remain the claimed durable shared-allowance slot",
+        );
+      }
+      const canonicalEffect = normalizeEffect(attempt.input.effect);
+      const authorityState = readAuthoritativeFactoryState(factoryPath).state;
+      if (
+        canonicalEffect.environmentId !== input.environmentId ||
+        authorityState.environmentId !== input.environmentId ||
+        digestCanonical(attempt.result.reservation.expectedEffect) !==
+          input.expectedCommandDigest
+      ) {
+        throw new StatefulInputError(
+          "executionFence",
+          "does not match the authoritative command or synthetic environment",
+        );
+      }
+      const fenceId = stableTupleId("execution-fence", [
+        input.executionAttemptId,
+        reservation.reservationId,
+        reservation.grantAllowanceKey,
+        attempt.result.grantExecutionOrdinal,
+        input.expectedCommandDigest,
+        input.executorAuthority,
+        input.environmentId,
+      ]);
+      const createdAt = this.#timestamp();
+      const versions = advanceVersions(
+        this.#database,
+        new Set(["authorization"]),
+      );
+      const base: ExecutionFenceBase = {
+        schemaVersion: "flakebrake-execution-fence/v1",
+        fenceId,
+        executionAttemptId: attempt.executionAttemptId,
+        reservationId: reservation.reservationId,
+        grantAllowanceKey: reservation.grantAllowanceKey,
+        grantExecutionOrdinal: attempt.result.grantExecutionOrdinal,
+        admissionRecordId: attempt.admissionRecordId,
+        promiseBasisId: attempt.input.promiseBasisId,
+        acceptedOwnerDecisionId: attempt.input.acceptedOwnerDecisionId,
+        grantOwnerDecisionId: attempt.input.grantOwnerDecisionId,
+        selectedBundleId: attempt.input.selectedBundleId,
+        selectedPlanId: attempt.input.selectedPlanId,
+        canonicalNormalizedEffect: canonicalEffect,
+        expectedCommandDigest: input.expectedCommandDigest,
+        executorAuthority: input.executorAuthority,
+        environmentId: input.environmentId,
+        createdAt,
+        createdAuthorizationStateVersion:
+          versions.authorizationStateVersion,
+      };
+      this.#database
+        .prepare(
+          `INSERT INTO execution_fences
+             (fence_id, execution_attempt_id, created_at, body_json)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(
+          fenceId,
+          input.executionAttemptId,
+          createdAt,
+          canonicalJson(base),
+        );
+      this.#appendAdmissionAddendum(
+        attempt.admissionRecordId,
+        "reservation_transition",
+        {
+          executionAttemptId: attempt.executionAttemptId,
+          reservationId: reservation.reservationId,
+          fenceId,
+          status: "EXECUTION_FENCED",
+          authorizationStateVersion: versions.authorizationStateVersion,
+        },
+      );
+      return deepFreeze({
+        ...base,
+        status: "active",
+        resultBinding: null,
+      });
+    });
+  }
+
+  public getExecutionFence(
+    executionAttemptId: string,
+  ): ExecutionFenceReadModel | null {
+    assertNonEmptyString(executionAttemptId, "executionAttemptId");
+    return deepFreeze(this.#executionFenceByAttempt(executionAttemptId));
+  }
+
+  public runWithExecutionFence<T>(
+    fenceId: string,
+    operation: (
+      fence: ExecutionFenceReadModel,
+    ) => ExecutionFenceOperationResult<T>,
+  ): T {
+    assertNonEmptyString(fenceId, "fenceId");
+    return inImmediateTransaction(this.#database, () => {
+      const fence = this.#requireExecutionFenceById(fenceId);
+      if (fence.status === "released_without_mutation") {
+        throw new StatefulInputError(
+          "fenceId",
+          "execution fence was durably released without mutation",
+        );
+      }
+      const reservation = this.#reservationReadModel(
+        this.#reservationByAttempt(fence.executionAttemptId),
+      );
+      if (
+        fence.status === "active" &&
+        reservation.claimState !== "claimed_nonterminal"
+      ) {
+        throw new StatefulInputError(
+          "fenceId",
+          "active fence lost its fixed nonterminal reservation",
+        );
+      }
+      const completed = operation(fence);
+      validateFenceResultBinding(completed.binding, fence);
+      if (fence.status === "active") {
+        this.#appendExecutionFenceEvent(
+          fence,
+          "factory_result_bound",
+          completed.binding,
+        );
+        const versions = advanceVersions(
+          this.#database,
+          new Set(["authorization"]),
+        );
+        this.#appendAdmissionAddendum(
+          fence.admissionRecordId,
+          "reservation_transition",
+          {
+            executionAttemptId: fence.executionAttemptId,
+            reservationId: fence.reservationId,
+            fenceId: fence.fenceId,
+            status: "FACTORY_RESULT_BOUND",
+            receiptId: completed.binding.receiptId,
+            factoryResultDigest: completed.binding.factoryResultDigest,
+            authorizationStateVersion: versions.authorizationStateVersion,
+          },
+        );
+      } else if (
+        canonicalSerialize(fence.resultBinding) !==
+        canonicalSerialize(completed.binding)
+      ) {
+        throw new StatefulInputError(
+          "fenceId",
+          "factory replay does not match the immutable fence result",
+        );
+      }
+      return completed.value;
+    });
+  }
+
+  public recoverExecutionFence(
+    executionAttemptId: string,
+  ): ExecutionFenceRecoveryResult {
+    assertNonEmptyString(executionAttemptId, "executionAttemptId");
+    const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
+    return inImmediateTransaction(this.#database, () => {
+      let fence = this.#executionFenceByAttempt(executionAttemptId);
+      if (fence === null) {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "has no durable M3 execution fence",
+        );
+      }
+      if (fence.status === "released_without_mutation") {
+        return deepFreeze({
+          executionAttemptId,
+          fenceId: fence.fenceId,
+          status: "terminal_failed_before_mutation",
+          receiptId: null,
+          versions: readVersions(this.#database),
+        });
+      }
+      const evidence = readAuthoritativeFactoryExecution(
+        factoryPath,
+        executionAttemptId,
+      );
+      if (evidence !== null) {
+        const binding = factoryEvidenceBinding(evidence);
+        validateFenceResultBinding(binding, fence);
+        if (fence.status === "active") {
+          this.#appendExecutionFenceEvent(
+            fence,
+            "factory_result_bound",
+            binding,
+          );
+          advanceVersions(this.#database, new Set(["authorization"]));
+          fence = this.#requireExecutionFenceById(fence.fenceId);
+        } else if (
+          canonicalSerialize(fence.resultBinding) !== canonicalSerialize(binding)
+        ) {
+          throw new StatefulInputError(
+            "fenceId",
+            "recovery found a conflicting durable factory result",
+          );
+        }
+        return deepFreeze({
+          executionAttemptId,
+          fenceId: fence.fenceId,
+          status: "factory_result_bound",
+          receiptId: binding.receiptId,
+          versions: readVersions(this.#database),
+        });
+      }
+      if (fence.status === "factory_result_bound") {
+        throw new StatefulInputError(
+          "fenceId",
+          "bound fence is missing its authoritative factory result",
+        );
+      }
+      this.#appendExecutionFenceEvent(
+        fence,
+        "released_without_mutation",
+        {
+          executionAttemptId,
+          reason: "trusted recovery observed no committed factory result",
+        },
+      );
+      advanceVersions(this.#database, new Set(["authorization"]));
+      const terminal = this.#recordExecutionTerminalInTransaction(
+        {
+          terminalEventId: stableTupleId("execution-fence-recovery", [
+            fence.fenceId,
+          ]),
+          executionAttemptId,
+          status: "DEFINITIVE_FAILURE_BEFORE_MUTATION",
+          evidenceReference: `execution-fence-recovery/${fence.fenceId}`,
+        },
+        fence.fenceId,
+      );
+      return deepFreeze({
+        executionAttemptId,
+        fenceId: fence.fenceId,
+        status: "terminal_failed_before_mutation",
+        receiptId: null,
+        versions: terminal.versions,
+      });
+    });
+  }
+
   public recordExecutionTerminal(
     input: ExecutionTerminalInput,
   ): ExecutionTerminalResult {
     validateExecutionTerminalInput(input);
+    return inImmediateTransaction(this.#database, () =>
+      this.#recordExecutionTerminalInTransaction(input, null),
+    );
+  }
+
+  public verifyExecutionAuthoritatively(
+    executionAttemptId: string,
+  ): AuthoritativeExecutionVerificationResult {
+    assertNonEmptyString(executionAttemptId, "executionAttemptId");
+    const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
     return inImmediateTransaction(this.#database, () => {
-      const existingEvent = this.#database
-        .prepare(
-          `SELECT reservation_id, body_json FROM reservation_events
-            WHERE reservation_event_id = ?`,
-        )
-        .get(input.terminalEventId) as Record<string, unknown> | undefined;
+      const attempt = this.#executionAttempt(executionAttemptId);
+      if (attempt === null) {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must reference an authoritative M2 claimed attempt",
+        );
+      }
+      const fence = this.#executionFenceByAttempt(executionAttemptId);
+      if (fence === null || fence.status !== "factory_result_bound") {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must have an exact factory-result-bound execution fence",
+        );
+      }
+      const evidence = readAuthoritativeFactoryExecution(
+        factoryPath,
+        executionAttemptId,
+      );
+      if (evidence === null) {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "has no authoritative committed factory result",
+        );
+      }
+      const binding = factoryEvidenceBinding(evidence);
+      validateFenceResultBinding(binding, fence);
+      if (
+        canonicalSerialize(binding) !== canonicalSerialize(fence.resultBinding) ||
+        evidence.environmentId !== fence.environmentId ||
+        evidence.result.fenceId !== fence.fenceId ||
+        evidence.request.executionAttemptId !== executionAttemptId ||
+        digestCanonical(evidence.result.canonicalCommand) !==
+          fence.expectedCommandDigest ||
+        canonicalSerialize(evidence.result.canonicalCommand) !==
+          canonicalSerialize(attempt.result.reservation.expectedEffect) ||
+        canonicalSerialize(evidence.result.resultingState) !==
+          canonicalSerialize(attempt.result.reservation.expectedAfterState)
+      ) {
+        throw new StatefulInputError(
+          "authoritativeFactoryEvidence",
+          "does not match the immutable M2 fence, command, or expected state",
+        );
+      }
+      const expectedClaim = claimedExecutionReference(attempt);
+      if (
+        canonicalSerialize(evidence.request.claim) !==
+        canonicalSerialize(expectedClaim)
+      ) {
+        throw new StatefulInputError(
+          "authoritativeFactoryEvidence.claim",
+          "does not reproduce the immutable M2 attempt basis",
+        );
+      }
+      const actualConsumption = this.#deriveAuthoritativeActualConsumption(
+        attempt,
+        attempt.result.reservation,
+      );
+      const terminal = this.#recordExecutionTerminalInTransaction(
+        {
+          terminalEventId: stableTupleId("authoritative-verification", [
+            executionAttemptId,
+            fence.fenceId,
+            binding.receiptId,
+          ]),
+          executionAttemptId,
+          status: "VERIFIED_SUCCESS",
+          receiptReference: binding.receiptId,
+          observedAfterState: asJsonValue(evidence.result.resultingState),
+          actualConsumption,
+        },
+        fence.fenceId,
+      );
+      return deepFreeze({
+        ...terminal,
+        fenceId: fence.fenceId,
+        receiptId: binding.receiptId,
+        actualConsumption,
+      });
+    });
+  }
+
+  #recordExecutionTerminalInTransaction(
+    input: ExecutionTerminalInput,
+    trustedFenceId: string | null,
+  ): ExecutionTerminalResult {
+      validateExecutionTerminalInput(input);
       const attempt = this.#executionAttempt(input.executionAttemptId);
       if (attempt === null) {
         throw new StatefulInputError(
@@ -1260,6 +1681,41 @@ export class FlakeBrakeStore {
           "must reference a claimed execution attempt",
         );
       }
+      const fence = this.#executionFenceByAttempt(input.executionAttemptId);
+      if (fence !== null && input.status !== "UNCERTAIN_OUTCOME") {
+        if (trustedFenceId !== fence.fenceId) {
+          throw new StatefulInputError(
+            "executionAttemptId",
+            input.status === "VERIFIED_SUCCESS" || input.status === "RECONCILED"
+              ? "fenced M3 execution requires authoritative factory verification"
+              : "fenced M3 execution requires serialized trusted recovery",
+          );
+        }
+        if (
+          (input.status === "VERIFIED_SUCCESS" || input.status === "RECONCILED") &&
+          fence.status !== "factory_result_bound"
+        ) {
+          throw new StatefulInputError(
+            "executionAttemptId",
+            "verified fenced execution requires a bound factory result",
+          );
+        }
+        if (
+          input.status === "DEFINITIVE_FAILURE_BEFORE_MUTATION" &&
+          fence.status !== "released_without_mutation"
+        ) {
+          throw new StatefulInputError(
+            "executionAttemptId",
+            "failure-before-mutation requires a released no-result fence",
+          );
+        }
+      }
+      const existingEvent = this.#database
+        .prepare(
+          `SELECT reservation_id, body_json FROM reservation_events
+            WHERE reservation_event_id = ?`,
+        )
+        .get(input.terminalEventId) as Record<string, unknown> | undefined;
       const reservation = this.#reservationByAttempt(input.executionAttemptId);
       if (existingEvent !== undefined) {
         const stored = parseCanonicalJson<ExecutionTerminalInput>(
@@ -1358,7 +1814,6 @@ export class FlakeBrakeStore {
         replayed: false,
         versions,
       });
-    });
   }
 
   public recordActualConsumption(input: RecordActualConsumptionInput): void {
@@ -2444,6 +2899,160 @@ export class FlakeBrakeStore {
         "execution attempt result",
       ),
     };
+  }
+
+  #executionFenceByAttempt(
+    executionAttemptId: string,
+  ): ExecutionFenceReadModel | null {
+    const row = this.#database
+      .prepare(
+        `SELECT body_json FROM execution_fences
+          WHERE execution_attempt_id = ?`,
+      )
+      .get(executionAttemptId) as Record<string, unknown> | undefined;
+    if (row === undefined) return null;
+    return this.#executionFenceReadModel(
+      parseCanonicalJson<ExecutionFenceBase>(
+        row["body_json"],
+        "execution fence",
+      ),
+    );
+  }
+
+  #requireExecutionFenceById(fenceId: string): ExecutionFenceReadModel {
+    const row = requireRow(
+      this.#database
+        .prepare("SELECT body_json FROM execution_fences WHERE fence_id = ?")
+        .get(fenceId) as Record<string, unknown> | undefined,
+      `execution fence ${fenceId}`,
+    );
+    return this.#executionFenceReadModel(
+      parseCanonicalJson<ExecutionFenceBase>(
+        row["body_json"],
+        "execution fence",
+      ),
+    );
+  }
+
+  #executionFenceReadModel(
+    base: ExecutionFenceBase,
+  ): ExecutionFenceReadModel {
+    const rows = this.#database
+      .prepare(
+        `SELECT event_kind, body_json FROM execution_fence_events
+          WHERE fence_id = ? ORDER BY sequence`,
+      )
+      .all(base.fenceId) as Record<string, unknown>[];
+    let status: ExecutionFenceReadModel["status"] = "active";
+    let resultBinding: ExecutionFenceResultBinding | null = null;
+    for (const row of rows) {
+      const eventKind = requireString(row["event_kind"], "fence event kind");
+      if (eventKind === "factory_result_bound") {
+        if (status !== "active" || resultBinding !== null) {
+          throw new StatefulInputError(
+            "executionFence",
+            "contains an invalid repeated result-binding transition",
+          );
+        }
+        resultBinding = parseCanonicalJson<ExecutionFenceResultBinding>(
+          row["body_json"],
+          "execution fence result binding",
+        );
+        status = "factory_result_bound";
+      } else if (eventKind === "released_without_mutation") {
+        if (status !== "active") {
+          throw new StatefulInputError(
+            "executionFence",
+            "contains an invalid release transition",
+          );
+        }
+        parseCanonicalJson<JsonValue>(
+          row["body_json"],
+          "execution fence release",
+        );
+        status = "released_without_mutation";
+      } else {
+        throw new StatefulInputError(
+          "executionFence",
+          `contains unsupported event ${eventKind}`,
+        );
+      }
+    }
+    return deepFreeze({ ...base, status, resultBinding });
+  }
+
+  #appendExecutionFenceEvent(
+    fence: ExecutionFenceReadModel,
+    eventKind: "factory_result_bound" | "released_without_mutation",
+    body: JsonValue | ExecutionFenceResultBinding,
+  ): void {
+    const createdAt = this.#timestamp();
+    const eventId = stableTupleId("execution-fence-event", [
+      fence.fenceId,
+      eventKind,
+      asJsonValue(body),
+    ]);
+    this.#database
+      .prepare(
+        `INSERT INTO execution_fence_events
+           (fence_event_id, fence_id, created_at, event_kind, body_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        eventId,
+        fence.fenceId,
+        createdAt,
+        eventKind,
+        canonicalJson(body),
+      );
+  }
+
+  #deriveAuthoritativeActualConsumption(
+    attempt: ExecutionAttemptReadModel,
+    reservation: InFlightExecutionReservation,
+  ): readonly import("./stateful-domain.js").ActualConsumptionValue[] {
+    if (attempt.input.affectedObligationIds.length !== 1) {
+      throw new StatefulInputError(
+        "affectedObligationIds",
+        "authoritative factory verification requires exactly one order",
+      );
+    }
+    const admission = this.getAdmissionRecord(attempt.admissionRecordId).record;
+    const obligationId = attempt.input.affectedObligationIds[0] as string;
+    const obligation = [
+      ...admission.m1Result.promiseBasis.acceptedPortfolio,
+      admission.proposalSnapshot,
+    ].find((candidate) => candidate.obligationId === obligationId);
+    if (obligation === undefined) {
+      throw new StatefulInputError(
+        "affectedObligationIds",
+        "does not identify an obligation in the immutable Promise Basis",
+      );
+    }
+    const actuals = Object.entries(reservation.resourceCapacityClaims)
+      .filter(([, value]) => value > 0)
+      .sort(([left], [right]) => compareStableStrings(left, right))
+      .map(([resourceKey, value]) => {
+        const workClassKey = obligation.workClassByResource[resourceKey];
+        if (workClassKey === undefined) {
+          throw new StatefulInputError(
+            "resourceCapacityClaims",
+            `has no immutable work class for ${resourceKey}`,
+          );
+        }
+        return { resourceKey, workClassKey, value };
+      });
+    return deepFreeze(actuals);
+  }
+
+  #requireAuthoritativeFactoryDatabasePath(): string {
+    if (this.#authoritativeFactoryDatabasePath === null) {
+      throw new StatefulInputError(
+        "authoritativeFactoryDatabasePath",
+        "is required for M3 fenced execution and verification",
+      );
+    }
+    return this.#authoritativeFactoryDatabasePath;
   }
 
   #assertReservationCompatibleWithM1(
@@ -3844,6 +4453,99 @@ function terminalEventKind(input: ExecutionTerminalInput): string {
     default:
       return assertNever(input);
   }
+}
+
+function validateCreateExecutionFenceInput(
+  input: CreateExecutionFenceInput,
+): void {
+  const value = exactObject(input, "executionFence");
+  requireExactObjectKeys(
+    value,
+    [
+      "executionAttemptId",
+      "expectedCommandDigest",
+      "executorAuthority",
+      "environmentId",
+    ],
+    "executionFence",
+  );
+  assertNonEmptyString(input.executionAttemptId, "executionAttemptId");
+  assertSha256Digest(input.expectedCommandDigest, "expectedCommandDigest");
+  if (input.executorAuthority !== "factory-change-control/v1") {
+    throw new StatefulInputError(
+      "executorAuthority",
+      "must identify the bounded factory change-control executor",
+    );
+  }
+  assertNonEmptyString(input.environmentId, "environmentId");
+}
+
+function assertFenceCreationMatches(
+  fence: ExecutionFenceReadModel,
+  input: CreateExecutionFenceInput,
+): void {
+  if (
+    fence.executionAttemptId !== input.executionAttemptId ||
+    fence.expectedCommandDigest !== input.expectedCommandDigest ||
+    fence.executorAuthority !== input.executorAuthority ||
+    fence.environmentId !== input.environmentId
+  ) {
+    throw new StatefulInputError(
+      "executionAttemptId",
+      "execution fence identity was reused with different authority or command data",
+    );
+  }
+}
+
+function validateFenceResultBinding(
+  binding: ExecutionFenceResultBinding,
+  fence: ExecutionFenceReadModel,
+): void {
+  const value = exactObject(binding, "executionFenceResultBinding");
+  requireExactObjectKeys(
+    value,
+    [
+      "schemaVersion",
+      "fenceId",
+      "executionAttemptId",
+      "environmentId",
+      "receiptId",
+      "factoryResultDigest",
+    ],
+    "executionFenceResultBinding",
+  );
+  if (
+    binding.schemaVersion !== "flakebrake-execution-fence-result/v1" ||
+    binding.fenceId !== fence.fenceId ||
+    binding.executionAttemptId !== fence.executionAttemptId ||
+    binding.environmentId !== fence.environmentId ||
+    !binding.receiptId.startsWith("factory-mutation-receipt/sha256:")
+  ) {
+    throw new StatefulInputError(
+      "executionFenceResultBinding",
+      "does not match the immutable execution fence identity",
+    );
+  }
+  assertSha256Digest(binding.factoryResultDigest, "factoryResultDigest");
+}
+
+function factoryEvidenceBinding(
+  evidence: AuthoritativeFactoryExecutionEvidence,
+): ExecutionFenceResultBinding {
+  return {
+    schemaVersion: "flakebrake-execution-fence-result/v1",
+    fenceId: evidence.result.fenceId,
+    executionAttemptId: evidence.result.executionAttemptId,
+    environmentId: evidence.environmentId,
+    receiptId: evidence.result.receipt.receiptId,
+    factoryResultDigest: evidence.resultDigest,
+  };
+}
+
+function digestCanonical(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalSerialize(value), "utf8")
+    .digest("hex")}`;
 }
 
 function validateExecutionTerminalInput(input: ExecutionTerminalInput): void {

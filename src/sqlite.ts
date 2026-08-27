@@ -17,6 +17,8 @@ const IMMUTABLE_TABLES = [
   "allowance_claims",
   "inflight_reservations",
   "reservation_events",
+  "execution_fences",
+  "execution_fence_events",
   "realized_effects",
   "realized_consumption_facts",
 ] as const;
@@ -202,6 +204,27 @@ function initializeSchema(database: SqliteDatabase): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS reservation_events_reservation
       ON reservation_events(reservation_id, sequence);
+
+    CREATE TABLE IF NOT EXISTS execution_fences (
+      fence_id TEXT PRIMARY KEY,
+      execution_attempt_id TEXT NOT NULL UNIQUE
+        REFERENCES execution_attempts(execution_attempt_id),
+      created_at TEXT NOT NULL,
+      body_json TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS execution_fence_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      fence_event_id TEXT NOT NULL UNIQUE,
+      fence_id TEXT NOT NULL REFERENCES execution_fences(fence_id),
+      created_at TEXT NOT NULL,
+      event_kind TEXT NOT NULL CHECK (
+        event_kind IN ('factory_result_bound', 'released_without_mutation')
+      ),
+      body_json TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS execution_fence_events_fence
+      ON execution_fence_events(fence_id, sequence);
 
     CREATE TABLE IF NOT EXISTS realized_effects (
       realized_effect_id TEXT PRIMARY KEY,
