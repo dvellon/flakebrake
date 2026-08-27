@@ -16,6 +16,9 @@ __pycache__/
 logs/
 *.log
 artifacts/private/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Local tools and editors
 .DS_Store
