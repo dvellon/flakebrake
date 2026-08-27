@@ -3,6 +3,10 @@ import { Transform, type TransformCallback } from "node:stream";
 import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 
 const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+const UTF8_DECODER = new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: true,
+});
 
 export interface StrictJsonLineInputOptions {
   readonly onRejected: (error: Error) => void;
@@ -28,23 +32,8 @@ export class StrictJsonLineInput extends Transform {
       return;
     }
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
-    if (this.#buffer.length + bytes.length > MAX_BUFFER_SIZE) {
-      this.#reject(new SyntaxError("MCP stdio frame exceeds 10 MiB"));
-      callback();
-      return;
-    }
-    this.#buffer = Buffer.concat([this.#buffer, bytes]);
     try {
-      while (!this.#rejected) {
-        const newline = this.#buffer.indexOf(0x0a);
-        if (newline === -1) break;
-        let line = this.#buffer.subarray(0, newline);
-        this.#buffer = this.#buffer.subarray(newline + 1);
-        if (line.at(-1) === 0x0d) line = line.subarray(0, line.length - 1);
-        const text = line.toString("utf8");
-        parseJsonRejectingDuplicateKeys(text);
-        this.push(Buffer.concat([line, Buffer.from("\n")]));
-      }
+      this.#consume(bytes);
       callback();
     } catch (error: unknown) {
       this.#reject(asError(error));
@@ -58,6 +47,47 @@ export class StrictJsonLineInput extends Transform {
     }
     this.#buffer = Buffer.alloc(0);
     callback();
+  }
+
+  #consume(bytes: Buffer): void {
+    let offset = 0;
+    while (!this.#rejected && offset < bytes.length) {
+      const newline = bytes.indexOf(0x0a, offset);
+      if (newline === -1) {
+        const remainder = bytes.subarray(offset);
+        const pendingLength = this.#buffer.length + remainder.length;
+        const lastByte = remainder.at(-1) ?? this.#buffer.at(-1);
+        const maximumPendingLength =
+          lastByte === 0x0d ? MAX_BUFFER_SIZE + 1 : MAX_BUFFER_SIZE;
+        if (pendingLength > maximumPendingLength) {
+          this.#reject(new SyntaxError("MCP stdio frame exceeds 10 MiB"));
+          return;
+        }
+        this.#buffer = Buffer.concat([this.#buffer, remainder]);
+        return;
+      }
+
+      const segment = bytes.subarray(offset, newline);
+      const completeLength = this.#buffer.length + segment.length;
+      const lastByte = segment.at(-1) ?? this.#buffer.at(-1);
+      const payloadLength = completeLength - (lastByte === 0x0d ? 1 : 0);
+      if (payloadLength > MAX_BUFFER_SIZE) {
+        this.#reject(new SyntaxError("MCP stdio frame exceeds 10 MiB"));
+        return;
+      }
+      let line = Buffer.concat([this.#buffer, segment]);
+      this.#buffer = Buffer.alloc(0);
+      if (line.at(-1) === 0x0d) line = line.subarray(0, line.length - 1);
+      let text: string;
+      try {
+        text = UTF8_DECODER.decode(line);
+      } catch {
+        throw new SyntaxError("MCP stdio frame contains invalid UTF-8");
+      }
+      parseJsonRejectingDuplicateKeys(text);
+      this.push(Buffer.concat([Buffer.from(text, "utf8"), Buffer.from("\n")]));
+      offset = newline + 1;
+    }
   }
 
   #reject(error: Error): void {

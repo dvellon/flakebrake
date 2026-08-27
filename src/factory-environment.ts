@@ -151,7 +151,10 @@ export class SyntheticFactoryEnvironment {
     if (typeof options.path !== "string" || options.path.length === 0) {
       throw new StatefulInputError("path", "must be a non-empty string");
     }
-    this.#environmentId = options.environmentId ?? HERO_ENVIRONMENT_ID;
+    this.#environmentId = requireNonBlankIdentifier(
+      options.environmentId ?? HERO_ENVIRONMENT_ID,
+      "environmentId",
+    );
     this.#now = options.now ?? (() => HERO_HORIZON_END);
     this.#database = new DatabaseSync(options.path);
     this.#database.exec("PRAGMA foreign_keys = ON");
@@ -469,7 +472,10 @@ export class SyntheticFactoryEnvironment {
       )
       .get() as Record<string, unknown> | undefined;
     if (metadata === undefined) throw new Error("Factory metadata is missing");
-    const environmentId = requireString(metadata["environment_id"], "environment_id");
+    const environmentId = requireNonBlankIdentifier(
+      metadata["environment_id"],
+      "environment_id",
+    );
     const stateVersion = requirePositiveInteger(
       metadata["state_version"],
       "state_version",
@@ -771,7 +777,10 @@ function validateAuthorizedScheduleMutation(
     );
   }
   requireString(request.command.orderId, "command.orderId");
-  requireString(request.command.environmentId, "command.environmentId");
+  requireNonBlankIdentifier(
+    request.command.environmentId,
+    "command.environmentId",
+  );
   requireString(request.command.productionCellId, "command.productionCellId");
   if (
     request.command.schemaVersion !== "microfactory-schedule-command/v1" ||
@@ -1066,7 +1075,10 @@ function readScheduleStateFromDatabase(
     )
     .get() as Record<string, unknown> | undefined;
   if (metadata === undefined) throw new Error("Factory metadata is missing");
-  const environmentId = requireString(metadata["environment_id"], "environment_id");
+  const environmentId = requireNonBlankIdentifier(
+    metadata["environment_id"],
+    "environment_id",
+  );
   const stateVersion = requirePositiveInteger(
     metadata["state_version"],
     "state_version",
@@ -1139,6 +1151,16 @@ function parseStateVersion(value: string): number {
 function requireString(value: unknown, path: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new StatefulInputError(path, "must be a non-empty string");
+  }
+  return value;
+}
+
+function requireNonBlankIdentifier(value: unknown, path: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new StatefulInputError(
+      path,
+      "must contain at least one non-whitespace character",
+    );
   }
   return value;
 }

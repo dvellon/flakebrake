@@ -215,54 +215,105 @@ export function createFactoryMcpService(
     { instructions: instructionsFor(serviceName) },
   );
   const authoritativeNow = options.now ?? (() => HERO_HORIZON_END);
-  const factory =
-    serviceName === "factory-capacity"
-      ? null
-      : new SyntheticFactoryEnvironment({
-          path: options.factoryDatabasePath,
-          now: authoritativeNow,
-        });
-  const m2Store = createStore({
-    path: options.m2DatabasePath,
-    authoritativeFactoryDatabasePath: options.factoryDatabasePath,
-    now: authoritativeNow,
-  });
+  let factory: SyntheticFactoryEnvironment | null = null;
+  let m2Store: FlakeBrakeStore | null = null;
+  try {
+    factory =
+      serviceName === "factory-capacity"
+        ? null
+        : new SyntheticFactoryEnvironment({
+            path: options.factoryDatabasePath,
+            now: authoritativeNow,
+          });
+    m2Store = createStore({
+      path: options.m2DatabasePath,
+      authoritativeFactoryDatabasePath: options.factoryDatabasePath,
+      now: authoritativeNow,
+    });
 
-  switch (serviceName) {
-    case "factory-orders":
-      registerOrdersTools(server, requireM2Store(m2Store), requireFactory(factory));
-      break;
-    case "factory-capacity":
-      registerCapacityTools(server, requireM2Store(m2Store));
-      break;
-    case "factory-simulator":
-      registerSimulatorTools(
-        server,
-        requireM2Store(m2Store),
-        requireFactory(factory),
-      );
-      break;
-    case "factory-change-control":
-      registerChangeControlTools(
-        server,
-        requireM2Store(m2Store),
-        requireFactory(factory),
-      );
-      break;
-    default:
-      assertNever(serviceName);
+    switch (serviceName) {
+      case "factory-orders":
+        registerOrdersTools(
+          server,
+          requireM2Store(m2Store),
+          requireFactory(factory),
+        );
+        break;
+      case "factory-capacity":
+        registerCapacityTools(server, requireM2Store(m2Store));
+        break;
+      case "factory-simulator":
+        registerSimulatorTools(
+          server,
+          requireM2Store(m2Store),
+          requireFactory(factory),
+        );
+        break;
+      case "factory-change-control":
+        registerChangeControlTools(
+          server,
+          requireM2Store(m2Store),
+          requireFactory(factory),
+        );
+        break;
+      default:
+        assertNever(serviceName);
+    }
+  } catch (error: unknown) {
+    try {
+      m2Store?.close();
+    } catch {
+      // Construction must preserve the original startup failure.
+    }
+    try {
+      factory?.close();
+    } catch {
+      // Construction must preserve the original startup failure.
+    }
+    throw error;
   }
 
-  let closed = false;
+  let serverClosed = false;
+  let storeClosed = false;
+  let factoryClosed = factory === null;
+  let closeInFlight: Promise<void> | null = null;
+  const closeOwnedResources = async (): Promise<void> => {
+    const failures: unknown[] = [];
+    if (!serverClosed) {
+      try {
+        await server.close();
+        serverClosed = true;
+      } catch (error: unknown) {
+        failures.push(error);
+      }
+    }
+    if (!storeClosed) {
+      try {
+        requireM2Store(m2Store).close();
+        storeClosed = true;
+      } catch (error: unknown) {
+        failures.push(error);
+      }
+    }
+    if (!factoryClosed) {
+      try {
+        requireFactory(factory).close();
+        factoryClosed = true;
+      } catch (error: unknown) {
+        failures.push(error);
+      }
+    }
+    throwCleanupFailures(failures, "Failed to close factory MCP service");
+  };
   return {
     serviceName,
     server,
-    close: async () => {
-      if (closed) return;
-      closed = true;
-      await server.close();
-      m2Store?.close();
-      factory?.close();
+    close: () => {
+      if (closeInFlight !== null) return closeInFlight;
+      closeInFlight = closeOwnedResources().finally(() => {
+        closeInFlight = null;
+      });
+      return closeInFlight;
     },
   };
 }
@@ -273,39 +324,86 @@ export async function serveFactoryMcpStdio(
 ): Promise<void> {
   const running = createFactoryMcpService(serviceName, options);
   const keepAlive = setInterval(() => undefined, 60_000);
-  let closing = false;
+  let shutdownStarted = false;
+  let closeInFlight: Promise<void> | null = null;
+  let closeError: unknown;
   let resolveStopped: (() => void) | undefined;
   const stopped = new Promise<void>((resolve) => {
     resolveStopped = resolve;
   });
-  const close = async (): Promise<void> => {
-    if (closing) return;
-    closing = true;
+  const guardedInput = new StrictJsonLineInput({
+    onRejected: () => {
+      if (shutdownStarted) return;
+      const parseError =
+        '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}\n';
+      process.stdout.write(parseError, () => {
+        void requestClose().catch(() => undefined);
+      });
+    },
+  });
+  const transport = new StdioServerTransport(guardedInput, process.stdout);
+  const onSigint = (): void => {
+    void requestClose().catch(() => undefined);
+  };
+  const onSigterm = (): void => {
+    void requestClose().catch(() => undefined);
+  };
+  const onStdinEnd = (): void => {
+    void requestClose().catch(() => undefined);
+  };
+  const closeOwnedResources = async (): Promise<void> => {
+    shutdownStarted = true;
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    process.stdin.removeListener("end", onStdinEnd);
+    clearInterval(keepAlive);
     try {
       process.stdin.unpipe(guardedInput);
       process.stdin.pause();
       guardedInput.end();
-      await running.close();
-    } finally {
-      clearInterval(keepAlive);
-      resolveStopped?.();
+    } catch {
+      // Stream release continues through the owned MCP resources below.
     }
+    const failures: unknown[] = [];
+    try {
+      await running.close();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+    try {
+      await transport.close();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+    throwCleanupFailures(failures, "Failed to stop factory MCP stdio service");
   };
-  const guardedInput = new StrictJsonLineInput({
-    onRejected: () => {
-      if (closing) return;
-      const parseError =
-        '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}\n';
-      process.stdout.write(parseError, () => void close());
-    },
-  });
-  const transport = new StdioServerTransport(guardedInput, process.stdout);
-  process.once("SIGINT", () => void close());
-  process.once("SIGTERM", () => void close());
-  process.stdin.once("end", () => void close());
-  await running.server.connect(transport);
-  process.stdin.pipe(guardedInput);
-  await stopped;
+  const requestClose = (): Promise<void> => {
+    if (closeInFlight !== null) return closeInFlight;
+    closeInFlight = Promise.resolve()
+      .then(closeOwnedResources)
+      .catch((error: unknown) => {
+        closeError = error;
+        throw error;
+      })
+      .finally(() => resolveStopped?.());
+    return closeInFlight;
+  };
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+  process.stdin.once("end", onStdinEnd);
+  try {
+    await running.server.connect(transport);
+    process.stdin.pipe(guardedInput);
+    await stopped;
+    if (closeError !== undefined) throw closeError;
+  } catch (error: unknown) {
+    try {
+      await requestClose();
+    } catch {
+      // Cleanup failures must not replace the meaningful startup failure.
+    }
+    throw error;
+  }
 }
 
 export async function startFactoryMcpCluster(
@@ -319,52 +417,86 @@ export async function startFactoryMcpCluster(
   const modulePath =
     options.modulePath ?? fileURLToPath(new URL("./mcp-cli.js", import.meta.url));
   const command = options.command ?? process.execPath;
-  const opened: FactoryMcpClientConnection[] = [];
-  try {
-    const connections = await Promise.all(
-      FACTORY_MCP_SERVICE_NAMES.map(async (serviceName) => {
-        const transport = new StdioClientTransport({
-          command,
-          args: [
-            modulePath,
-            "--service",
-            serviceName,
-            "--factory-db",
-            options.factoryDatabasePath,
-            "--m2-db",
-            options.m2DatabasePath,
-          ],
-          ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-          stderr: options.stderr ?? "pipe",
-        });
-        const client = new Client({
-          name: "flakebrake-m3-lifecycle-client",
-          version: "0.1.0-m3",
-        });
+  const attempts = await Promise.allSettled(
+    FACTORY_MCP_SERVICE_NAMES.map(async (serviceName) => {
+      const transport = new StdioClientTransport({
+        command,
+        args: [
+          modulePath,
+          "--service",
+          serviceName,
+          "--factory-db",
+          options.factoryDatabasePath,
+          "--m2-db",
+          options.m2DatabasePath,
+        ],
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        stderr: options.stderr ?? "pipe",
+      });
+      const client = new Client({
+        name: "flakebrake-m3-lifecycle-client",
+        version: "0.1.0-m3",
+      });
+      const connection = { serviceName, client, transport } as const;
+      try {
         await client.connect(transport);
-        const connection = { serviceName, client, transport } as const;
-        opened.push(connection);
         return connection;
-      }),
+      } catch (error: unknown) {
+        try {
+          await client.close();
+        } catch {
+          try {
+            await transport.close();
+          } catch {
+            // The original connection failure remains authoritative.
+          }
+        }
+        throw error;
+      }
+    }),
+  );
+  const connections = attempts.flatMap((attempt) =>
+    attempt.status === "fulfilled" ? [attempt.value] : [],
+  );
+  const failed = attempts.find(
+    (attempt): attempt is PromiseRejectedResult => attempt.status === "rejected",
+  );
+  if (failed !== undefined) {
+    await Promise.allSettled(
+      connections.map((connection) => connection.client.close()),
     );
+    throw failed.reason;
+  }
+  {
     const services = new Map(
       connections.map((connection) => [connection.serviceName, connection]),
     );
-    let closed = false;
+    const closed = new Set<FactoryMcpServiceName>();
+    let closeInFlight: Promise<void> | null = null;
+    const closeConnections = async (): Promise<void> => {
+      const failures: unknown[] = [];
+      for (const connection of services.values()) {
+        if (closed.has(connection.serviceName)) continue;
+        try {
+          await connection.client.close();
+          closed.add(connection.serviceName);
+        } catch (error: unknown) {
+          failures.push(error);
+        }
+      }
+      throwCleanupFailures(failures, "Failed to close factory MCP cluster");
+    };
     return {
       transport: "stdio",
       services,
-      close: async () => {
-        if (closed) return;
-        closed = true;
-        await Promise.allSettled(
-          [...services.values()].map((connection) => connection.client.close()),
-        );
+      close: () => {
+        if (closeInFlight !== null) return closeInFlight;
+        closeInFlight = closeConnections().finally(() => {
+          closeInFlight = null;
+        });
+        return closeInFlight;
       },
     };
-  } catch (error: unknown) {
-    await Promise.allSettled(opened.map((connection) => connection.client.close()));
-    throw error;
   }
 }
 
@@ -777,6 +909,12 @@ function requireFactory(
 ): SyntheticFactoryEnvironment {
   if (factory === null) throw new Error("Factory environment was not opened");
   return factory;
+}
+
+function throwCleanupFailures(failures: readonly unknown[], message: string): void {
+  if (failures.length === 0) return;
+  if (failures.length === 1) throw failures[0];
+  throw new AggregateError(failures, message);
 }
 
 function asJsonValue(value: unknown): JsonValue {

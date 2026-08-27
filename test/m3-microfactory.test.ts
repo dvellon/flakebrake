@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 import { canonicalSerialize } from "../src/canonical.js";
@@ -19,7 +21,6 @@ import type {
   ClaimExecutionInput,
   EffectFingerprint,
   FactoryScheduleState,
-  FlakeBrakeStore,
   JsonValue,
   RunningFactoryMcpCluster,
 } from "../src/index.js";
@@ -32,9 +33,11 @@ import {
   HERO_OWNER_ID,
   HERO_PRODUCTION_CELL_ID,
   HERO_RESOURCE_KEYS,
+  FlakeBrakeStore,
   SyntheticFactoryEnvironment,
   claimedExecutionReference,
   commandFromAttempt,
+  createFactoryMcpService,
   createHeroEvaluationInput,
   createHeroInitialState,
   createHeroProposal,
@@ -43,8 +46,10 @@ import {
   factoryStateDigest,
   parseJsonRejectingDuplicateKeys,
   resultingScheduleState,
+  serveFactoryMcpStdio,
   startFactoryMcpCluster,
 } from "../src/index.js";
+import { StrictJsonLineInput } from "../src/mcp-stdio-guard.js";
 
 interface TempDatabases {
   readonly directory: string;
@@ -699,6 +704,80 @@ async function rejectRawFrameWithoutMutation(
     await waitForExit(child);
     assert.equal(durableDatabaseSnapshot(fixture.factoryPath), beforeFactory);
     assert.equal(durableDatabaseSnapshot(fixture.m2Path), beforeM2);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGTERM");
+  }
+}
+
+async function runStrictJsonGuard(
+  chunks: readonly Buffer[],
+): Promise<{ readonly output: Buffer; readonly rejections: readonly Error[] }> {
+  const output: Buffer[] = [];
+  const rejections: Error[] = [];
+  const guard = new StrictJsonLineInput({
+    onRejected: (error) => rejections.push(error),
+  });
+  guard.on("data", (chunk: Buffer) => output.push(Buffer.from(chunk)));
+  for (const chunk of chunks) guard.write(chunk);
+  const finished = new Promise<void>((resolve, reject) => {
+    guard.once("finish", resolve);
+    guard.once("error", reject);
+  });
+  guard.end();
+  await finished;
+  return { output: Buffer.concat(output), rejections };
+}
+
+async function rejectRawBytesWithoutMutation(
+  fixture: ClaimedMutationFixture,
+  bytes: Buffer,
+): Promise<string> {
+  const beforeFactory = durableDatabaseSnapshot(fixture.factoryPath);
+  const beforeM2 = durableDatabaseSnapshot(fixture.m2Path);
+  const child = spawn(
+    process.execPath,
+    [
+      "dist/src/mcp-cli.js",
+      "--service",
+      "factory-change-control",
+      "--factory-db",
+      fixture.factoryPath,
+      "--m2-db",
+      fixture.m2Path,
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const output = { value: "" };
+  child.stdout.on("data", (chunk: Buffer) => {
+    output.value += chunk.toString("utf8");
+  });
+  child.stderr.resume();
+  const initialize = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "flakebrake-byte-audit", version: "1" },
+    },
+  });
+  try {
+    child.stdin.write(`${initialize}\n`);
+    await waitForOutput(child, output, (value) => value.includes('"id":1'));
+    child.stdin.write(
+      Buffer.concat([
+        Buffer.from(
+          '{"jsonrpc":"2.0","method":"notifications/initialized"}\n',
+        ),
+        bytes,
+      ]),
+    );
+    await waitForOutput(child, output, (value) => value.includes('"code":-32700'));
+    await waitForExit(child);
+    assert.equal(durableDatabaseSnapshot(fixture.factoryPath), beforeFactory);
+    assert.equal(durableDatabaseSnapshot(fixture.m2Path), beforeM2);
+    return output.value;
   } finally {
     if (child.exitCode === null) child.kill("SIGTERM");
   }
@@ -2100,5 +2179,377 @@ describe("M3 audit fix: cross-process exactly-once replay", () => {
       await Promise.allSettled([firstCluster.close(), secondCluster.close()]);
       removeFixture(fixture);
     }
+  });
+});
+
+describe("M3 Qodo PR #4 regressions", () => {
+  test("35. rejected server connection rolls back every startup resource", async () => {
+    const fixture = initializeReadFixture();
+    const serverPrototype = McpServer.prototype as unknown as {
+      connect: (transport: unknown) => Promise<void>;
+    };
+    const originalConnect = serverPrototype.connect;
+    const originalFactoryClose = SyntheticFactoryEnvironment.prototype.close;
+    const originalStoreClose = FlakeBrakeStore.prototype.close;
+    const startupFailure = new Error("injected MCP transport startup failure");
+    let factoryCloseCount = 0;
+    let storeCloseCount = 0;
+    let rejection: unknown;
+    const originalSigint = new Set(process.listeners("SIGINT"));
+    const originalSigterm = new Set(process.listeners("SIGTERM"));
+    const originalEnd = new Set(process.stdin.listeners("end"));
+    const initialTimeoutCount = process
+      .getActiveResourcesInfo()
+      .filter((resource) => resource === "Timeout").length;
+    let observedFactoryCloseCount = -1;
+    let observedStoreCloseCount = -1;
+    let observedSigintCount = -1;
+    let observedSigtermCount = -1;
+    let observedEndCount = -1;
+    let observedTimeoutCount = -1;
+    serverPrototype.connect = async () => {
+      throw startupFailure;
+    };
+    SyntheticFactoryEnvironment.prototype.close = function closeFactory(): void {
+      factoryCloseCount += 1;
+      originalFactoryClose.call(this);
+    };
+    FlakeBrakeStore.prototype.close = function closeStore(): void {
+      storeCloseCount += 1;
+      originalStoreClose.call(this);
+    };
+    try {
+      try {
+        await serveFactoryMcpStdio("factory-orders", {
+          factoryDatabasePath: fixture.factoryPath,
+          m2DatabasePath: fixture.m2Path,
+        });
+      } catch (error: unknown) {
+        rejection = error;
+      }
+      observedFactoryCloseCount = factoryCloseCount;
+      observedStoreCloseCount = storeCloseCount;
+      observedSigintCount = process.listeners("SIGINT").length;
+      observedSigtermCount = process.listeners("SIGTERM").length;
+      observedEndCount = process.stdin.listeners("end").length;
+      observedTimeoutCount = process
+        .getActiveResourcesInfo()
+        .filter((resource) => resource === "Timeout").length;
+    } finally {
+      serverPrototype.connect = originalConnect;
+      const addedSigterm = process
+        .listeners("SIGTERM")
+        .filter((listener) => !originalSigterm.has(listener));
+      for (const listener of addedSigterm) {
+        Reflect.apply(listener, process, ["SIGTERM"]);
+      }
+      await waitForImmediate();
+      await waitForImmediate();
+      for (const listener of process.listeners("SIGINT")) {
+        if (!originalSigint.has(listener)) process.removeListener("SIGINT", listener);
+      }
+      for (const listener of process.listeners("SIGTERM")) {
+        if (!originalSigterm.has(listener)) process.removeListener("SIGTERM", listener);
+      }
+      for (const listener of process.stdin.listeners("end")) {
+        if (!originalEnd.has(listener)) {
+          process.stdin.removeListener("end", listener as () => void);
+        }
+      }
+      const clean = createFactoryMcpService("factory-orders", {
+        factoryDatabasePath: fixture.factoryPath,
+        m2DatabasePath: fixture.m2Path,
+      });
+      await clean.close();
+      SyntheticFactoryEnvironment.prototype.close = originalFactoryClose;
+      FlakeBrakeStore.prototype.close = originalStoreClose;
+      removeFixture(fixture);
+    }
+    assert.equal(rejection, startupFailure);
+    assert.equal(observedFactoryCloseCount, 1);
+    assert.equal(observedStoreCloseCount, 1);
+    assert.equal(observedSigintCount, originalSigint.size);
+    assert.equal(observedSigtermCount, originalSigterm.size);
+    assert.equal(observedEndCount, originalEnd.size);
+    assert.ok(observedTimeoutCount <= initialTimeoutCount);
+  });
+
+  test("36. M2 construction failure closes the acquired factory", () => {
+    const fixture = tempDatabases();
+    const originalFactoryClose = SyntheticFactoryEnvironment.prototype.close;
+    let factoryCloseCount = 0;
+    let startupError: unknown;
+    let rollbackCloseCount = -1;
+    SyntheticFactoryEnvironment.prototype.close = function closeFactory(): void {
+      factoryCloseCount += 1;
+      originalFactoryClose.call(this);
+    };
+    try {
+      try {
+        createFactoryMcpService("factory-orders", {
+          factoryDatabasePath: fixture.factoryPath,
+          m2DatabasePath: fixture.m2Path,
+        });
+      } catch (error: unknown) {
+        startupError = error;
+      }
+      rollbackCloseCount = factoryCloseCount;
+      const reopened = new SyntheticFactoryEnvironment({ path: fixture.factoryPath });
+      reopened.close();
+    } finally {
+      SyntheticFactoryEnvironment.prototype.close = originalFactoryClose;
+      removeFixture(fixture);
+    }
+    assert.match(String(startupError), /initialState/u);
+    assert.equal(rollbackCloseCount, 1);
+    assert.equal(factoryCloseCount, 2);
+  });
+
+  test("37. partial close failure retains retry ownership and closes databases", async () => {
+    const fixture = initializeReadFixture();
+    const originalFactoryClose = SyntheticFactoryEnvironment.prototype.close;
+    const originalStoreClose = FlakeBrakeStore.prototype.close;
+    let factoryCloseCount = 0;
+    let storeCloseCount = 0;
+    SyntheticFactoryEnvironment.prototype.close = function closeFactory(): void {
+      factoryCloseCount += 1;
+      originalFactoryClose.call(this);
+    };
+    FlakeBrakeStore.prototype.close = function closeStore(): void {
+      storeCloseCount += 1;
+      originalStoreClose.call(this);
+    };
+    const running = createFactoryMcpService("factory-orders", {
+      factoryDatabasePath: fixture.factoryPath,
+      m2DatabasePath: fixture.m2Path,
+    });
+    const originalServerClose = running.server.close.bind(running.server);
+    const closeFailure = new Error("injected server close failure");
+    let serverCloseAttempts = 0;
+    running.server.close = async () => {
+      serverCloseAttempts += 1;
+      if (serverCloseAttempts === 1) throw closeFailure;
+      await originalServerClose();
+    };
+    let firstError: unknown;
+    let firstFactoryCloseCount = -1;
+    let firstStoreCloseCount = -1;
+    try {
+      try {
+        await running.close();
+      } catch (error: unknown) {
+        firstError = error;
+      }
+      firstFactoryCloseCount = factoryCloseCount;
+      firstStoreCloseCount = storeCloseCount;
+      await running.close();
+      await running.close();
+    } finally {
+      SyntheticFactoryEnvironment.prototype.close = originalFactoryClose;
+      FlakeBrakeStore.prototype.close = originalStoreClose;
+      removeFixture(fixture);
+    }
+    assert.equal(firstError, closeFailure);
+    assert.equal(firstFactoryCloseCount, 1);
+    assert.equal(firstStoreCloseCount, 1);
+    assert.equal(serverCloseAttempts, 2);
+    assert.equal(factoryCloseCount, 1);
+    assert.equal(storeCloseCount, 1);
+  });
+
+  test("38. blank environment identities fail before durable mutation", () => {
+    const constructionResults: {
+      readonly environmentId: string;
+      readonly error: unknown;
+      readonly before: string;
+      readonly after: string;
+    }[] = [];
+    for (const environmentId of ["", "   "]) {
+      const fixture = tempDatabases();
+      const before = canonicalSerialize(readdirSync(fixture.directory).sort());
+      let environment: SyntheticFactoryEnvironment | undefined;
+      let error: unknown;
+      try {
+        environment = new SyntheticFactoryEnvironment({
+          path: fixture.factoryPath,
+          environmentId,
+        });
+      } catch (caught: unknown) {
+        error = caught;
+      } finally {
+        environment?.close();
+      }
+      const after = canonicalSerialize(readdirSync(fixture.directory).sort());
+      constructionResults.push({ environmentId, error, before, after });
+      removeFixture(fixture);
+    }
+
+    const mutationFixture = prepareClaimedFixture();
+    const store = createStore({
+      path: mutationFixture.m2Path,
+      now: () => HERO_HORIZON_END,
+      authoritativeFactoryDatabasePath: mutationFixture.factoryPath,
+    });
+    const factory = new SyntheticFactoryEnvironment({
+      path: mutationFixture.factoryPath,
+    });
+    const beforeFactory = durableDatabaseSnapshot(mutationFixture.factoryPath);
+    const beforeM2 = durableDatabaseSnapshot(mutationFixture.m2Path);
+    let mutationError: unknown;
+    try {
+      factory.executeAuthorizedScheduleMutation(store, {
+        ...mutationFixture.firstRequest,
+        command: {
+          ...mutationFixture.firstRequest.command,
+          environmentId: "   ",
+        },
+      });
+    } catch (error: unknown) {
+      mutationError = error;
+    } finally {
+      factory.close();
+      store.close();
+    }
+    const afterFactory = durableDatabaseSnapshot(mutationFixture.factoryPath);
+    const afterM2 = durableDatabaseSnapshot(mutationFixture.m2Path);
+    removeFixture(mutationFixture);
+
+    for (const result of constructionResults) {
+      assert.match(
+        String(result.error),
+        /environmentId.*non-whitespace/u,
+        JSON.stringify(result.environmentId),
+      );
+      assert.equal(result.after, result.before, JSON.stringify(result.environmentId));
+    }
+    assert.match(String(mutationError), /command\.environmentId.*non-whitespace/u);
+    assert.equal(afterFactory, beforeFactory);
+    assert.equal(afterM2, beforeM2);
+  });
+
+  test("39. malformed UTF-8 is rejected before MCP parsing or mutation", async () => {
+    const prefix = Buffer.from('{"value":"');
+    const suffix = Buffer.from('"}\n');
+    const malformedContinuation = await runStrictJsonGuard([
+      Buffer.concat([prefix, Buffer.from([0x80]), suffix]),
+    ]);
+    const truncatedMultibyte = await runStrictJsonGuard([
+      Buffer.concat([prefix, Buffer.from([0xe2, 0x82]), suffix]),
+    ]);
+    const euroFrame = Buffer.from('{"value":"€"}\n');
+    const euroStart = euroFrame.indexOf(0xe2);
+    const validFragmented = await runStrictJsonGuard([
+      euroFrame.subarray(0, euroStart + 1),
+      euroFrame.subarray(euroStart + 1, euroStart + 2),
+      euroFrame.subarray(euroStart + 2),
+    ]);
+
+    const fixture = prepareClaimedFixture();
+    try {
+      const consequentialFrame = Buffer.from(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 91,
+          method: "tools/call",
+          params: {
+            name: "create_schedule_reservation",
+            arguments: mutationArguments(fixture.firstRequest),
+          },
+        })}\n`,
+      );
+      const malformedThenConsequential = Buffer.concat([
+        Buffer.from('{"jsonrpc":"2.0","id":90,"method":"ping","bad":"'),
+        Buffer.from([0x80]),
+        Buffer.from('"}\n'),
+        consequentialFrame,
+      ]);
+      const output = await rejectRawBytesWithoutMutation(
+        fixture,
+        malformedThenConsequential,
+      );
+      assert.match(output, /"code":-32700/u);
+    } finally {
+      removeFixture(fixture);
+    }
+
+    assert.equal(malformedContinuation.output.length, 0);
+    assert.match(String(malformedContinuation.rejections[0]), /UTF-8/u);
+    assert.equal(truncatedMultibyte.output.length, 0);
+    assert.match(String(truncatedMultibyte.rejections[0]), /UTF-8/u);
+    assert.equal(validFragmented.rejections.length, 0);
+    assert.deepEqual(validFragmented.output, euroFrame);
+  });
+
+  test("40. frame bounds apply per raw newline-delimited frame", async () => {
+    const maximumFrameBytes = 10 * 1024 * 1024;
+    const exactPrefix = Buffer.from('{"payload":"');
+    const exactSuffix = Buffer.from('"}');
+    const exactFrame = Buffer.concat([
+      exactPrefix,
+      Buffer.alloc(
+        maximumFrameBytes - exactPrefix.length - exactSuffix.length,
+        0x61,
+      ),
+      exactSuffix,
+    ]);
+    const exactBoundary = await runStrictJsonGuard([
+      Buffer.concat([exactFrame, Buffer.from("\n")]),
+    ]);
+
+    const firstFrame = Buffer.from('{"small":true}\n');
+    const oversizedFrame = Buffer.alloc(maximumFrameBytes + 1, 0x20);
+    const followingFrame = Buffer.from('{"following":true}\n');
+    const validBatch = await runStrictJsonGuard([
+      Buffer.concat([firstFrame, followingFrame]),
+    ]);
+    const batched = await runStrictJsonGuard([
+      Buffer.concat([
+        firstFrame,
+        oversizedFrame,
+        Buffer.from("\n"),
+        followingFrame,
+      ]),
+    ]);
+    const unterminated = await runStrictJsonGuard([
+      Buffer.alloc(maximumFrameBytes, 0x20),
+      Buffer.from(" "),
+    ]);
+
+    const fixture = prepareClaimedFixture();
+    try {
+      const validConsequential = Buffer.from(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 93,
+          method: "tools/call",
+          params: {
+            name: "create_schedule_reservation",
+            arguments: mutationArguments(fixture.firstRequest),
+          },
+        })}\n`,
+      );
+      const output = await rejectRawBytesWithoutMutation(
+        fixture,
+        Buffer.concat([
+          Buffer.alloc(maximumFrameBytes + 1, 0x20),
+          Buffer.from("\n"),
+          validConsequential,
+        ]),
+      );
+      assert.match(output, /"code":-32700/u);
+    } finally {
+      removeFixture(fixture);
+    }
+
+    assert.equal(exactBoundary.rejections.length, 0);
+    assert.deepEqual(exactBoundary.output, Buffer.concat([exactFrame, Buffer.from("\n")]));
+    assert.equal(validBatch.rejections.length, 0);
+    assert.deepEqual(validBatch.output, Buffer.concat([firstFrame, followingFrame]));
+    assert.equal(batched.rejections.length, 1);
+    assert.match(String(batched.rejections[0]), /exceeds 10 MiB/u);
+    assert.deepEqual(batched.output, firstFrame);
+    assert.equal(unterminated.rejections.length, 1);
+    assert.match(String(unterminated.rejections[0]), /exceeds 10 MiB/u);
+    assert.equal(unterminated.output.length, 0);
   });
 });
