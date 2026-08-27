@@ -260,6 +260,32 @@ export interface IssuedGrantResult {
   readonly versions: VersionTuple;
 }
 
+export interface AcceptPromiseAndIssueGrantInput {
+  readonly acceptance: AcceptPromiseInput;
+  readonly grant: Omit<
+    IssueGrantInput,
+    | "expectedPortfolioVersion"
+    | "expectedCapacityModelVersion"
+    | "expectedCapacityPlanVersion"
+  >;
+}
+
+export type AcceptPromiseAndIssueGrantResult =
+  | {
+      readonly acceptance: Extract<
+        AcceptPromiseResult,
+        { readonly status: "COMMITTED" }
+      >;
+      readonly grant: IssuedGrantResult;
+    }
+  | {
+      readonly acceptance: Extract<
+        AcceptPromiseResult,
+        { readonly status: "STALE_READMISSION" }
+      >;
+      readonly grant: null;
+    };
+
 export interface DeniedScopePredicate {
   readonly scopeSchemaVersion: "microfactory-denied-scope/v1";
   readonly environmentId: string;

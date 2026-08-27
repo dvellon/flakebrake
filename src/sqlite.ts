@@ -1,8 +1,12 @@
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { canonicalSerialize } from "./canonical.js";
 
 export type SqliteDatabase = DatabaseSync;
+export type DatabaseInstanceKind = "m2" | "factory";
 
 const IMMUTABLE_TABLES = [
   "admission_records",
@@ -30,13 +34,98 @@ export function openSqlite(path: string): SqliteDatabase {
   if (path !== ":memory:") database.exec("PRAGMA journal_mode = WAL");
   database.exec("PRAGMA synchronous = FULL");
   initializeSchema(database);
+  ensureDatabaseIncarnation(database, "m2");
   return database;
+}
+
+export function ensureDatabaseIncarnation(
+  database: SqliteDatabase,
+  kind: DatabaseInstanceKind,
+): string {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS database_incarnation (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      store_kind TEXT NOT NULL CHECK (store_kind IN ('m2', 'factory')),
+      incarnation_id TEXT NOT NULL UNIQUE
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS database_incarnation_immutable_update
+    BEFORE UPDATE ON database_incarnation BEGIN
+      SELECT RAISE(ABORT, 'database incarnation is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS database_incarnation_immutable_delete
+    BEFORE DELETE ON database_incarnation BEGIN
+      SELECT RAISE(ABORT, 'database incarnation is immutable');
+    END;
+  `);
+  const existing = database
+    .prepare(
+      "SELECT store_kind, incarnation_id FROM database_incarnation WHERE singleton = 1",
+    )
+    .get() as Record<string, unknown> | undefined;
+  if (existing === undefined) {
+    const incarnationId = `database-incarnation/${randomUUID()}`;
+    database
+      .prepare(
+        "INSERT INTO database_incarnation (singleton, store_kind, incarnation_id) VALUES (1, ?, ?)",
+      )
+      .run(kind, incarnationId);
+    return incarnationId;
+  }
+  if (existing["store_kind"] !== kind) {
+    throw new Error(
+      `Database instance kind ${String(existing["store_kind"])} does not match ${kind}`,
+    );
+  }
+  if (
+    typeof existing["incarnation_id"] !== "string" ||
+    !existing["incarnation_id"].startsWith("database-incarnation/")
+  ) {
+    throw new Error("Database incarnation metadata is malformed");
+  }
+  return existing["incarnation_id"];
+}
+
+export function readDatabaseInstanceIdentity(
+  path: string,
+  kind: DatabaseInstanceKind,
+  environmentId: string,
+): string {
+  const canonicalPath = realpathSync(resolve(path));
+  const database = new DatabaseSync(canonicalPath, { readOnly: true });
+  try {
+    const row = database
+      .prepare(
+        "SELECT store_kind, incarnation_id FROM database_incarnation WHERE singleton = 1",
+      )
+      .get() as Record<string, unknown> | undefined;
+    if (
+      row === undefined ||
+      row["store_kind"] !== kind ||
+      typeof row["incarnation_id"] !== "string" ||
+      !row["incarnation_id"].startsWith("database-incarnation/")
+    ) {
+      throw new Error(`${kind} database instance identity is missing or malformed`);
+    }
+    return `database-instance/sha256:${createHash("sha256")
+      .update(
+        canonicalSerialize({
+          canonicalPath,
+          environmentId,
+          incarnationId: row["incarnation_id"],
+          kind,
+        }),
+      )
+      .digest("hex")}`;
+  } finally {
+    database.close();
+  }
 }
 
 export function inImmediateTransaction<T>(
   database: SqliteDatabase,
   operation: () => T,
 ): T {
+  if (database.isTransaction) return operation();
   database.exec("BEGIN IMMEDIATE");
   try {
     const result = operation();

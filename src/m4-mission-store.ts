@@ -199,6 +199,15 @@ export class M4MissionStore {
       if (existing !== null) {
         const expected = bindingMaterial(existing);
         if (canonicalSerialize(expected) !== canonicalSerialize(input)) {
+          if (
+            expected.m2EnvironmentIdentity !== input.m2EnvironmentIdentity ||
+            expected.factoryEnvironmentIdentity !==
+              input.factoryEnvironmentIdentity
+          ) {
+            throw new Error(
+              `Mission ${input.missionId} database instance identity conflicts with its durable environment binding`,
+            );
+          }
           throw new Error(`Mission ${input.missionId} binding conflicts`);
         }
         return existing;

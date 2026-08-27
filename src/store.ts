@@ -51,6 +51,8 @@ import {
 import type { SqliteDatabase } from "./sqlite.js";
 import type {
   AcceptPromiseInput,
+  AcceptPromiseAndIssueGrantInput,
+  AcceptPromiseAndIssueGrantResult,
   AcceptPromiseResult,
   ActualConsumptionValue,
   AdmissionAddendum,
@@ -161,6 +163,42 @@ interface AdmissionBasisValues {
   readonly capacityPlanVersion: string;
   readonly authorizationStateVersion: string;
   readonly calibrationFrontierDigest: string;
+}
+
+function committedAcceptanceReplay(
+  admission: AdmissionReadModel,
+  input: AcceptPromiseInput,
+  body: JsonValue,
+): Extract<AcceptPromiseResult, { readonly status: "COMMITTED" }> {
+  const record = admission.record;
+  const mismatches = compareAdmissionBasis(input, {
+    portfolioVersion: record.portfolioVersion,
+    capacityModelVersion: record.capacityModelVersion,
+    capacityPlanVersion: record.capacityPlanVersion,
+    authorizationStateVersion: record.authorizationStateVersion,
+    calibrationFrontierDigest: record.calibrationFrontierDigest,
+  });
+  if (mismatches.length > 0 || !isJsonObject(body)) {
+    throw new StatefulInputError(
+      "acceptance",
+      "replay differs from the immutable accepted admission basis",
+    );
+  }
+  const committedPortfolioVersion = body["committedPortfolioVersion"];
+  if (typeof committedPortfolioVersion !== "string") {
+    throw new Error("Acceptance commit is missing its portfolio version");
+  }
+  return deepFreeze({
+    status: "COMMITTED",
+    admissionRecordId: input.admissionRecordId,
+    selectedPlanId: input.selectedPlanId,
+    versions: {
+      portfolioVersion: committedPortfolioVersion,
+      capacityModelVersion: record.capacityModelVersion,
+      capacityPlanVersion: record.capacityPlanVersion,
+      authorizationStateVersion: record.authorizationStateVersion,
+    },
+  });
 }
 
 type ExecutionFenceBase = Omit<
@@ -426,6 +464,55 @@ export class FlakeBrakeStore {
         admissionRecordId: input.admissionRecordId,
         selectedPlanId: input.selectedPlanId,
         versions,
+      });
+    });
+  }
+
+  public acceptPromiseAndIssueGrant(
+    input: AcceptPromiseAndIssueGrantInput,
+  ): AcceptPromiseAndIssueGrantResult {
+    return inImmediateTransaction(this.#database, () => {
+      const admission = this.getAdmissionRecord(
+        input.acceptance.admissionRecordId,
+      );
+      const acceptanceCommits = admission.addenda.filter(
+        (addendum) => addendum.kind === "acceptance_commit",
+      );
+      const exactCommit = acceptanceCommits.find((addendum) => {
+        if (!isJsonObject(addendum.body)) return false;
+        return (
+          addendum.body["ownerDecisionId"] ===
+            input.acceptance.ownerDecisionId &&
+          addendum.body["selectedPlanId"] === input.acceptance.selectedPlanId
+        );
+      });
+      if (acceptanceCommits.length > 0 && exactCommit === undefined) {
+        throw new StatefulInputError(
+          "acceptance",
+          "conflicts with the immutable accepted promise",
+        );
+      }
+      const acceptance =
+        exactCommit === undefined
+          ? this.acceptPromise(input.acceptance)
+          : committedAcceptanceReplay(
+              admission,
+              input.acceptance,
+              exactCommit.body,
+            );
+      if (acceptance.status !== "COMMITTED") {
+        return deepFreeze({ acceptance, grant: null });
+      }
+      const grant = this.issueGrant({
+        ...input.grant,
+        expectedPortfolioVersion: acceptance.versions.portfolioVersion,
+        expectedCapacityModelVersion:
+          acceptance.versions.capacityModelVersion,
+        expectedCapacityPlanVersion: acceptance.versions.capacityPlanVersion,
+      });
+      return deepFreeze({
+        acceptance,
+        grant: { ...grant, created: true },
       });
     });
   }

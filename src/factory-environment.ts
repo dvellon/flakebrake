@@ -16,7 +16,10 @@ import {
   createHeroProposal,
 } from "./hero-fixture.js";
 import { stableTupleId } from "./identity.js";
-import { inImmediateTransaction } from "./sqlite.js";
+import {
+  ensureDatabaseIncarnation,
+  inImmediateTransaction,
+} from "./sqlite.js";
 import type { SqliteDatabase } from "./sqlite.js";
 import type {
   ClaimExecutionInput,
@@ -164,6 +167,7 @@ export class SyntheticFactoryEnvironment {
     }
     this.#database.exec("PRAGMA synchronous = FULL");
     initializeFactorySchema(this.#database);
+    ensureDatabaseIncarnation(this.#database, "factory");
     inImmediateTransaction(this.#database, () => this.#seedIfEmpty());
   }
 

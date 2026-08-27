@@ -22,6 +22,7 @@ import {
 import { readAuthoritativeFactoryExecution } from "./factory-environment.js";
 import { HERO_HORIZON_END, HERO_OWNER_ID, createHeroProposal } from "./hero-fixture.js";
 import { stableTupleId } from "./identity.js";
+import { readDatabaseInstanceIdentity } from "./sqlite.js";
 import { createStore } from "./store.js";
 import type { FlakeBrakeStore } from "./store.js";
 
@@ -41,11 +42,18 @@ export interface M4OwnerApprovalRequest {
     | "portfolio_modification"
     | "promise_choice"
     | "consequential_effect";
+  readonly requestDigest: string;
+}
+
+export interface M4OwnerDecisionResponse {
+  readonly requestDigest: string;
+  readonly ownerSourceIdentity: string;
+  readonly decision: M4OwnerApprovalDecision;
 }
 
 export type M4OwnerDecisionProvider = (
   request: M4OwnerApprovalRequest,
-) => Promise<M4OwnerApprovalDecision> | M4OwnerApprovalDecision;
+) => Promise<M4OwnerDecisionResponse> | M4OwnerDecisionResponse;
 
 export interface M4MissionControllerOptions {
   readonly missionId: string;
@@ -88,6 +96,7 @@ export interface M4ApprovalRecord {
   readonly decision: "allow" | "deny";
   readonly reason: string;
   readonly source: "owner" | "active_m2_denial";
+  readonly ownerSourceIdentity: string | null;
   readonly bridgeKey: string;
   readonly denialId: string | null;
   readonly executionAttemptId: string | null;
@@ -174,16 +183,16 @@ export class M4MissionController {
   }
 
   public async runToCompletion(): Promise<M4MissionRunResult> {
+    const identities = this.#databaseIdentities();
     this.#options.missionStore.bindMission({
       missionId: this.#options.missionId,
       environmentId: this.#options.environmentId,
       trueforgeAgentId: this.#options.trueforgeAgentId,
       trueforgeSessionId: this.#options.trueforgeSessionId,
-      m2EnvironmentIdentity: databaseIdentity(this.#options.m2DatabasePath),
-      factoryEnvironmentIdentity: databaseIdentity(
-        this.#options.factoryDatabasePath,
-      ),
+      m2EnvironmentIdentity: identities.m2,
+      factoryEnvironmentIdentity: identities.factory,
     });
+    this.#assertDatabaseBinding();
     this.#hydrateApprovals();
 
     let turn = await this.#initialOrCurrentTurn();
@@ -192,6 +201,7 @@ export class M4MissionController {
     let boundedContinuations = 0;
     let invalidApprovalRecoveries = 0;
     while (true) {
+      this.#assertDatabaseBinding();
       if (turn.done.state.status !== "done") {
         recoveredFailedTurns += 1;
         if (recoveredFailedTurns > 3) {
@@ -746,6 +756,7 @@ export class M4MissionController {
       decision: prepared.decision,
       reason: prepared.reason,
       source: prepared.source,
+      ownerSourceIdentity: prepared.ownerSourceIdentity,
       bridgeKey: action.bridgeKey,
       denialId: prepared.denialId,
       executionAttemptId: prepared.executionAttemptId,
@@ -773,9 +784,11 @@ export class M4MissionController {
     readonly decision: "allow" | "deny";
     readonly reason: string;
     readonly source: "owner" | "active_m2_denial";
+    readonly ownerSourceIdentity: string | null;
     readonly denialId: string | null;
     readonly executionAttemptId: string | null;
   }> {
+    this.#assertDatabaseBinding();
     if (
       tool.name === "select_portfolio_modification" ||
       tool.name === "accept_promise"
@@ -788,9 +801,13 @@ export class M4MissionController {
             : "promise_choice",
       });
       return {
-        decision: owner.status,
-        reason: owner.status === "deny" ? owner.reason : "owner approved",
+        decision: owner.decision.status,
+        reason:
+          owner.decision.status === "deny"
+            ? owner.decision.reason
+            : "owner approved",
         source: "owner",
+        ownerSourceIdentity: owner.ownerSourceIdentity,
         denialId: null,
         executionAttemptId: null,
       };
@@ -801,11 +818,14 @@ export class M4MissionController {
       const claim = claimInputFromM4MutationArguments(tool.arguments);
       const effect = effectFromM4MutationArguments(tool.arguments);
       const recordedOwner = this.#recordedOwnerDecision(action.bridgeKey);
-      if (recordedOwner?.status === "deny") {
-        return this.#recordOwnerDenial(store, action, tool, claim, effect, recordedOwner);
+      if (recordedOwner?.decision.status === "deny") {
+        return this.#recordOwnerDenial(store, action, tool, claim, effect, {
+          ...recordedOwner,
+          decision: recordedOwner.decision,
+        });
       }
-      if (recordedOwner?.status === "allow") {
-        return this.#recordOwnerAllowance(store, action, claim);
+      if (recordedOwner?.decision.status === "allow") {
+        return this.#recordOwnerAllowance(store, action, claim, recordedOwner);
       }
       const authorization = store.evaluateAuthorization({
         effect,
@@ -825,6 +845,7 @@ export class M4MissionController {
           decision: "deny",
           reason: authorization.explanation,
           source: "active_m2_denial",
+          ownerSourceIdentity: null,
           denialId:
             authorization.denialId === undefined
               ? null
@@ -836,10 +857,13 @@ export class M4MissionController {
         tool,
         phase: "consequential_effect",
       });
-      if (owner.status === "deny") {
-        return this.#recordOwnerDenial(store, action, tool, claim, effect, owner);
+      if (owner.decision.status === "deny") {
+        return this.#recordOwnerDenial(store, action, tool, claim, effect, {
+          ...owner,
+          decision: owner.decision,
+        });
       }
-      return this.#recordOwnerAllowance(store, action, claim);
+      return this.#recordOwnerAllowance(store, action, claim, owner);
     } finally {
       store.close();
     }
@@ -851,10 +875,11 @@ export class M4MissionController {
       readonly tool: ResolvedToolCall;
       readonly phase: M4OwnerApprovalRequest["phase"];
     },
-  ): Promise<M4OwnerApprovalDecision> {
+  ): Promise<M4OwnerDecisionResponse> {
+    this.#assertDatabaseBinding();
     const recorded = this.#recordedOwnerDecision(action.bridgeKey);
     if (recorded !== null) return recorded;
-    const owner = await this.#options.ownerDecisionProvider({
+    const requestWithoutDigest = {
       missionId: this.#options.missionId,
       trueforgeSessionId: this.#options.trueforgeSessionId,
       trueforgeTurnId: action.trueforgeTurnId,
@@ -863,7 +888,15 @@ export class M4MissionController {
       toolName: input.tool.name,
       arguments: asJson(input.tool.arguments),
       phase: input.phase,
-    });
+    } as const;
+    const request: M4OwnerApprovalRequest = {
+      ...requestWithoutDigest,
+      requestDigest: digest(requestWithoutDigest),
+    };
+    const owner = validateOwnerDecisionResponse(
+      await this.#options.ownerDecisionProvider(request),
+      request,
+    );
     this.#options.missionStore.recordBridgeOutcome(
       action.bridgeKey,
       "owner_decision_received",
@@ -872,13 +905,32 @@ export class M4MissionController {
     return owner;
   }
 
-  #recordedOwnerDecision(bridgeKey: string): M4OwnerApprovalDecision | null {
+  #recordedOwnerDecision(bridgeKey: string): M4OwnerDecisionResponse | null {
     const outcome = bridgeOutcome(
       this.#options.missionStore.getSnapshot(this.#options.missionId),
       bridgeKey,
       "owner_decision_received",
     );
-    return outcome === null ? null : ownerDecision(outcome.result);
+    if (outcome === null) return null;
+    const action = this.#options.missionStore
+      .getSnapshot(this.#options.missionId)
+      .bridgeActions.find((candidate) => candidate.bridgeKey === bridgeKey);
+    if (action === undefined) throw new Error(`Owner bridge ${bridgeKey} is missing`);
+    const phase = ownerPhase(action.toolName);
+    const requestWithoutDigest = {
+      missionId: action.missionId,
+      trueforgeSessionId: action.trueforgeSessionId,
+      trueforgeTurnId: action.trueforgeTurnId,
+      trueforgeThreadId: action.trueforgeThreadId,
+      trueforgeToolCallId: action.trueforgeToolCallId,
+      toolName: action.toolName,
+      arguments: action.arguments,
+      phase,
+    } as const;
+    return validateOwnerDecisionResponse(ownerDecision(outcome.result), {
+      ...requestWithoutDigest,
+      requestDigest: digest(requestWithoutDigest),
+    });
   }
 
   #recordOwnerDenial(
@@ -887,11 +939,17 @@ export class M4MissionController {
     tool: ResolvedToolCall,
     claim: ReturnType<typeof claimInputFromM4MutationArguments>,
     effect: ReturnType<typeof effectFromM4MutationArguments>,
-    owner: Extract<M4OwnerApprovalDecision, { readonly status: "deny" }>,
+    owner: M4OwnerDecisionResponse & {
+      readonly decision: Extract<
+        M4OwnerApprovalDecision,
+        { readonly status: "deny" }
+      >;
+    },
   ): {
     readonly decision: "deny";
     readonly reason: string;
     readonly source: "owner";
+    readonly ownerSourceIdentity: string;
     readonly denialId: string;
     readonly executionAttemptId: null;
   } {
@@ -910,7 +968,7 @@ export class M4MissionController {
       approverId: HERO_OWNER_ID,
       evidencePacketId: tool.sourceEventId,
       missionId: this.#options.missionId,
-      reason: owner.reason,
+      reason: owner.decision.reason,
     });
     this.#options.missionStore.recordBridgeOutcome(
       action.bridgeKey,
@@ -919,8 +977,9 @@ export class M4MissionController {
     );
     return {
       decision: "deny",
-      reason: owner.reason,
+      reason: owner.decision.reason,
       source: "owner",
+      ownerSourceIdentity: owner.ownerSourceIdentity,
       denialId,
       executionAttemptId: null,
     };
@@ -930,10 +989,12 @@ export class M4MissionController {
     store: FlakeBrakeStore,
     action: M4BridgeAction,
     claim: ReturnType<typeof claimInputFromM4MutationArguments>,
+    owner: M4OwnerDecisionResponse,
   ): {
     readonly decision: "allow";
     readonly reason: string;
     readonly source: "owner";
+    readonly ownerSourceIdentity: string;
     readonly denialId: null;
     readonly executionAttemptId: string;
   } {
@@ -947,6 +1008,7 @@ export class M4MissionController {
       decision: "allow",
       reason: "owner approved and exact M2 claim is durable",
       source: "owner",
+      ownerSourceIdentity: owner.ownerSourceIdentity,
       denialId: null,
       executionAttemptId: claimed.executionAttemptId,
     };
@@ -1125,6 +1187,36 @@ export class M4MissionController {
     });
   }
 
+  #databaseIdentities(): { readonly m2: string; readonly factory: string } {
+    return {
+      m2: readDatabaseInstanceIdentity(
+        this.#options.m2DatabasePath,
+        "m2",
+        this.#options.environmentId,
+      ),
+      factory: readDatabaseInstanceIdentity(
+        this.#options.factoryDatabasePath,
+        "factory",
+        this.#options.environmentId,
+      ),
+    };
+  }
+
+  #assertDatabaseBinding(): void {
+    const mission = this.#options.missionStore.getSnapshot(
+      this.#options.missionId,
+    ).mission;
+    const current = this.#databaseIdentities();
+    if (
+      mission.m2EnvironmentIdentity !== current.m2 ||
+      mission.factoryEnvironmentIdentity !== current.factory
+    ) {
+      throw new Error(
+        `Mission ${this.#options.missionId} database instance identity conflicts with its durable environment binding`,
+      );
+    }
+  }
+
   #hydrateApprovals(): void {
     const snapshot = this.#options.missionStore.getSnapshot(
       this.#options.missionId,
@@ -1154,24 +1246,44 @@ export class M4MissionController {
   }
 }
 
-export function deterministicM4OwnerDecisions(): M4OwnerDecisionProvider {
+export function deterministicM4OwnerDecisions(
+  ownerSourceIdentity = "test-owner/deterministic-m4-policy",
+): M4OwnerDecisionProvider {
   return (request) => {
     if (
       request.phase === "portfolio_modification" ||
       request.phase === "promise_choice"
     ) {
-      return { status: "allow" };
+      return m4OwnerDecisionResponse(request, ownerSourceIdentity, {
+        status: "allow",
+      });
     }
     const arguments_ = request.arguments as Record<string, JsonValue>;
     const claim = arguments_["claim"] as Record<string, JsonValue>;
     const effect = claim["effect"] as Record<string, JsonValue>;
     const material = effect["materialParameters"] as Record<string, JsonValue>;
-    return material["start"] === "2026-08-26T09:10:00.000Z"
+    const decision = material["start"] === "2026-08-26T09:10:00.000Z"
       ? {
-          status: "deny",
+          status: "deny" as const,
           reason: "Owner denied the primary 09:10 schedule scope",
         }
-      : { status: "allow" };
+      : { status: "allow" as const };
+    return m4OwnerDecisionResponse(request, ownerSourceIdentity, decision);
+  };
+}
+
+export function m4OwnerDecisionResponse(
+  request: M4OwnerApprovalRequest,
+  ownerSourceIdentity: string,
+  decision: M4OwnerApprovalDecision,
+): M4OwnerDecisionResponse {
+  if (ownerSourceIdentity.trim().length === 0) {
+    throw new TypeError("ownerSourceIdentity must be a non-empty string");
+  }
+  return {
+    requestDigest: request.requestDigest,
+    ownerSourceIdentity,
+    decision,
   };
 }
 
@@ -1306,6 +1418,10 @@ function approvalRecord(value: JsonValue): M4ApprovalRecord {
     decision,
     reason: jsonString(record["reason"], "reason"),
     source,
+    ownerSourceIdentity:
+      source === "owner"
+        ? jsonString(record["ownerSourceIdentity"], "ownerSourceIdentity")
+        : null,
     bridgeKey: jsonString(record["bridgeKey"], "bridgeKey"),
     denialId: jsonNullableString(record["denialId"], "denialId"),
     executionAttemptId: jsonNullableString(
@@ -1315,14 +1431,52 @@ function approvalRecord(value: JsonValue): M4ApprovalRecord {
   };
 }
 
-function ownerDecision(value: JsonValue): M4OwnerApprovalDecision {
+function ownerDecision(value: JsonValue): M4OwnerDecisionResponse {
   const record = jsonObject(value, "owner_decision_received");
-  const status = jsonString(record["status"], "status");
-  if (status === "allow") return { status };
-  if (status === "deny") {
-    return { status, reason: jsonString(record["reason"], "reason") };
+  const decisionRecord = jsonObject(record["decision"], "decision");
+  const status = jsonString(decisionRecord["status"], "status");
+  let decision: M4OwnerApprovalDecision;
+  if (status === "allow") decision = { status };
+  else if (status === "deny") {
+    decision = {
+      status,
+      reason: jsonString(decisionRecord["reason"], "reason"),
+    };
+  } else {
+    throw new TypeError("Owner decision status is invalid");
   }
-  throw new TypeError("Owner decision status is invalid");
+  return {
+    requestDigest: jsonString(record["requestDigest"], "requestDigest"),
+    ownerSourceIdentity: jsonString(
+      record["ownerSourceIdentity"],
+      "ownerSourceIdentity",
+    ),
+    decision,
+  };
+}
+
+function validateOwnerDecisionResponse(
+  value: M4OwnerDecisionResponse,
+  request: M4OwnerApprovalRequest,
+): M4OwnerDecisionResponse {
+  const parsed = ownerDecision(asJson(value));
+  if (parsed.requestDigest !== request.requestDigest) {
+    throw new Error(
+      "External owner decision does not match the exact mission action and arguments",
+    );
+  }
+  if (parsed.ownerSourceIdentity.trim().length === 0) {
+    throw new TypeError("External owner source identity is missing");
+  }
+  return parsed;
+}
+
+function ownerPhase(toolName: string): M4OwnerApprovalRequest["phase"] {
+  if (toolName === "select_portfolio_modification") {
+    return "portfolio_modification";
+  }
+  if (toolName === "accept_promise") return "promise_choice";
+  return "consequential_effect";
 }
 
 function isM4PostModificationAdmission(value: JsonValue): boolean {
@@ -1336,7 +1490,7 @@ function isM4PostModificationAdmission(value: JsonValue): boolean {
 }
 
 function jsonObject(
-  value: JsonValue,
+  value: JsonValue | undefined,
   field: string,
 ): Readonly<Record<string, JsonValue>> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -1380,10 +1534,6 @@ function successorOwnerIsActive(ownerToken: string): boolean {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function databaseIdentity(path: string): string {
-  return `sha256:${createHash("sha256").update(path).digest("hex")}`;
 }
 
 function digest(value: unknown): string {

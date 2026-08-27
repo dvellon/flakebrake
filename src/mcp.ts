@@ -998,25 +998,34 @@ function registerM4ChangeControlTools(
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
     (input) => {
-      const acceptance = acceptPromiseOrReplay(store, input);
-      if (acceptance.status !== "COMMITTED") return toolResult({ acceptance });
-      const current = store.getPortfolio().versions;
-      const grant = store.issueGrant({
-        grantId: input.grant.grant_id,
-        grantVersion: input.grant.grant_version,
-        admissionRecordId: input.admission_record_id,
-        promiseBasisId: input.grant.scope.promiseBasisId,
-        acceptedOwnerDecisionId: input.owner_decision_id,
-        ownerDecisionId: input.grant.grant_owner_decision_id,
-        selectedBundleId: input.grant.selected_bundle_id,
-        selectedPlanId: input.selected_plan_id,
-        scope: input.grant.scope as ApprovalScope,
-        postDenialAuthorization: null,
-        expectedPortfolioVersion: current.portfolioVersion,
-        expectedCapacityModelVersion: current.capacityModelVersion,
-        expectedCapacityPlanVersion: current.capacityPlanVersion,
+      const result = store.acceptPromiseAndIssueGrant({
+        acceptance: {
+          admissionRecordId: input.admission_record_id,
+          selectedPlanId: input.selected_plan_id,
+          ownerDecisionId: input.owner_decision_id,
+          approverId: input.approver_id,
+          expectedPortfolioVersion: input.expected_portfolio_version,
+          expectedCapacityModelVersion: input.expected_capacity_model_version,
+          expectedCapacityPlanVersion: input.expected_capacity_plan_version,
+          expectedAuthorizationStateVersion:
+            input.expected_authorization_state_version,
+          expectedCalibrationFrontierDigest:
+            input.expected_calibration_frontier_digest,
+        },
+        grant: {
+          grantId: input.grant.grant_id,
+          grantVersion: input.grant.grant_version,
+          admissionRecordId: input.admission_record_id,
+          promiseBasisId: input.grant.scope.promiseBasisId,
+          acceptedOwnerDecisionId: input.owner_decision_id,
+          ownerDecisionId: input.grant.grant_owner_decision_id,
+          selectedBundleId: input.grant.selected_bundle_id,
+          selectedPlanId: input.selected_plan_id,
+          scope: input.grant.scope as ApprovalScope,
+          postDenialAuthorization: null,
+        },
       });
-      return toolResult({ acceptance, grant });
+      return toolResult(result);
     },
   );
 
@@ -1627,70 +1636,6 @@ function recordCurrentM4AdmissionOrReplay(
   return (
     recorded?.record ?? store.evaluateAndRecordAdmission({ proposal })
   );
-}
-
-function acceptPromiseOrReplay(
-  store: FlakeBrakeStore,
-  input: z.infer<typeof acceptPromiseSchema>,
-): ReturnType<FlakeBrakeStore["acceptPromise"]> {
-  const admission = store.getAdmissionRecord(input.admission_record_id);
-  const committed = admission.addenda.find((addendum) => {
-    if (addendum.kind !== "acceptance_commit") return false;
-    if (
-      addendum.body === null ||
-      typeof addendum.body !== "object" ||
-      Array.isArray(addendum.body)
-    ) {
-      return false;
-    }
-    const body = addendum.body as Readonly<Record<string, JsonValue>>;
-    return (
-      body["ownerDecisionId"] === input.owner_decision_id &&
-      body["selectedPlanId"] === input.selected_plan_id
-    );
-  });
-  if (committed !== undefined) {
-    if (
-      input.expected_portfolio_version !== admission.record.portfolioVersion ||
-      input.expected_capacity_model_version !==
-        admission.record.capacityModelVersion ||
-      input.expected_capacity_plan_version !== admission.record.capacityPlanVersion ||
-      input.expected_authorization_state_version !==
-        admission.record.authorizationStateVersion ||
-      input.expected_calibration_frontier_digest !==
-        admission.record.calibrationFrontierDigest
-    ) {
-      throw new TypeError("Replay acceptance basis differs from the immutable admission");
-    }
-    const body = committed.body as Record<string, JsonValue>;
-    const committedPortfolioVersion = body["committedPortfolioVersion"];
-    if (typeof committedPortfolioVersion !== "string") {
-      throw new TypeError("Acceptance commit is missing its portfolio version");
-    }
-    return {
-      status: "COMMITTED",
-      admissionRecordId: input.admission_record_id,
-      selectedPlanId: input.selected_plan_id,
-      versions: {
-        portfolioVersion: committedPortfolioVersion,
-        capacityModelVersion: admission.record.capacityModelVersion,
-        capacityPlanVersion: admission.record.capacityPlanVersion,
-        authorizationStateVersion: admission.record.authorizationStateVersion,
-      },
-    };
-  }
-  return store.acceptPromise({
-    admissionRecordId: input.admission_record_id,
-    selectedPlanId: input.selected_plan_id,
-    ownerDecisionId: input.owner_decision_id,
-    approverId: input.approver_id,
-    expectedPortfolioVersion: input.expected_portfolio_version,
-    expectedCapacityModelVersion: input.expected_capacity_model_version,
-    expectedCapacityPlanVersion: input.expected_capacity_plan_version,
-    expectedAuthorizationStateVersion: input.expected_authorization_state_version,
-    expectedCalibrationFrontierDigest:
-      input.expected_calibration_frontier_digest,
-  });
 }
 
 function normalizedMutation(

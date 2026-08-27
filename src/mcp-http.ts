@@ -8,7 +8,6 @@ import {
   createFactoryMcpService,
   type FactoryMcpServiceName,
   type FactoryMcpServiceOptions,
-  type RunningFactoryMcpService,
 } from "./mcp.js";
 import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 
@@ -38,10 +37,14 @@ export interface RunningFactoryMcpHttpCluster {
   readonly close: () => Promise<void>;
 }
 
-interface ActiveRequest {
-  readonly transport: StreamableHTTPServerTransport;
-  readonly service: RunningFactoryMcpService;
+interface AcceptedRequest {
+  readonly request: IncomingMessage;
+  readonly response: import("node:http").ServerResponse;
+  readonly done: Promise<void>;
+  readonly resolveDone: () => void;
 }
+
+const HTTP_DRAIN_TIMEOUT_MS = 500;
 
 /**
  * Starts one stateless MCP Streamable HTTP endpoint. A fresh MCP server/transport
@@ -56,13 +59,23 @@ export async function startFactoryMcpHttpService(
   const port = options.port ?? 0;
   assertLoopback(host);
   assertPort(port);
-  const active = new Set<ActiveRequest>();
+  const accepted = new Set<AcceptedRequest>();
   let closing = false;
   const httpServer = createServer((request, response) => {
+    let resolveDone: (() => void) | undefined;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const acceptedRequest: AcceptedRequest = {
+      request,
+      response,
+      done,
+      resolveDone: () => resolveDone?.(),
+    };
+    accepted.add(acceptedRequest);
     void handleHttpRequest(
       serviceName,
       options,
-      active,
       request,
       response,
     ).catch(() => {
@@ -71,6 +84,9 @@ export async function startFactoryMcpHttpService(
       } else if (!response.writableEnded) {
         response.end();
       }
+    }).finally(() => {
+      accepted.delete(acceptedRequest);
+      acceptedRequest.resolveDone();
     });
   });
   httpServer.on("clientError", (_error, socket) => {
@@ -82,7 +98,7 @@ export async function startFactoryMcpHttpService(
     await closeHttpServer(httpServer);
     throw new Error("Factory MCP HTTP server did not bind a TCP address");
   }
-  let closed = false;
+  let closePromise: Promise<void> | undefined;
   return {
     serviceName,
     transport: "streamable-http",
@@ -90,24 +106,33 @@ export async function startFactoryMcpHttpService(
     port: address.port,
     url: `http://${host}:${String(address.port)}/mcp`,
     close: async () => {
-      if (closed) return;
-      closed = true;
-      closing = true;
-      await closeHttpServer(httpServer);
-      await Promise.allSettled(
-        [...active].map(async ({ service, transport }) => {
-          await transport.close();
-          await service.close();
-        }),
-      );
-      active.clear();
+      closePromise ??= (async () => {
+        closing = true;
+        const stopped = closeHttpServer(httpServer);
+        const initial = [...accepted];
+        const drained = await Promise.race([
+          Promise.allSettled(initial.map((item) => item.done)).then(() => true),
+          delay(HTTP_DRAIN_TIMEOUT_MS).then(() => false),
+        ]);
+        if (!drained) {
+          for (const item of [...accepted]) {
+            item.request.destroy(
+              new Error("Factory MCP HTTP shutdown aborted an incomplete request"),
+            );
+            item.response.destroy();
+          }
+        }
+        await Promise.allSettled([...accepted].map((item) => item.done));
+        httpServer.closeAllConnections();
+        await stopped;
+      })();
+      await closePromise;
     },
   };
 
   async function handleHttpRequest(
     name: FactoryMcpServiceName,
     serviceOptions: FactoryMcpServiceOptions,
-    requests: Set<ActiveRequest>,
     request: IncomingMessage,
     response: import("node:http").ServerResponse,
   ): Promise<void> {
@@ -144,13 +169,10 @@ export async function startFactoryMcpHttpService(
     // cast only bridges the SDK declaration's exact-optional mismatch; it does
     // not alter the runtime transport or wrap it in an in-process substitute.
     const transport = new StreamableHTTPServerTransport();
-    const activeRequest = { service, transport } as const;
-    requests.add(activeRequest);
     try {
       await service.server.connect(transport as unknown as Transport);
       await transport.handleRequest(request, response, parsedBody);
     } finally {
-      requests.delete(activeRequest);
       await transport.close();
       await service.close();
     }
@@ -233,8 +255,12 @@ function closeHttpServer(server: Server): Promise<void> {
       if (error) reject(error);
       else resolve();
     });
-    server.closeAllConnections();
+    server.closeIdleConnections();
   });
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function writeJsonRpcError(

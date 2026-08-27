@@ -12,6 +12,7 @@ import {
   createStore,
   ExecutionAttemptConflictError,
   rational,
+  readDatabaseInstanceIdentity,
   StatefulInputError,
 } from "../src/index.js";
 import type {
@@ -727,6 +728,121 @@ describe("M2 acceptance compare-and-swap A-F", () => {
       assert.equal(item.store.getPortfolio().acceptedObligations.length, 1);
     } finally {
       dispose(item);
+    }
+  });
+});
+
+describe("M2 Qodo PR #5 atomicity and database incarnation", () => {
+  test("acceptance and its exact grant roll back and replay as one durable pair", () => {
+    const item = tempStoreFromState(initialState());
+    try {
+      const admission = evaluate(item.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        item.store.getPortfolio().versions,
+        admission,
+        "qodo-atomic-grant",
+        "qodo-atomic-grant-decision",
+        "qodo-atomic-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const before = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance,
+            grant: {
+              ...grant,
+              scope: {
+                ...grant.scope,
+                objectiveId: "objective/qodo-injected-failure",
+              },
+            },
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), before);
+
+      const committed = item.store.acceptPromiseAndIssueGrant({
+        acceptance,
+        grant,
+      });
+      assert.equal(committed.acceptance.status, "COMMITTED");
+      assert.ok(committed.grant);
+      assert.equal(
+        item.store
+          .getAdmissionRecord(admission.admissionRecordId)
+          .addenda.filter((addendum) => addendum.kind === "acceptance_commit")
+          .length,
+        1,
+      );
+      assert.deepEqual(
+        item.store.acceptPromiseAndIssueGrant({ acceptance, grant }),
+        committed,
+      );
+      const after = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance,
+            grant: { ...grant, selectedBundleId: "qodo-conflicting-bundle" },
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), after);
+    } finally {
+      dispose(item);
+    }
+  });
+
+  test("database incarnation migrates once, survives restart, and rejects mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-incarnation-"));
+    const path = join(directory, "m2 with spaces.sqlite");
+    const uninitialized = new DatabaseSync(path);
+    uninitialized.close();
+    const store = createStore({ path, initialState: initialState() });
+    store.close();
+    try {
+      const first = readDatabaseInstanceIdentity(path, "m2", "factory-1");
+      const restarted = createStore({ path });
+      restarted.close();
+      assert.equal(
+        readDatabaseInstanceIdentity(path, "m2", "factory-1"),
+        first,
+      );
+      const database = new DatabaseSync(path);
+      try {
+        assert.throws(
+          () =>
+            database
+              .prepare(
+                "UPDATE database_incarnation SET incarnation_id = ? WHERE singleton = 1",
+              )
+              .run("database-incarnation/forged"),
+          /database incarnation is immutable/u,
+        );
+        assert.throws(
+          () =>
+            database
+              .prepare("DELETE FROM database_incarnation WHERE singleton = 1")
+              .run(),
+          /database incarnation is immutable/u,
+        );
+      } finally {
+        database.close();
+      }
+      assert.equal(
+        readDatabaseInstanceIdentity(path, "m2", "factory-1"),
+        first,
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

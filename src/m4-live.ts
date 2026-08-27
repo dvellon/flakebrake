@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
@@ -6,8 +7,8 @@ import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
 import { canonicalSerialize } from "./canonical.js";
 import {
   M4MissionController,
-  deterministicM4OwnerDecisions,
   type M4MissionRunResult,
+  type M4OwnerDecisionProvider,
 } from "./m4-mission-controller.js";
 import { M4MissionStore } from "./m4-mission-store.js";
 import { startFactoryMcpHttpCluster } from "./mcp-http.js";
@@ -18,15 +19,28 @@ import {
 } from "./hero-fixture.js";
 import { SyntheticFactoryEnvironment } from "./factory-environment.js";
 import { createStore, type FlakeBrakeStore } from "./store.js";
+import { readDatabaseInstanceIdentity } from "./sqlite.js";
+import type { RunningFactoryMcpHttpCluster } from "./mcp-http.js";
 import {
   ensureFlakeBrakeRootAgent,
   registerFactoryMcpConnectors,
   startTrueForgeServer,
+  type RunningTrueForgeServer,
 } from "./trueforge-runtime.js";
 
 export const M4_LIVE_MISSION_ID = "mission/flakebrake-m4-live";
-export const DEFAULT_M0_TRUEFORGE_DATABASE_PATH =
-  "/home/cd/.local/share/flakebrake/trueforge.sqlite";
+
+export type LiveM4AcquisitionStage =
+  | "environment_initialized"
+  | "http_started"
+  | "trueforge_started"
+  | "mission_store_opened"
+  | "connectors_registered"
+  | "model_provider_configured"
+  | "sandbox_provider_configured"
+  | "sandbox_provider_ready"
+  | "agent_ready"
+  | "session_ready";
 
 export interface LiveM4MissionOptions {
   readonly m2DatabasePath: string;
@@ -34,8 +48,12 @@ export interface LiveM4MissionOptions {
   readonly missionDatabasePath: string;
   readonly trueforgeDatabasePath: string;
   readonly localSandboxRootParent: string;
-  readonly m0TrueForgeDatabasePath?: string;
+  readonly m0TrueForgeDatabasePath: string;
   readonly model?: string;
+  readonly ownerDecisionProvider: M4OwnerDecisionProvider;
+  readonly lifecycleObserver?: (
+    stage: LiveM4AcquisitionStage,
+  ) => Promise<void> | void;
 }
 
 export interface LiveM4MissionResult {
@@ -52,6 +70,17 @@ export interface LiveM4MissionResult {
   readonly actualConsumptionFacts: number;
 }
 
+interface LiveResourceOwners {
+  readonly missionStore: M4MissionStore | undefined;
+  readonly clearMissionStore: () => void;
+  readonly trueforge: RunningTrueForgeServer | undefined;
+  readonly clearTrueForge: () => void;
+  readonly http: RunningFactoryMcpHttpCluster | undefined;
+  readonly clearHttp: () => void;
+}
+
+const LIVE_MISSION_RUNS = new Map<string, Promise<void>>();
+
 /**
  * Separately invoked live acceptance run. Credentials are copied in memory
  * from the M0 TrueForge store into an isolated TrueForge 0.1.4 process and are
@@ -60,106 +89,284 @@ export interface LiveM4MissionResult {
 export async function runLiveM4Mission(
   options: LiveM4MissionOptions,
 ): Promise<LiveM4MissionResult> {
-  initializeLiveEnvironment(options);
-  const m0 = readM0Configuration(
-    options.m0TrueForgeDatabasePath ?? DEFAULT_M0_TRUEFORGE_DATABASE_PATH,
-  );
+  if (typeof options.ownerDecisionProvider !== "function") {
+    throw new TypeError(
+      "An explicit external owner decision provider is required",
+    );
+  }
+  if (
+    typeof options.m0TrueForgeDatabasePath !== "string" ||
+    options.m0TrueForgeDatabasePath.length === 0
+  ) {
+    throw new TypeError("An explicit M0 TrueForge database path is required");
+  }
+  const m0 = readM0Configuration(options.m0TrueForgeDatabasePath);
   const modelName = options.model ?? "openai/gpt-5-4-mini";
   if (!m0.modelNames.includes(modelName)) {
     throw new Error(
       `Live M4 smoke prerequisite is unavailable: model ${modelName} was not proven by M0`,
     );
   }
-  const http = await startFactoryMcpHttpCluster({
-    factoryDatabasePath: options.factoryDatabasePath,
-    m2DatabasePath: options.m2DatabasePath,
-    now: () => HERO_HORIZON_END,
-    enableM4Tools: true,
-  });
-  const trueforge = await startTrueForgeServer({
-    sqlitePath: options.trueforgeDatabasePath,
-    localSandboxRootParent: options.localSandboxRootParent,
-  });
-  const missionStore = new M4MissionStore({
-    path: options.missionDatabasePath,
-    now: () => HERO_HORIZON_END,
-  });
+  const releaseMissionRun = await acquireLiveMissionRun(
+    options.missionDatabasePath,
+  );
   try {
-    const connectors = await registerFactoryMcpConnectors(
-      trueforge.client,
-      http,
-    );
-    await trueforge.client.settings.modelProviders.createOrUpdate({
-      manifest: m0.modelProvider,
-    });
-    await trueforge.client.settings.sandboxProviders.createOrUpdate({
-      manifest: m0.sandboxProvider,
-    });
-    await waitForDaytona(trueforge.client);
-    const agent = await ensureFlakeBrakeRootAgent(trueforge.client, modelName);
-    const session = await trueforge.client.sessions.create({
-      agent: { name: agent.name },
-    });
-    const controller = new M4MissionController({
-      missionId: M4_LIVE_MISSION_ID,
-      environmentId: HERO_ENVIRONMENT_ID,
-      trueforgeAgentId: agent.id,
-      trueforgeSessionId: session.data.id,
-      trueforgeClient: trueforge.client,
-      missionStore,
-      m2DatabasePath: options.m2DatabasePath,
-      factoryDatabasePath: options.factoryDatabasePath,
-      ownerDecisionProvider: deterministicM4OwnerDecisions(),
-      disconnectInitialStreamAfterEvents: 4,
-    });
-    const mission = await controller.runToCompletion();
-    const store = createStore({ path: options.m2DatabasePath });
-    const factory = new SyntheticFactoryEnvironment({
-      path: options.factoryDatabasePath,
-      now: () => HERO_HORIZON_END,
-    });
+    let http: RunningFactoryMcpHttpCluster | undefined;
+    let trueforge: RunningTrueForgeServer | undefined;
+    let missionStore: M4MissionStore | undefined;
+    let result: LiveM4MissionResult | undefined;
+    let primaryFailure: unknown;
     try {
-      const result: LiveM4MissionResult = {
-        mission,
-        model: modelName,
-        sandboxProvider: "daytona",
-        connectorUrls: Object.fromEntries(connectors),
-        subagentThreads: mission.trueforgeEvents
-          .filter((item) => item.event.type === "thread.created")
-          .map((item) =>
-            item.event.type === "thread.created"
-              ? {
-                  threadId: item.event.threadId,
-                  title: item.event.title,
-                }
-              : { threadId: "", title: "" },
-          ),
-        sandboxIds: mission.trueforgeEvents
-          .filter((item) => item.event.type === "sandbox.created")
-          .map((item) =>
-            item.event.type === "sandbox.created" ? item.event.sandboxId : "",
-          ),
-        controlledWriteCount: factory
-          .getScheduleState()
-          .reservations.filter(
-            (reservation) => reservation.sourceExecutionAttemptId !== null,
-          ).length,
-        actualConsumptionFacts: store
-          .getAdmissionHistory()
-          .flatMap((admission) => admission.addenda)
-          .filter((addendum) => addendum.kind === "actual_consumption").length,
-      };
-      assertLiveAcceptance(result, store, factory);
-      return result;
-    } finally {
-      factory.close();
-      store.close();
+      initializeLiveEnvironment(options);
+      await options.lifecycleObserver?.("environment_initialized");
+      http = await startFactoryMcpHttpCluster({
+        factoryDatabasePath: options.factoryDatabasePath,
+        m2DatabasePath: options.m2DatabasePath,
+        now: () => HERO_HORIZON_END,
+        enableM4Tools: true,
+      });
+      await options.lifecycleObserver?.("http_started");
+      trueforge = await startTrueForgeServer({
+        sqlitePath: options.trueforgeDatabasePath,
+        localSandboxRootParent: options.localSandboxRootParent,
+      });
+      await options.lifecycleObserver?.("trueforge_started");
+      missionStore = new M4MissionStore({
+        path: options.missionDatabasePath,
+        now: () => HERO_HORIZON_END,
+      });
+      await options.lifecycleObserver?.("mission_store_opened");
+      const connectors = await registerFactoryMcpConnectors(
+        trueforge.client,
+        http,
+      );
+      await options.lifecycleObserver?.("connectors_registered");
+      await trueforge.client.settings.modelProviders.createOrUpdate({
+        manifest: m0.modelProvider,
+      });
+      await options.lifecycleObserver?.("model_provider_configured");
+      await trueforge.client.settings.sandboxProviders.createOrUpdate({
+        manifest: m0.sandboxProvider,
+      });
+      await options.lifecycleObserver?.("sandbox_provider_configured");
+      await waitForDaytona(trueforge.client);
+      await options.lifecycleObserver?.("sandbox_provider_ready");
+      const agent = await ensureFlakeBrakeRootAgent(
+        trueforge.client,
+        modelName,
+      );
+      await options.lifecycleObserver?.("agent_ready");
+      let sessionId: string;
+      const existing =
+        missionStore.getSnapshotOrNull(M4_LIVE_MISSION_ID)?.mission;
+      if (existing !== undefined && existing.trueforgeAgentId !== agent.id) {
+        throw new Error(
+          "Persisted live M4 mission is bound to a different TrueForge agent",
+        );
+      }
+      sessionId =
+        existing?.trueforgeSessionId ??
+        (
+          await trueforge.client.sessions.create({
+            agent: { name: agent.name },
+          })
+        ).data.id;
+      if (existing !== undefined) {
+        await trueforge.client.sessions.get(sessionId);
+      }
+      missionStore.bindMission({
+        missionId: M4_LIVE_MISSION_ID,
+        environmentId: HERO_ENVIRONMENT_ID,
+        trueforgeAgentId: agent.id,
+        trueforgeSessionId: sessionId,
+        m2EnvironmentIdentity: readDatabaseInstanceIdentity(
+          options.m2DatabasePath,
+          "m2",
+          HERO_ENVIRONMENT_ID,
+        ),
+        factoryEnvironmentIdentity: readDatabaseInstanceIdentity(
+          options.factoryDatabasePath,
+          "factory",
+          HERO_ENVIRONMENT_ID,
+        ),
+      });
+      await options.lifecycleObserver?.("session_ready");
+      const controller = new M4MissionController({
+        missionId: M4_LIVE_MISSION_ID,
+        environmentId: HERO_ENVIRONMENT_ID,
+        trueforgeAgentId: agent.id,
+        trueforgeSessionId: sessionId,
+        trueforgeClient: trueforge.client,
+        missionStore,
+        m2DatabasePath: options.m2DatabasePath,
+        factoryDatabasePath: options.factoryDatabasePath,
+        ownerDecisionProvider: options.ownerDecisionProvider,
+        disconnectInitialStreamAfterEvents: 4,
+      });
+      const mission = await controller.runToCompletion();
+      const store = createStore({ path: options.m2DatabasePath });
+      const factory = new SyntheticFactoryEnvironment({
+        path: options.factoryDatabasePath,
+        now: () => HERO_HORIZON_END,
+      });
+      try {
+        result = {
+          mission,
+          model: modelName,
+          sandboxProvider: "daytona",
+          connectorUrls: Object.fromEntries(connectors),
+          subagentThreads: mission.trueforgeEvents
+            .filter((item) => item.event.type === "thread.created")
+            .map((item) =>
+              item.event.type === "thread.created"
+                ? {
+                    threadId: item.event.threadId,
+                    title: item.event.title,
+                  }
+                : { threadId: "", title: "" },
+            ),
+          sandboxIds: mission.trueforgeEvents
+            .filter((item) => item.event.type === "sandbox.created")
+            .map((item) =>
+              item.event.type === "sandbox.created" ? item.event.sandboxId : "",
+            ),
+          controlledWriteCount: factory
+            .getScheduleState()
+            .reservations.filter(
+              (reservation) => reservation.sourceExecutionAttemptId !== null,
+            ).length,
+          actualConsumptionFacts: store
+            .getAdmissionHistory()
+            .flatMap((admission) => admission.addenda)
+            .filter((addendum) => addendum.kind === "actual_consumption")
+            .length,
+        };
+        assertLiveAcceptance(result, store, factory);
+      } finally {
+        factory.close();
+        store.close();
+      }
+    } catch (error: unknown) {
+      primaryFailure = error;
     }
+    const owners: LiveResourceOwners = {
+      get missionStore() {
+        return missionStore;
+      },
+      clearMissionStore() {
+        missionStore = undefined;
+      },
+      get trueforge() {
+        return trueforge;
+      },
+      clearTrueForge() {
+        trueforge = undefined;
+      },
+      get http() {
+        return http;
+      },
+      clearHttp() {
+        http = undefined;
+      },
+    };
+    const cleanupFailures = await cleanupLiveResources(owners);
+    if (primaryFailure !== undefined) {
+      attachCleanupDiagnostics(primaryFailure, cleanupFailures, () =>
+        cleanupLiveResources(owners),
+      );
+      throw primaryFailure;
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(cleanupFailures, "Live M4 cleanup failed");
+    }
+    if (result === undefined)
+      throw new Error("Live M4 mission produced no result");
+    return result;
   } finally {
-    missionStore.close();
-    await trueforge.close();
-    await http.close();
+    releaseMissionRun();
   }
+}
+
+async function acquireLiveMissionRun(
+  missionDatabasePath: string,
+): Promise<() => void> {
+  const key = resolve(missionDatabasePath);
+  const predecessor = LIVE_MISSION_RUNS.get(key) ?? Promise.resolve();
+  let releaseGate: (() => void) | undefined;
+  const gate = new Promise<void>((resolveGate) => {
+    releaseGate = resolveGate;
+  });
+  const tail = predecessor.then(() => gate);
+  LIVE_MISSION_RUNS.set(key, tail);
+  await predecessor;
+  return () => {
+    releaseGate?.();
+    if (LIVE_MISSION_RUNS.get(key) === tail) {
+      LIVE_MISSION_RUNS.delete(key);
+    }
+  };
+}
+
+async function cleanupLiveResources(
+  owners: LiveResourceOwners,
+): Promise<unknown[]> {
+  let failures: unknown[] = [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const currentFailures: unknown[] = [];
+    if (owners.missionStore !== undefined) {
+      try {
+        owners.missionStore.close();
+        owners.clearMissionStore();
+      } catch (error: unknown) {
+        currentFailures.push(error);
+      }
+    }
+    if (owners.trueforge !== undefined) {
+      try {
+        await owners.trueforge.close();
+        owners.clearTrueForge();
+      } catch (error: unknown) {
+        currentFailures.push(error);
+      }
+    }
+    if (owners.http !== undefined) {
+      try {
+        await owners.http.close();
+        owners.clearHttp();
+      } catch (error: unknown) {
+        currentFailures.push(error);
+      }
+    }
+    failures = currentFailures;
+    if (failures.length === 0) break;
+  }
+  return failures;
+}
+
+function attachCleanupDiagnostics(
+  primary: unknown,
+  failures: readonly unknown[],
+  retryCleanup: () => Promise<unknown[]>,
+): void {
+  if (
+    failures.length === 0 ||
+    (typeof primary !== "object" && typeof primary !== "function") ||
+    primary === null
+  ) {
+    return;
+  }
+  Object.defineProperties(primary, {
+    cleanupDiagnostics: {
+      configurable: true,
+      enumerable: false,
+      value: [...failures],
+    },
+    retryCleanup: {
+      configurable: true,
+      enumerable: false,
+      value: retryCleanup,
+    },
+  });
 }
 
 function assertLiveAcceptance(
@@ -171,7 +378,9 @@ function assertLiveAcceptance(
     result.subagentThreads.length !== 3 ||
     new Set(result.subagentThreads.map((thread) => thread.threadId)).size !== 3
   ) {
-    throw new Error("Live M4 acceptance did not persist three distinct subagents");
+    throw new Error(
+      "Live M4 acceptance did not persist three distinct subagents",
+    );
   }
   const assurance = result.subagentThreads.find(
     (thread) => thread.title === "Assurance and simulation engineer",
@@ -269,7 +478,9 @@ function assertDurableHeroAcceptance(
     attempt.input.resourceCapacityClaims["agent_work_units"] !== 6 ||
     attempt.input.resourceCapacityClaims["production_cell_minutes"] !== 30
   ) {
-    throw new Error("Live M4 execution was not bound to the exact fresh admission");
+    throw new Error(
+      "Live M4 execution was not bound to the exact fresh admission",
+    );
   }
   const reservation = store
     .getReservations(true)
@@ -300,7 +511,8 @@ function assertDurableHeroAcceptance(
     (order) => order.obligationId === "order/best-effort-display",
   );
   if (
-    canonicalSerialize(currentProtected) !== canonicalSerialize(initialProtected) ||
+    canonicalSerialize(currentProtected) !==
+      canonicalSerialize(initialProtected) ||
     bestEffort?.serviceLevel["quantity"] !== 8
   ) {
     throw new Error(
@@ -321,19 +533,22 @@ function assertDurableHeroAcceptance(
     actualByResource.get("agent_work_units") !== 6 ||
     actualByResource.get("production_cell_minutes") !== 30
   ) {
-    throw new Error("Live M4 actual consumption was not exactly agent 6 and production 30");
+    throw new Error(
+      "Live M4 actual consumption was not exactly agent 6 and production 30",
+    );
   }
 
   const actions = result.mission.missionSnapshot.bridgeActions;
   const denied = actions.find(
-    (action) =>
-      action.bridgeKey === result.mission.approvals[2]?.bridgeKey,
+    (action) => action.bridgeKey === result.mission.approvals[2]?.bridgeKey,
   );
   const allowed = actions.find(
-    (action) =>
-      action.bridgeKey === result.mission.approvals[4]?.bridgeKey,
+    (action) => action.bridgeKey === result.mission.approvals[4]?.bridgeKey,
   );
-  const deniedArguments = jsonRecord(denied?.arguments, "denied schedule arguments");
+  const deniedArguments = jsonRecord(
+    denied?.arguments,
+    "denied schedule arguments",
+  );
   const allowedArguments = jsonRecord(
     allowed?.arguments,
     "approved schedule arguments",
@@ -346,7 +561,9 @@ function assertDurableHeroAcceptance(
     allowedInterval.start !== "2026-08-26T09:40:00.000Z" ||
     allowedInterval.end !== "2026-08-26T10:10:00.000Z"
   ) {
-    throw new Error("Live M4 denial or approved alternative interval was not exact");
+    throw new Error(
+      "Live M4 denial or approved alternative interval was not exact",
+    );
   }
 
   assertIndependentVerificationOrder(result);
@@ -370,7 +587,8 @@ function assertIndependentVerificationOrder(result: LiveM4MissionResult): void {
   for (const event of events) {
     if (event.type !== "model.message") continue;
     for (const call of event.toolCalls ?? []) {
-      if (call.type === "function") toolNames.set(call.id, persistedToolName(call));
+      if (call.type === "function")
+        toolNames.set(call.id, persistedToolName(call));
     }
   }
   const responseIndexes = (name: string): number[] =>
@@ -382,32 +600,29 @@ function assertIndependentVerificationOrder(result: LiveM4MissionResult): void {
   const mutations = responseIndexes("create_schedule_reservation");
   const reads = responseIndexes("read_schedule_state");
   const verifications = responseIndexes("verify_schedule_execution");
-  const statuses = responseIndexes("read_execution_status");
   const mutation = mutations.at(-1) ?? -1;
   const verification = verifications.at(-1) ?? -1;
-  const terminal = statuses.at(-1) ?? -1;
   const independentRead = reads.some(
     (index) => index > mutation && index < verification,
   );
-  const rootDone = events.findIndex(
-    (event, index) =>
-      index > terminal &&
-      event.type === "turn.done" &&
-      event.state.status === "done",
+  const finalTurnDone = result.mission.trueforgeEvents.some(
+    (item) =>
+      item.turnId === result.mission.finalTurnId &&
+      item.event.type === "turn.done" &&
+      item.event.state.status === "done",
   );
   if (
     mutation < 0 ||
     !independentRead ||
     verification <= mutation ||
-    terminal <= verification ||
-    rootDone <= terminal
+    !finalTurnDone
   ) {
     throw new Error(
-      `Live M4 did not read back before verification and complete only after terminal success (mutation=${String(
+      `Live M4 did not read back before verification or retain its completed final provider turn (mutation=${String(
         mutation,
       )}, reads=${reads.join(",")}, verification=${String(
         verification,
-      )}, terminal=${String(terminal)}, rootDone=${String(rootDone)})`,
+      )}, finalTurnDone=${String(finalTurnDone)})`,
     );
   }
 }
@@ -458,7 +673,9 @@ function readM0Configuration(path: string): M0Configuration {
       )
       .get() as Record<string, unknown> | undefined;
     const sandboxRow = database
-      .prepare("SELECT json(manifest) AS manifest FROM sandbox_provider LIMIT 1")
+      .prepare(
+        "SELECT json(manifest) AS manifest FROM sandbox_provider LIMIT 1",
+      )
       .get() as Record<string, unknown> | undefined;
     if (modelRow === undefined || sandboxRow === undefined) {
       throw new Error(
@@ -580,7 +797,10 @@ function initializeLiveEnvironment(options: LiveM4MissionOptions): void {
   factory.close();
 }
 
-function objectFromJson(value: unknown, field: string): Record<string, unknown> {
+function objectFromJson(
+  value: unknown,
+  field: string,
+): Record<string, unknown> {
   if (typeof value !== "string") throw new TypeError(`${field} must be JSON`);
   return object(JSON.parse(value) as unknown, field);
 }

@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
+import { IncomingMessage, Server } from "node:http";
+import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -22,6 +33,7 @@ import {
   HERO_HORIZON_END,
   HERO_RESOURCE_KEYS,
   M4MissionController,
+  M4_LIVE_MISSION_ID,
   M4MissionStore,
   TRUEFORGE_SDK_VERSION,
   TRUEFORGE_SERVER_VERSION,
@@ -29,12 +41,19 @@ import {
   createHeroInitialState,
   createHeroProposal,
   createStore,
+  deterministicM4OwnerDecisions,
   flakeBrakeRootAgentSpec,
+  m4OwnerDecisionResponse,
+  readDatabaseInstanceIdentity,
   runDeterministicM4Mission,
+  runLiveM4Mission,
   startFactoryMcpHttpCluster,
+  startFactoryMcpHttpService,
   type DeterministicM4MissionOptions,
   type DeterministicM4MissionResult,
+  type LiveM4MissionOptions,
   type M4MissionCheckpoint,
+  type M4OwnerApprovalRequest,
   type RunningFactoryMcpHttpCluster,
 } from "../src/index.js";
 
@@ -607,6 +626,16 @@ describe("M4 genuine TrueForge deterministic mission", () => {
     const alternate = first.mission.approvals[3];
     assert.ok(ownerDenial?.denialId);
     assert.equal(alternate?.denialId, ownerDenial.denialId);
+    assert.ok(
+      first.mission.approvals
+        .filter((approval) => approval.source === "owner")
+        .every(
+          (approval) =>
+            approval.ownerSourceIdentity ===
+            "test-owner/deterministic-m4-policy",
+        ),
+    );
+    assert.equal(alternate?.ownerSourceIdentity, null);
     assert.equal(first.activeDenials.length, 1);
     assert.equal(first.activeDenials[0]?.status, "active");
     assert.equal(first.activeDenials[0]?.denialId, ownerDenial.denialId);
@@ -885,8 +914,16 @@ test(
         environmentId: HERO_ENVIRONMENT_ID,
         trueforgeAgentId: "agent/nonterminal-provider-done",
         trueforgeSessionId: sessionId,
-        m2EnvironmentIdentity: databaseIdentity(m2Path),
-        factoryEnvironmentIdentity: databaseIdentity(factoryPath),
+        m2EnvironmentIdentity: readDatabaseInstanceIdentity(
+          m2Path,
+          "m2",
+          HERO_ENVIRONMENT_ID,
+        ),
+        factoryEnvironmentIdentity: readDatabaseInstanceIdentity(
+          factoryPath,
+          "factory",
+          HERO_ENVIRONMENT_ID,
+        ),
       });
       missionStore.advanceCursor(missionId, turnId, 1);
       const controller = new M4MissionController({
@@ -898,7 +935,12 @@ test(
         missionStore,
         m2DatabasePath: m2Path,
         factoryDatabasePath: factoryPath,
-        ownerDecisionProvider: () => ({ status: "allow" }),
+        ownerDecisionProvider: (request) =>
+          m4OwnerDecisionResponse(
+            request,
+            "test-owner/nonterminal-provider",
+            { status: "allow" },
+          ),
       });
       await assert.rejects(
         controller.runToCompletion(),
@@ -1109,8 +1151,16 @@ test("17. malformed approval arguments are denied before durable business mutati
       environmentId: HERO_ENVIRONMENT_ID,
       trueforgeAgentId: "agent/malformed-approval",
       trueforgeSessionId: sessionId,
-      m2EnvironmentIdentity: databaseIdentity(m2Path),
-      factoryEnvironmentIdentity: databaseIdentity(factoryPath),
+      m2EnvironmentIdentity: readDatabaseInstanceIdentity(
+        m2Path,
+        "m2",
+        HERO_ENVIRONMENT_ID,
+      ),
+      factoryEnvironmentIdentity: readDatabaseInstanceIdentity(
+        factoryPath,
+        "factory",
+        HERO_ENVIRONMENT_ID,
+      ),
     });
     missionStore.advanceCursor(missionId, turnId, 3);
     const controller = new M4MissionController({
@@ -1122,7 +1172,10 @@ test("17. malformed approval arguments are denied before durable business mutati
       missionStore,
       m2DatabasePath: m2Path,
       factoryDatabasePath: factoryPath,
-      ownerDecisionProvider: () => ({ status: "allow" }),
+      ownerDecisionProvider: (request: M4OwnerApprovalRequest) =>
+        m4OwnerDecisionResponse(request, "test-owner/malformed-approval", {
+          status: "allow",
+        }),
     });
     await assert.rejects(
       controller.runToCompletion(),
@@ -1146,6 +1199,8 @@ test("18. grouped approval calls are denied and retried only sequentially", asyn
   const sessionId = "session/grouped-approval";
   const turnId = "turn/grouped-approval";
   const calls = ["tool/grouped-left", "tool/grouped-right"];
+  initializeBoundEnvironment(m2Path, factoryPath);
+  const before = m2Snapshot(m2Path);
   const modelEvent = {
     id: "event/grouped-source",
     type: "model.message",
@@ -1233,8 +1288,16 @@ test("18. grouped approval calls are denied and retried only sequentially", asyn
       environmentId: HERO_ENVIRONMENT_ID,
       trueforgeAgentId: "agent/grouped-approval",
       trueforgeSessionId: sessionId,
-      m2EnvironmentIdentity: databaseIdentity(m2Path),
-      factoryEnvironmentIdentity: databaseIdentity(factoryPath),
+      m2EnvironmentIdentity: readDatabaseInstanceIdentity(
+        m2Path,
+        "m2",
+        HERO_ENVIRONMENT_ID,
+      ),
+      factoryEnvironmentIdentity: readDatabaseInstanceIdentity(
+        factoryPath,
+        "factory",
+        HERO_ENVIRONMENT_ID,
+      ),
     });
     missionStore.advanceCursor(missionId, turnId, 3);
     const controller = new M4MissionController({
@@ -1246,7 +1309,10 @@ test("18. grouped approval calls are denied and retried only sequentially", asyn
       missionStore,
       m2DatabasePath: m2Path,
       factoryDatabasePath: factoryPath,
-      ownerDecisionProvider: () => ({ status: "allow" }),
+      ownerDecisionProvider: (request) =>
+        m4OwnerDecisionResponse(request, "test-owner/grouped-approval", {
+          status: "allow",
+        }),
     });
     await assert.rejects(
       controller.runToCompletion(),
@@ -1254,8 +1320,7 @@ test("18. grouped approval calls are denied and retried only sequentially", asyn
     );
     assert.equal(continuationCalls, 1);
     assert.equal(missionStore.getSnapshot(missionId).bridgeActions.length, 0);
-    assert.equal(existsSync(m2Path), false);
-    assert.equal(existsSync(factoryPath), false);
+    assert.equal(m2Snapshot(m2Path), before);
   } finally {
     missionStore.close();
     rmSync(directory, { recursive: true, force: true });
@@ -1339,6 +1404,574 @@ test(
   },
 );
 
+test("Qodo R1.1 live mode without an external owner fails closed before mutation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-owner-"));
+  const options = liveOptions(directory, {
+    m0TrueForgeDatabasePath: join(directory, "missing-m0.sqlite"),
+  });
+  try {
+    await assert.rejects(
+      runLiveM4Mission(options as LiveM4MissionOptions),
+      /external owner decision provider is required/u,
+    );
+    assert.deepEqual(readdirSync(directory), []);
+
+    const wrongMissionDirectory = join(directory, "wrong-mission-owner");
+    mkdirSync(wrongMissionDirectory);
+    const wrongMissionOptions = {
+      m2DatabasePath: join(wrongMissionDirectory, "m2.sqlite"),
+      factoryDatabasePath: join(wrongMissionDirectory, "factory.sqlite"),
+      missionDatabasePath: join(wrongMissionDirectory, "mission.sqlite"),
+      trueforgeDatabasePath: join(wrongMissionDirectory, "trueforge.sqlite"),
+      localSandboxRootParent: join(wrongMissionDirectory, "sandboxes"),
+      ownerDecisionProvider: (request: M4OwnerApprovalRequest) => ({
+        ...m4OwnerDecisionResponse(request, "test-owner/wrong-mission", {
+          status: "allow",
+        }),
+        requestDigest: "sha256:wrong-mission-and-arguments",
+      }),
+    } satisfies DeterministicM4MissionOptions;
+    await assert.rejects(
+      runDeterministicM4Mission(wrongMissionOptions),
+      /does not match the exact mission action and arguments/u,
+    );
+    const afterWrongOwner = createStore({
+      path: wrongMissionOptions.m2DatabasePath,
+    });
+    try {
+      assert.equal(
+        afterWrongOwner.getPortfolio().versions.portfolioVersion,
+        "portfolio/v1",
+      );
+      assert.equal(
+        afterWrongOwner
+          .getAdmissionHistory()
+          .flatMap((admission) => admission.addenda)
+          .some((addendum) => addendum.kind === "owner_choice"),
+        false,
+      );
+    } finally {
+      afterWrongOwner.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test(
+  "Qodo R1.2 a process-restarted live retry reuses its durable session and terminal result",
+  { timeout: 180_000 },
+  async (context) => {
+    const provenM0Path = process.env["FLAKEBRAKE_M0_DATABASE_PATH"];
+    if (provenM0Path === undefined) {
+      context.skip("FLAKEBRAKE_M0_DATABASE_PATH is required for live resume coverage");
+      return;
+    }
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-live-resume-"));
+    const seedOptions: DeterministicM4MissionOptions = {
+      m2DatabasePath: join(directory, "m2.sqlite"),
+      factoryDatabasePath: join(directory, "factory.sqlite"),
+      missionDatabasePath: join(directory, "mission.sqlite"),
+      trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
+      localSandboxRootParent: join(directory, "sandboxes"),
+      missionId: M4_LIVE_MISSION_ID,
+    };
+    const options = {
+      ...seedOptions,
+      m0TrueForgeDatabasePath: provenM0Path,
+      ownerDecisionProvider: (request: M4OwnerApprovalRequest) =>
+        m4OwnerDecisionResponse(request, "test-owner/qodo-live-resume", {
+          status: "allow",
+        }),
+    } satisfies LiveM4MissionOptions;
+    try {
+      const seed = await runDeterministicM4Mission(seedOptions);
+      assert.equal(seed.mission.missionId, M4_LIVE_MISSION_ID);
+      const snapshotBefore = missionSnapshot(options.missionDatabasePath);
+      const sessionsBefore = trueForgeSessionCount(
+        options.trueforgeDatabasePath,
+      );
+      const retries = await Promise.allSettled([
+        runLiveM4Mission(options),
+        runLiveM4Mission(options),
+      ]);
+      assert.equal(retries[0]?.status, retries[1]?.status);
+      if (retries[0]?.status === "fulfilled" && retries[1]?.status === "fulfilled") {
+        assert.equal(
+          retries[0].value.mission.trueforgeSessionId,
+          retries[1].value.mission.trueforgeSessionId,
+        );
+        assert.equal(
+          retries[0].value.mission.projectionDigest,
+          retries[1].value.mission.projectionDigest,
+        );
+      } else if (
+        retries[0]?.status === "rejected" &&
+        retries[1]?.status === "rejected"
+      ) {
+        const messages = retries.map((retry) =>
+          retry.status === "rejected" && retry.reason instanceof Error
+            ? retry.reason.message
+            : String(retry.status === "rejected" ? retry.reason : ""),
+        );
+        assert.equal(messages[0], messages[1]);
+        assert.doesNotMatch(
+          messages[0] ?? "",
+          /binding conflicts|different TrueForge session|Internal server error/u,
+        );
+      }
+      assert.equal(
+        trueForgeSessionCount(options.trueforgeDatabasePath),
+        sessionsBefore,
+      );
+      assert.equal(missionSnapshot(options.missionDatabasePath), snapshotBefore);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("Qodo R1.3 promise acceptance and grant issuance roll back as one unit", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-atomic-"));
+  const m2Path = join(directory, "m2.sqlite");
+  const factoryPath = join(directory, "factory.sqlite");
+  const store = createStore({
+    path: m2Path,
+    initialState: createHeroInitialState(),
+    now: () => HERO_HORIZON_END,
+  });
+  const factory = new SyntheticFactoryEnvironment({
+    path: factoryPath,
+    now: () => HERO_HORIZON_END,
+  });
+  store.close();
+  factory.close();
+  const cluster = await startFactoryMcpHttpCluster({
+    m2DatabasePath: m2Path,
+    factoryDatabasePath: factoryPath,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+  });
+  try {
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      await client.callTool({ name: "record_current_admission", arguments: {} });
+      const preparedModification = resultObject(
+        (await client.callTool({
+          name: "prepare_portfolio_modification",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      await client.callTool({
+        name: "select_portfolio_modification",
+        arguments: record(preparedModification["arguments"], "modification"),
+      });
+      const preparedAcceptance = resultObject(
+        (await client.callTool({
+          name: "prepare_promise_acceptance",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      const exact = record(preparedAcceptance["arguments"], "acceptance");
+      const exactGrant = record(exact["grant"], "grant");
+      const badGrant = {
+        ...exactGrant,
+        scope: {
+          ...record(exactGrant["scope"], "grant scope"),
+          objectiveId: "objective/qodo-injected-invalid",
+        },
+      };
+      const failed = (await client.callTool({
+        name: "accept_promise",
+        arguments: { ...exact, grant: badGrant },
+      })) as CallToolResult;
+      assert.equal(failed.isError, true);
+
+      const afterFailure = createStore({ path: m2Path });
+      try {
+        const admission = afterFailure.getAdmissionRecord(
+          String(exact["admission_record_id"]),
+        );
+        assert.equal(
+          admission.addenda.filter(
+            (addendum) => addendum.kind === "acceptance_commit",
+          ).length,
+          0,
+        );
+        assert.equal(
+          afterFailure.getPortfolio().versions.portfolioVersion,
+          "portfolio/v2",
+        );
+      } finally {
+        afterFailure.close();
+      }
+
+      const committed = resultObject(
+        (await client.callTool({
+          name: "accept_promise",
+          arguments: exact,
+        })) as CallToolResult,
+      );
+      assert.equal(record(committed["acceptance"], "acceptance")["status"], "COMMITTED");
+      const replay = resultObject(
+        (await client.callTool({
+          name: "accept_promise",
+          arguments: exact,
+        })) as CallToolResult,
+      );
+      assert.equal(canonicalSerialize(replay), canonicalSerialize(committed));
+    });
+  } finally {
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Qodo R1.4 live M0 configuration is explicit and portable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake qodo portable "));
+  const syntheticHome = join(directory, "synthetic home");
+  mkdirSync(syntheticHome);
+  const previousHome = process.env["HOME"];
+  process.env["HOME"] = syntheticHome;
+  try {
+    await assert.rejects(
+      runLiveM4Mission(
+        liveOptions(directory, {
+          model: "openai/qodo-not-proven",
+          ownerDecisionProvider: deterministicM4OwnerDecisions(
+            "test-owner/qodo-portable",
+          ),
+        }) as LiveM4MissionOptions,
+      ),
+      /explicit M0 TrueForge database path is required/u,
+    );
+    assert.deepEqual(readdirSync(directory), ["synthetic home"]);
+
+    const portableM0Path = join(directory, "M0 configuration with spaces.sqlite");
+    createSyntheticM0Database(portableM0Path);
+    await assert.rejects(
+      runLiveM4Mission(
+        liveOptions(directory, {
+          m0TrueForgeDatabasePath: portableM0Path,
+          model: "openai/qodo-not-proven",
+          ownerDecisionProvider: deterministicM4OwnerDecisions(
+            "test-owner/qodo-portable",
+          ),
+        }) as LiveM4MissionOptions,
+      ),
+      /model openai\/qodo-not-proven was not proven by M0/u,
+    );
+    assert.deepEqual(readdirSync(directory).sort(), [
+      "M0 configuration with spaces.sqlite",
+      "synthetic home",
+    ]);
+  } finally {
+    if (previousHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = previousHome;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Qodo R1.5 CLI rejects every malformed value-taking flag before allocation", () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-cli-"));
+  const cli = join(process.cwd(), "dist", "src", "m4-cli.js");
+  const valueFlags = [
+    "--m2-db",
+    "--factory-db",
+    "--mission-db",
+    "--trueforge-db",
+    "--sandbox-root",
+    "--m0-db",
+    "--model",
+    "--owner-source",
+  ] as const;
+  try {
+    for (const flag of valueFlags) {
+      const missing = spawnM4Cli(cli, directory, [
+        "--live",
+        "--m0-db",
+        join(directory, "missing.sqlite"),
+        flag,
+      ]);
+      assert.notEqual(missing.status, 0);
+      assert.match(missing.stderr, new RegExp(`${flag} requires a value`, "u"));
+
+      const followedByFlag = spawnM4Cli(cli, directory, [
+        "--live",
+        flag,
+        "--model",
+        "qodo-model",
+      ]);
+      assert.notEqual(followedByFlag.status, 0);
+      assert.match(
+        followedByFlag.stderr,
+        new RegExp(`${flag} requires a value`, "u"),
+      );
+
+      const empty = spawnM4Cli(cli, directory, ["--live", flag, ""]);
+      assert.notEqual(empty.status, 0);
+      assert.match(empty.stderr, new RegExp(`${flag}.*empty`, "u"));
+
+      const conflicting = spawnM4Cli(cli, directory, [
+        "--live",
+        flag,
+        "first",
+        flag,
+        "second",
+      ]);
+      assert.notEqual(conflicting.status, 0);
+      assert.match(conflicting.stderr, new RegExp(`${flag}.*conflicting`, "u"));
+    }
+    const unknown = spawnM4Cli(cli, directory, ["--unknown-qodo-flag"]);
+    assert.notEqual(unknown.status, 0);
+    assert.match(unknown.stderr, /unknown option --unknown-qodo-flag/u);
+    const help = spawnM4Cli(cli, directory, ["--help"]);
+    assert.equal(help.status, 0);
+    assert.match(help.stdout, /Usage: flakebrake.*m4/u);
+    assert.deepEqual(readdirSync(directory), []);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test(
+  "Qodo R1.6 replacing a database at the bound pathname fails before mutation",
+  { timeout: 180_000 },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-incarnation-"));
+    const options = liveOptions(directory);
+    try {
+      await runDeterministicM4Mission({
+        ...options,
+        missionId: "mission/qodo-database-incarnation",
+      });
+      const original = join(directory, "original-m2.sqlite");
+      renameSync(options.m2DatabasePath, original);
+      const replacement = createStore({
+        path: options.m2DatabasePath,
+        initialState: createHeroInitialState(),
+        now: () => HERO_HORIZON_END,
+      });
+      const before = canonicalSerialize(replacement.getPortfolio());
+      replacement.close();
+      await assert.rejects(
+        runDeterministicM4Mission({
+          ...options,
+          missionId: "mission/qodo-database-incarnation",
+        }),
+        /database instance identity.*conflicts/u,
+      );
+      const reopened = createStore({ path: options.m2DatabasePath });
+      try {
+        assert.equal(canonicalSerialize(reopened.getPortfolio()), before);
+        assert.equal(reopened.getAdmissionHistory().length, 0);
+      } finally {
+        reopened.close();
+      }
+
+      rmSync(options.m2DatabasePath, { force: true });
+      renameSync(original, options.m2DatabasePath);
+      const originalFactory = join(directory, "original-factory.sqlite");
+      renameSync(options.factoryDatabasePath, originalFactory);
+      const replacementFactory = new SyntheticFactoryEnvironment({
+        path: options.factoryDatabasePath,
+        now: () => HERO_HORIZON_END,
+      });
+      const factoryBefore = canonicalSerialize(
+        replacementFactory.getScheduleState(),
+      );
+      replacementFactory.close();
+      await assert.rejects(
+        runDeterministicM4Mission({
+          ...options,
+          missionId: "mission/qodo-database-incarnation",
+        }),
+        /database instance identity.*conflicts/u,
+      );
+      const reopenedFactory = new SyntheticFactoryEnvironment({
+        path: options.factoryDatabasePath,
+        now: () => HERO_HORIZON_END,
+      });
+      try {
+        assert.equal(
+          canonicalSerialize(reopenedFactory.getScheduleState()),
+          factoryBefore,
+        );
+        assert.equal(reopenedFactory.getMutationCount(), 0);
+      } finally {
+        reopenedFactory.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("Qodo R1.7 every acquired live server is cleaned after a later startup failure", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-startup-"));
+  const m0Path = join(directory, "m0.sqlite");
+  createSyntheticM0Database(m0Path);
+  const invalidTrueForgePath = join(directory, "trueforge-directory");
+  mkdirSync(invalidTrueForgePath);
+  const before = new Set(activeServerHandles());
+  let leaked: Server[] = [];
+  try {
+    await assert.rejects(
+      runLiveM4Mission(
+        liveOptions(directory, {
+          m0TrueForgeDatabasePath: m0Path,
+          trueforgeDatabasePath: invalidTrueForgePath,
+          ownerDecisionProvider: deterministicM4OwnerDecisions(
+            "test-owner/qodo-startup",
+          ),
+        }) as LiveM4MissionOptions,
+      ),
+    );
+    await tick();
+    leaked = activeServerHandles().filter(
+      (server) => !before.has(server) && server.listening,
+    );
+    assert.equal(leaked.length, 0);
+
+    const stageDirectory = join(directory, "stage boundaries");
+    mkdirSync(stageDirectory);
+    const stages = [
+      "environment_initialized",
+      "http_started",
+      "trueforge_started",
+      "mission_store_opened",
+      "connectors_registered",
+      "model_provider_configured",
+    ] as const;
+    for (const stage of stages) {
+      const beforeStage = new Set(activeServerHandles());
+      await assert.rejects(
+        runLiveM4Mission({
+          ...(liveOptions(stageDirectory, {
+            m0TrueForgeDatabasePath: m0Path,
+            ownerDecisionProvider: deterministicM4OwnerDecisions(
+              "test-owner/qodo-startup-stages",
+            ),
+          }) as LiveM4MissionOptions),
+          lifecycleObserver: (observed) => {
+            if (observed === stage) {
+              throw new Error(`planned startup failure after ${stage}`);
+            }
+          },
+        }),
+        new RegExp(`planned startup failure after ${stage}`, "u"),
+      );
+      await tick();
+      assert.equal(
+        activeServerHandles().filter(
+          (server) => !beforeStage.has(server) && server.listening,
+        ).length,
+        0,
+      );
+    }
+  } finally {
+    await Promise.allSettled(leaked.map((server) => closeServer(server)));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Qodo R1.8 close drains or aborts a fragmented accepted body before returning", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-http-close-"));
+  const m2Path = join(directory, "m2.sqlite");
+  const factoryPath = join(directory, "factory.sqlite");
+  const store = createStore({
+    path: m2Path,
+    initialState: createHeroInitialState(),
+    now: () => HERO_HORIZON_END,
+  });
+  const factory = new SyntheticFactoryEnvironment({
+    path: factoryPath,
+    now: () => HERO_HORIZON_END,
+  });
+  store.close();
+  factory.close();
+  const service = await startFactoryMcpHttpService("factory-change-control", {
+    m2DatabasePath: m2Path,
+    factoryDatabasePath: factoryPath,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+  });
+  const socket = new Socket();
+  const ownedServer = activeServerHandles().find((candidate) => {
+    const address = candidate.address();
+    return typeof address === "object" && address?.port === service.port;
+  });
+  assert.ok(ownedServer);
+  const originalClose = Server.prototype.close;
+  const originalCloseAll = Server.prototype.closeAllConnections;
+  const originalIterator = IncomingMessage.prototype[Symbol.asyncIterator];
+  let markBodyReadStarted: (() => void) | undefined;
+  const bodyReadStarted = new Promise<void>((resolve) => {
+    markBodyReadStarted = resolve;
+  });
+  let closePromise: Promise<void> | undefined;
+  try {
+    Server.prototype.close = function (
+      callback?: (error?: Error) => void,
+    ): Server {
+      if (callback !== undefined) queueMicrotask(() => callback());
+      return this;
+    };
+    Server.prototype.closeAllConnections = function (): void {};
+    IncomingMessage.prototype[Symbol.asyncIterator] = function () {
+      markBodyReadStarted?.();
+      return originalIterator.call(this);
+    };
+    await new Promise<void>((resolve, reject) => {
+      socket.once("error", reject);
+      socket.connect(service.port, service.host, resolve);
+    });
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "record_current_admission", arguments: {} },
+    });
+    const split = Math.floor(body.length / 2);
+    socket.write(
+      `POST /mcp HTTP/1.1\r\nHost: ${service.host}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2025-03-26\r\nContent-Length: ${String(Buffer.byteLength(body))}\r\nConnection: keep-alive\r\n\r\n${body.slice(0, split)}`,
+    );
+    await bodyReadStarted;
+    closePromise = service.close();
+    const premature = await Promise.race([
+      closePromise.then(() => true),
+      tick().then(() => false),
+    ]);
+    assert.equal(
+      premature,
+      false,
+      "close must account for the accepted fragmented request before resolving",
+    );
+    const outcome = await Promise.race([
+      closePromise.then(() => "closed" as const),
+      new Promise<"timed-out">((resolve) =>
+        setTimeout(() => resolve("timed-out"), 1_500),
+      ),
+    ]);
+    assert.equal(outcome, "closed");
+    socket.write(body.slice(split));
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    const after = createStore({ path: m2Path });
+    try {
+      assert.equal(after.getAdmissionHistory().length, 0);
+    } finally {
+      after.close();
+    }
+  } finally {
+    Server.prototype.close = originalClose;
+    Server.prototype.closeAllConnections = originalCloseAll;
+    IncomingMessage.prototype[Symbol.asyncIterator] = originalIterator;
+    socket.destroy();
+    await closePromise;
+    await closeServer(ownedServer);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function withHttpClient<T>(
   cluster: RunningFactoryMcpHttpCluster,
   serviceName: (typeof FACTORY_MCP_SERVICE_NAMES)[number],
@@ -1357,6 +1990,151 @@ async function withHttpClient<T>(
   } finally {
     await client.close();
   }
+}
+
+type PartialLiveM4MissionOptions = Omit<
+  LiveM4MissionOptions,
+  "m0TrueForgeDatabasePath" | "ownerDecisionProvider"
+> &
+  Partial<
+    Pick<
+      LiveM4MissionOptions,
+      "m0TrueForgeDatabasePath" | "ownerDecisionProvider"
+    >
+  >;
+
+function liveOptions(
+  directory: string,
+  overrides: Partial<LiveM4MissionOptions> = {},
+): PartialLiveM4MissionOptions {
+  return {
+    m2DatabasePath: join(directory, "m2.sqlite"),
+    factoryDatabasePath: join(directory, "factory.sqlite"),
+    missionDatabasePath: join(directory, "mission.sqlite"),
+    trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
+    localSandboxRootParent: join(directory, "sandboxes"),
+    ...overrides,
+  };
+}
+
+function missionSnapshot(path: string): string {
+  const store = new M4MissionStore({ path, now: () => HERO_HORIZON_END });
+  try {
+    return canonicalSerialize(store.getSnapshot(M4_LIVE_MISSION_ID));
+  } finally {
+    store.close();
+  }
+}
+
+function initializeBoundEnvironment(m2Path: string, factoryPath: string): void {
+  const factory = new SyntheticFactoryEnvironment({
+    path: factoryPath,
+    now: () => HERO_HORIZON_END,
+  });
+  factory.close();
+  const store = createStore({
+    path: m2Path,
+    initialState: createHeroInitialState(),
+    authoritativeFactoryDatabasePath: factoryPath,
+    now: () => HERO_HORIZON_END,
+  });
+  store.close();
+}
+
+function spawnM4Cli(
+  cli: string,
+  temporaryDirectory: string,
+  arguments_: readonly string[],
+): { readonly status: number | null; readonly stdout: string; readonly stderr: string } {
+  const result = spawnSync(process.execPath, [cli, ...arguments_], {
+    cwd: temporaryDirectory,
+    encoding: "utf8",
+    env: { ...process.env, TMPDIR: temporaryDirectory, HOME: temporaryDirectory },
+    timeout: 30_000,
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+function createSyntheticM0Database(path: string): void {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`
+      CREATE TABLE model_provider (name TEXT PRIMARY KEY, manifest TEXT NOT NULL) STRICT;
+      CREATE TABLE sandbox_provider (name TEXT PRIMARY KEY, manifest TEXT NOT NULL) STRICT;
+    `);
+    database
+      .prepare("INSERT INTO model_provider (name, manifest) VALUES (?, ?)")
+      .run(
+        "openai",
+        JSON.stringify({
+          type: "openai",
+          auth: { api_key: "test-only-not-a-credential" },
+          base_url: "http://127.0.0.1:1/v1",
+          models: [
+            {
+              name: "gpt-5-4-mini",
+              model_id: "gpt-5-4-mini",
+              properties: {
+                context_length: 32_768,
+                max_output_tokens: 4_096,
+                reasoning_efforts: ["medium"],
+              },
+            },
+          ],
+        }),
+      );
+    database
+      .prepare("INSERT INTO sandbox_provider (name, manifest) VALUES (?, ?)")
+      .run(
+        "daytona",
+        JSON.stringify({
+          type: "daytona",
+          auth: { api_key: "test-only-not-a-credential" },
+          auto_archive_interval_in_minutes: 60,
+          auto_delete_interval_in_minutes: 120,
+          auto_stop_interval_in_minutes: 30,
+          exec_timeout_ms: 10_000,
+        }),
+      );
+  } finally {
+    database.close();
+  }
+}
+
+function trueForgeSessionCount(path: string): number {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = database.prepare("SELECT count(*) AS count FROM session").get() as
+      | Record<string, unknown>
+      | undefined;
+    assert.ok(row);
+    assert.equal(typeof row["count"], "number");
+    return row["count"] as number;
+  } finally {
+    database.close();
+  }
+}
+
+function activeServerHandles(): Server[] {
+  const handles = (
+    process as unknown as { _getActiveHandles: () => readonly unknown[] }
+  )._getActiveHandles();
+  return handles.filter((handle): handle is Server => handle instanceof Server);
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections();
+  });
+}
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function resultObject(result: CallToolResult): Record<string, unknown> {

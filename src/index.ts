@@ -86,6 +86,7 @@ export type * from "./m4-deterministic-model.js";
 export {
   M4MissionController,
   deterministicM4OwnerDecisions,
+  m4OwnerDecisionResponse,
 } from "./m4-mission-controller.js";
 export type * from "./m4-mission-controller.js";
 export {
@@ -94,10 +95,10 @@ export {
 } from "./m4-runner.js";
 export type * from "./m4-runner.js";
 export {
-  DEFAULT_M0_TRUEFORGE_DATABASE_PATH,
   M4_LIVE_MISSION_ID,
   runLiveM4Mission,
 } from "./m4-live.js";
 export type * from "./m4-live.js";
 export { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 export { DuplicateJsonKeyError } from "./strict-json.js";
+export { readDatabaseInstanceIdentity } from "./sqlite.js";
