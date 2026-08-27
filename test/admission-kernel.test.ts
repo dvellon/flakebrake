@@ -313,6 +313,7 @@ function reservation(
   claims: DemandValues,
   affectedObligationIds: readonly string[] = ["existing-order"],
 ): FixedCapacityReservation {
+  const start = "2026-08-26T00:00:00Z";
   return {
     reservationId: "reservation-1",
     executionAttemptId: "attempt-1",
@@ -320,13 +321,18 @@ function reservation(
     lockedOperationId: "operation-1",
     affectedObligationIds,
     resourceClaims: demand(claims),
-    temporalClaim: {
-      resourceKey: PRODUCTION,
-      start: "2026-08-26T00:00:00Z",
-      end: "2026-08-26T00:30:00Z",
-      requiredDuration: claims.production,
-      timeUnit: "minutes",
-    },
+    temporalClaim:
+      claims.production === 0
+        ? null
+        : {
+            resourceKey: PRODUCTION,
+            start,
+            end: new Date(
+              Date.parse(start) + claims.production * 60_000,
+            ).toISOString(),
+            requiredDuration: claims.production,
+            timeUnit: "minutes",
+          },
     expectedPostcondition: { state: "finished" },
     claimAccounting,
   };
@@ -355,6 +361,37 @@ function pendingRequirementId(obligationId: string, decisionId: string): string 
     obligationId,
     decisionId,
   ]);
+}
+
+function singleRequirementProof(
+  proofId: string,
+  decisionId: string,
+  requirementId: string,
+  decisionSemantics: DecisionSemantics,
+): CombinedDecisionProof {
+  return {
+    proofId,
+    decisionId,
+    selectorId: `selector:${proofId}`,
+    selectedBundleId: `selected:${proofId}`,
+    coveredRequirementIds: [requirementId],
+    alternatives: [
+      {
+        bundleId: `selected:${proofId}`,
+        selectorValue: "selected",
+        requirementIds: [requirementId],
+        fullySpecified: true,
+      },
+      {
+        bundleId: `declined:${proofId}`,
+        selectorValue: "declined",
+        requirementIds: [],
+        fullySpecified: true,
+      },
+    ],
+    allOrNoneEnforced: true,
+    ...decisionSemantics,
+  };
 }
 
 function score(overrides: Partial<CandidateScore> = {}): CandidateScore {
@@ -1616,6 +1653,229 @@ describe("final bounded M1 closure regressions", () => {
       (error: unknown) =>
         error instanceof AdmissionInputError &&
         error.path === "fixedCapacityReservations.executionAttemptId",
+    );
+  });
+});
+
+describe("Qodo PR #2 correctness regressions", () => {
+  test("replan search rejects oversized portfolios, option lists, and candidate products", () => {
+    const oversizedPortfolio = Array.from({ length: 17 }, (_, index) =>
+      accepted({
+        id: `bounded-portfolio-${String(index)}`,
+        demand: { agent: 0, human: 0, production: 0 },
+      }),
+    );
+    assert.throws(
+      () =>
+        evaluateAdmission(
+          evaluationInput({
+            capacity: { agent: 0, human: 100, production: 100 },
+            accepted: oversizedPortfolio,
+            proposal: proposed({
+              id: "bounded-portfolio-proposal",
+              demand: { agent: 1, human: 0, production: 0 },
+            }),
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof AdmissionInputError &&
+        error.path === "acceptedObligations",
+    );
+
+    const oversizedOptions = Array.from({ length: 17 }, (_, index) =>
+      option(
+        `bounded-option-${String(index)}`,
+        { quantity: 9 },
+        { agent: 1, human: 0, production: 0 },
+      ),
+    );
+    assert.throws(
+      () =>
+        evaluateAdmission(
+          evaluationInput({
+            capacity: { agent: 0, human: 100, production: 100 },
+            accepted: [],
+            proposal: proposed({
+              id: "bounded-option-proposal",
+              demand: { agent: 1, human: 0, production: 0 },
+              options: oversizedOptions,
+            }),
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof AdmissionInputError &&
+        error.path === "proposal.modificationOptions",
+    );
+
+    const threeOptions = (prefix: string) =>
+      Array.from({ length: 3 }, (_, index) =>
+        option(
+          `${prefix}-${String(index)}`,
+          { quantity: 9 },
+          { agent: 0, human: 0, production: 0 },
+        ),
+      );
+    const productPortfolio = Array.from({ length: 4 }, (_, index) =>
+      accepted({
+        id: `candidate-product-${String(index)}`,
+        demand: { agent: 0, human: 0, production: 0 },
+        options: threeOptions(`candidate-product-option-${String(index)}`),
+      }),
+    );
+    const productProposalOptions = Array.from({ length: 4 }, (_, index) =>
+      option(
+        `candidate-product-proposal-option-${String(index)}`,
+        { quantity: 9 },
+        { agent: 1, human: 0, production: 0 },
+      ),
+    );
+    assert.throws(
+      () =>
+        evaluateAdmission(
+          evaluationInput({
+            capacity: { agent: 0, human: 100, production: 100 },
+            accepted: productPortfolio,
+            proposal: proposed({
+              id: "candidate-product-proposal",
+              demand: { agent: 1, human: 0, production: 0 },
+              options: productProposalOptions,
+            }),
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof AdmissionInputError &&
+        error.path === "replanSearch.candidateCount",
+    );
+  });
+
+  test("fixed temporal reservation duration must equal its occupied interval", () => {
+    const partialInterval: FixedCapacityReservation = {
+      ...reservation(
+        "additional",
+        { agent: 0, human: 0, production: 10 },
+        ["reservation-anchor"],
+      ),
+      temporalClaim: {
+        resourceKey: PRODUCTION,
+        start: "2026-08-26T00:00:00Z",
+        end: "2026-08-26T00:30:00Z",
+        requiredDuration: 10,
+        timeUnit: "minutes",
+      },
+    };
+
+    assert.throws(
+      () =>
+        evaluateAdmission(
+          evaluationInput({
+            capacity: { agent: 10, human: 10, production: 100 },
+            accepted: [
+              accepted({
+                id: "reservation-anchor",
+                demand: { agent: 0, human: 0, production: 0 },
+              }),
+            ],
+            proposal: proposed({
+              id: "reservation-proposal",
+              demand: { agent: 0, human: 0, production: 0 },
+            }),
+            reservations: [partialInterval],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof AdmissionInputError &&
+        error.path ===
+          "fixedCapacityReservations.0.temporalClaim.requiredDuration",
+    );
+  });
+
+  test("combined proofs cannot emit duplicate decision IDs", () => {
+    const firstSemantics = semantics("decision-collision-first");
+    const secondSemantics = semantics("decision-collision-second");
+    const proposal: ProposedObligation = {
+      ...proposed({
+        id: "decision-collision-proposal",
+        demand: { agent: 0, human: 0, production: 0 },
+      }),
+      pendingOwnerDecisions: [
+        {
+          decisionId: "pending-first",
+          kind: "consequential_effect",
+          ...firstSemantics,
+        },
+        {
+          decisionId: "pending-second",
+          kind: "consequential_effect",
+          ...secondSemantics,
+        },
+      ],
+    };
+
+    assert.throws(
+      () =>
+        evaluateAdmission(
+          evaluationInput({
+            capacity: { agent: 10, human: 10, production: 100 },
+            accepted: [],
+            proposal,
+            combinedDecisionProofs: [
+              singleRequirementProof(
+                "proof-first",
+                "colliding-decision",
+                pendingRequirementId(proposal.obligationId, "pending-first"),
+                firstSemantics,
+              ),
+              singleRequirementProof(
+                "proof-second",
+                "colliding-decision",
+                pendingRequirementId(proposal.obligationId, "pending-second"),
+                secondSemantics,
+              ),
+            ],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof AdmissionInputError &&
+        error.path === "combinedDecisionProofs.decisionId",
+    );
+  });
+
+  test("combined proof decision IDs cannot collide with generated decisions", () => {
+    const effectSemantics = semantics("generated-decision-collision");
+    const proposal: ProposedObligation = {
+      ...proposed({
+        id: "generated-decision-collision-proposal",
+        demand: { agent: 0, human: 0, production: 0 },
+      }),
+      pendingOwnerDecisions: [
+        {
+          decisionId: "pending-effect",
+          kind: "consequential_effect",
+          ...effectSemantics,
+        },
+      ],
+    };
+
+    assert.throws(
+      () =>
+        evaluateAdmission(
+          evaluationInput({
+            capacity: { agent: 10, human: 10, production: 100 },
+            accepted: [],
+            proposal,
+            combinedDecisionProofs: [
+              singleRequirementProof(
+                "proof-generated-collision",
+                acceptanceRequirementId(proposal.obligationId),
+                pendingRequirementId(proposal.obligationId, "pending-effect"),
+                effectSemantics,
+              ),
+            ],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof AdmissionInputError &&
+        error.path === "meaningfulDecisionFrontier.decisionId",
     );
   });
 });

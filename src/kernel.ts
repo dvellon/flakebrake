@@ -76,6 +76,9 @@ import {
 
 const HUMAN_REVIEW_RESOURCE_KEY = "human_review_decisions";
 const AGENT_WORK_RESOURCE_KEY = "agent_work_units";
+const MAX_ACCEPTED_OBLIGATIONS = 16;
+const MAX_MODIFICATION_OPTIONS_PER_OBLIGATION = 16;
+const MAX_REPLAN_CANDIDATES = 1_024;
 const TIME_UNIT_MILLISECONDS: Readonly<Record<TimeUnit, number>> = {
   minutes: 60_000,
   hours: 3_600_000,
@@ -707,6 +710,10 @@ function enumerateReplans(context: EvaluatorContext): EvaluatedSearch {
     obligation,
     options: constructibleOptions(context, obligation),
   }));
+  validateReplanCandidateCount(
+    proposalOptions.valid.length,
+    acceptedOptions.map((entry) => entry.options.valid.length),
+  );
   const rejectedOptions = [
     ...proposalOptions.rejected,
     ...acceptedOptions.flatMap((entry) => entry.options.rejected),
@@ -1121,6 +1128,10 @@ function buildDecisionFrontier(
   }
   decisions.sort((left, right) =>
     compareStableStrings(left.decisionId, right.decisionId),
+  );
+  assertUnique(
+    decisions.map((decision) => decision.decisionId),
+    "meaningfulDecisionFrontier.decisionId",
   );
   return { requirements, decisions, requiredDecisionCount: decisions.length };
 }
@@ -1742,6 +1753,12 @@ function validateAdmissionInput(value: unknown): AdmissionEvaluationInput {
     root["acceptedObligations"],
     "acceptedObligations",
   );
+  if (acceptedRaw.length > MAX_ACCEPTED_OBLIGATIONS) {
+    throw new AdmissionInputError(
+      "acceptedObligations",
+      `cannot exceed ${String(MAX_ACCEPTED_OBLIGATIONS)} obligations in v0.1`,
+    );
+  }
   acceptedRaw.forEach((obligation, index) =>
     validateObligation(
       obligation,
@@ -1791,6 +1808,10 @@ function validateAdmissionInput(value: unknown): AdmissionEvaluationInput {
   assertUnique(
     proofs.map((proof) => proof.proofId),
     "combinedDecisionProofs.proofId",
+  );
+  assertUnique(
+    proofs.map((proof) => proof.decisionId),
+    "combinedDecisionProofs.decisionId",
   );
   validateDecisionProofSemantics(accepted, proposal, proofs);
   return value as AdmissionEvaluationInput;
@@ -1967,6 +1988,12 @@ function validateObligation(
     obligation["modificationOptions"],
     `${path}.modificationOptions`,
   );
+  if (optionsRaw.length > MAX_MODIFICATION_OPTIONS_PER_OBLIGATION) {
+    throw new AdmissionInputError(
+      `${path}.modificationOptions`,
+      `cannot exceed ${String(MAX_MODIFICATION_OPTIONS_PER_OBLIGATION)} options in v0.1`,
+    );
+  }
   optionsRaw.forEach((option, index) =>
     validateModificationOptionInput(
       option,
@@ -2245,8 +2272,11 @@ function validateReservation(
       temporal["end"] as string,
       temporal["timeUnit"] as TimeUnit,
     );
-    if ((temporal["requiredDuration"] as number) > window) {
-      throw new AdmissionInputError(`${path}.temporalClaim`, "duration exceeds fixed window");
+    if ((temporal["requiredDuration"] as number) !== window) {
+      throw new AdmissionInputError(
+        `${path}.temporalClaim.requiredDuration`,
+        "must equal the occupied fixed interval duration",
+      );
     }
     if (
       Date.parse(temporal["start"] as string) < Date.parse(resource.horizonStart) ||
@@ -2790,6 +2820,23 @@ function strategyStatus(
     return "no_feasible_candidate";
   }
   return "available";
+}
+
+function validateReplanCandidateCount(
+  proposalOptionCount: number,
+  acceptedOptionCounts: readonly number[],
+): void {
+  let combinations = BigInt(proposalOptionCount + 1);
+  for (const optionCount of acceptedOptionCounts) {
+    combinations *= BigInt(optionCount + 1);
+  }
+  const candidateCount = combinations - 1n;
+  if (candidateCount > BigInt(MAX_REPLAN_CANDIDATES)) {
+    throw new AdmissionInputError(
+      "replanSearch.candidateCount",
+      `cannot exceed ${String(MAX_REPLAN_CANDIDATES)} constructible candidates in v0.1`,
+    );
+  }
 }
 
 function enumerateAcceptedChoices(
