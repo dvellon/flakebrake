@@ -46,6 +46,7 @@ import type { SqliteDatabase } from "./sqlite.js";
 import type {
   AcceptPromiseInput,
   AcceptPromiseResult,
+  ActualConsumptionValue,
   AdmissionAddendum,
   AdmissionAddendumKind,
   AdmissionBasisMismatch,
@@ -398,13 +399,14 @@ export class FlakeBrakeStore {
       }
 
       this.#validatePlanIdentity(record.record, input.selectedPlanId);
-      if (!existing) {
-        this.#appendAdmissionAddendum(
-          input.admissionRecordId,
-          "owner_choice",
-          decisionBody,
-        );
+      if (existing) {
+        return this.#modifyDecisionReplay(input);
       }
+      this.#appendAdmissionAddendum(
+        input.admissionRecordId,
+        "owner_choice",
+        decisionBody,
+      );
       const proposal = input.replacementProposal ?? record.record.proposalSnapshot;
       const freshInput = this.#buildAdmissionInput(
         {
@@ -701,7 +703,11 @@ export class FlakeBrakeStore {
       maxExecutions: base.maxExecutions,
       claimedExecutionSlots,
       grantIds,
-      status: this.#allowanceStatus(base, claimedExecutionSlots.length),
+      status: this.#allowanceStatus(
+        base,
+        claimedExecutionSlots.length,
+        this.#timestamp(),
+      ),
     });
   }
 
@@ -822,6 +828,7 @@ export class FlakeBrakeStore {
         assertSameDenialExceptionInput(existing, input);
         return this.#denialExceptionReadModel(existing);
       }
+      const transactionTime = this.#timestamp();
       const parent = this.#denialBase(input.parentDenialId);
       if (parent === null || this.#denialReadModel(parent).status !== "active") {
         throw new StatefulInputError("parentDenialId", "must reference an active denial");
@@ -831,6 +838,17 @@ export class FlakeBrakeStore {
         throw new StatefulInputError(
           "grantAllowanceKey",
           "must reference an existing grant allowance",
+        );
+      }
+      const allowanceStatus = this.#allowanceStatus(
+        allowance,
+        this.#allowanceClaimCount(input.grantAllowanceKey),
+        transactionTime,
+      );
+      if (allowanceStatus !== "live") {
+        throw new StatefulInputError(
+          "grantAllowanceKey",
+          `must reference a live grant allowance; current status is ${allowanceStatus}`,
         );
       }
       if (allowance.decisionId !== input.ownerDecisionId) {
@@ -894,7 +912,7 @@ export class FlakeBrakeStore {
           "approved scope must be a strict subset of the parent denial scope",
         );
       }
-      const createdAt = this.#timestamp();
+      const createdAt = transactionTime;
       const body: DenialExceptionReadModel = {
         denialExceptionId: input.denialExceptionId,
         parentDenialId: input.parentDenialId,
@@ -1812,6 +1830,42 @@ export class FlakeBrakeStore {
     return false;
   }
 
+  #modifyDecisionReplay(
+    input: Extract<OwnerDecisionInput, { readonly kind: "MODIFY" }>,
+  ): OwnerDecisionResult {
+    const matchingLinks = this.#readAdmissionAddenda(
+      input.admissionRecordId,
+    ).filter(
+      (addendum) =>
+        addendum.kind === "readmission_link" &&
+        isJsonObject(addendum.body) &&
+        addendum.body["ownerDecisionId"] === input.ownerDecisionId,
+    );
+    if (matchingLinks.length !== 1) {
+      throw new StatefulInputError(
+        "ownerDecisionId",
+        "durable MODIFY decision must have exactly one readmission result",
+      );
+    }
+    const body = matchingLinks[0]?.body;
+    if (!isJsonObject(body)) {
+      throw new StatefulInputError(
+        "ownerDecisionId",
+        "durable MODIFY decision has a malformed readmission result",
+      );
+    }
+    const freshAdmissionRecordId = requireString(
+      body["freshAdmissionRecordId"],
+      "readmissionLink.freshAdmissionRecordId",
+    );
+    return deepFreeze({
+      status: "READMITTED",
+      ownerDecisionId: input.ownerDecisionId,
+      freshAdmissionRecord:
+        this.getAdmissionRecord(freshAdmissionRecordId).record,
+    });
+  }
+
   #validateAcceptablePlan(
     record: AdmissionRecordBody,
     addenda: readonly AdmissionAddendum[],
@@ -2207,6 +2261,18 @@ export class FlakeBrakeStore {
       const correctedClaims = { ...fact.resourceClaims };
       const addenda = this.#readAdmissionAddenda(fact.admissionRecordId);
       for (const coordinate of fact.actualConsumptionCoordinates) {
+        const actual = addenda.find(
+          (addendum) =>
+            addendum.addendumId === coordinate.actualConsumptionFactId &&
+            addendum.kind === "actual_consumption" &&
+            isJsonObject(addendum.body),
+        );
+        if (actual === undefined || !isJsonObject(actual.body)) {
+          throw new StatefulInputError(
+            "realizedConsumption.actualConsumptionCoordinates",
+            "must reference the immutable actual-consumption fact",
+          );
+        }
         const correction = addenda
           .filter(
             (addendum) =>
@@ -2217,11 +2283,26 @@ export class FlakeBrakeStore {
           )
           .at(-1);
         if (correction !== undefined && isJsonObject(correction.body)) {
-          correctedClaims[coordinate.resourceKey] =
-            requireNonNegativeSafeInteger(
-              correction.body["correctedActualConsumption"],
-              "correctedActualConsumption",
+          const current = requireNonNegativeSafeInteger(
+            correctedClaims[coordinate.resourceKey],
+            "realizedConsumption.resourceClaims",
+          );
+          const original = requireNonNegativeSafeInteger(
+            actual.body["actualConsumption"],
+            "actualConsumption",
+          );
+          const corrected = requireNonNegativeSafeInteger(
+            correction.body["correctedActualConsumption"],
+            "correctedActualConsumption",
+          );
+          const total = current - original + corrected;
+          if (!Number.isSafeInteger(total) || total < 0) {
+            throw new StatefulInputError(
+              "realizedConsumption.resourceClaims",
+              "corrected resource consumption must be a nonnegative safe integer",
             );
+          }
+          correctedClaims[coordinate.resourceKey] = total;
         }
       }
       const resourceClaims = Object.fromEntries(
@@ -2535,14 +2616,36 @@ export class FlakeBrakeStore {
   #allowanceStatus(
     base: GrantAllowanceBase,
     claimedCount: number,
+    evaluatedAt: string,
   ): GrantAllowanceReadModel["status"] {
     if (this.#hasAuthorizationEvent("allowance", base.grantAllowanceKey, ["revoked"])) {
       return "revoked";
     }
-    if (this.#hasAuthorizationEvent("allowance", base.grantAllowanceKey, ["expired"])) {
+    if (
+      this.#hasAuthorizationEvent("allowance", base.grantAllowanceKey, ["expired"])
+    ) {
       return "expired";
     }
-    return claimedCount >= base.maxExecutions ? "exhausted" : "live";
+    if (claimedCount >= base.maxExecutions) {
+      return "exhausted";
+    }
+    return Date.parse(evaluatedAt) >
+      Date.parse(base.canonicalApprovedScope.validUntil)
+      ? "expired"
+      : "live";
+  }
+
+  #allowanceClaimCount(grantAllowanceKey: string): number {
+    const row = this.#database
+      .prepare(
+        `SELECT COUNT(*) AS claimed_count FROM allowance_claims
+          WHERE grant_allowance_key = ?`,
+      )
+      .get(grantAllowanceKey) as Record<string, unknown> | undefined;
+    return requireNonNegativeSafeInteger(
+      requireRow(row, "grant allowance claim count")["claimed_count"],
+      "claimed_count",
+    );
   }
 
   #hasAuthorizationEvent(
@@ -2657,11 +2760,11 @@ export class FlakeBrakeStore {
         break;
       }
     }
-    if (
-      status === "active" &&
-      this.getGrantAllowance(base.grantAllowanceKey).status === "exhausted"
-    ) {
-      status = "exhausted";
+    if (status === "active") {
+      const allowanceStatus = this.getGrantAllowance(
+        base.grantAllowanceKey,
+      ).status;
+      if (allowanceStatus !== "live") status = allowanceStatus;
     }
     return deepFreeze({ ...base, status });
   }
@@ -2849,21 +2952,25 @@ export class FlakeBrakeStore {
         actual.resourceKey,
         actual.workClassKey,
       );
+    }
+    for (const [resourceKey, actualValue] of aggregateActualConsumption(
+      input.actualConsumption,
+    )) {
       const resource = resources.find(
-        (candidate) => candidate.resourceKey === actual.resourceKey,
+        (candidate) => candidate.resourceKey === resourceKey,
       );
       if (resource === undefined) {
         throw new StatefulInputError(
           "actualConsumption.resourceKey",
-          `unknown resource ${actual.resourceKey}`,
+          `unknown resource ${resourceKey}`,
         );
       }
       if (
         reservation.claimAccounting === "additional" &&
-        actual.value > 0 &&
+        actualValue > 0 &&
         resource.timeUnit !== null &&
         (reservation.temporalClaim === null ||
-          reservation.temporalClaim.resourceKey !== actual.resourceKey ||
+          reservation.temporalClaim.resourceKey !== resourceKey ||
           reservation.temporalClaim.timeUnit !== resource.timeUnit)
       ) {
         throw new StatefulInputError(
@@ -2873,7 +2980,7 @@ export class FlakeBrakeStore {
       }
       if (
         reservation.claimAccounting === "additional" &&
-        actual.value > 0 &&
+        actualValue > 0 &&
         resource.timeUnit !== null &&
         reservation.temporalClaim !== null
       ) {
@@ -2883,7 +2990,10 @@ export class FlakeBrakeStore {
           (Date.parse(reservation.temporalClaim.end) -
             Date.parse(reservation.temporalClaim.start)) /
           unitMilliseconds;
-        if (!Number.isSafeInteger(windowDuration) || actual.value > windowDuration) {
+        if (
+          !Number.isSafeInteger(windowDuration) ||
+          actualValue > windowDuration
+        ) {
           throw new StatefulInputError(
             "actualConsumption",
             "realized timed consumption cannot exceed its immutable temporal window",
@@ -2905,14 +3015,16 @@ export class FlakeBrakeStore {
     const resourceClaims = Object.fromEntries(
       resources.map((resource) => [resource.resourceKey, 0]),
     ) as Record<string, number>;
-    for (const actual of input.actualConsumption) {
-      if (!Object.hasOwn(resourceClaims, actual.resourceKey)) {
+    for (const [resourceKey, actualValue] of aggregateActualConsumption(
+      input.actualConsumption,
+    )) {
+      if (!Object.hasOwn(resourceClaims, resourceKey)) {
         throw new StatefulInputError(
           "actualConsumption.resourceKey",
-          `unknown resource ${actual.resourceKey}`,
+          `unknown resource ${resourceKey}`,
         );
       }
-      resourceClaims[actual.resourceKey] = actual.value;
+      resourceClaims[resourceKey] = actualValue;
     }
     let temporalClaim = null as InFlightExecutionReservation["temporalClaim"];
     for (const resource of resources) {
@@ -3812,14 +3924,38 @@ function validateActualConsumptionValues(value: unknown): void {
   if (!Array.isArray(value)) {
     throw new StatefulInputError("actualConsumption", "must be an array");
   }
-  const resourceKeys: string[] = [];
+  const coordinates: string[] = [];
   value.forEach((entry, index) => {
     validateActualConsumptionValue(entry, index);
-    resourceKeys.push(
-      (entry as Record<string, unknown>)["resourceKey"] as string,
+    const actual = entry as Record<string, unknown>;
+    coordinates.push(
+      stableTupleId("actual-consumption-coordinate", [
+        actual["resourceKey"] as string,
+        actual["workClassKey"] as string,
+      ]),
     );
   });
-  assertUniqueStrings(resourceKeys, "actualConsumption.resourceKey");
+  assertUniqueStrings(
+    coordinates,
+    "actualConsumption.resourceKey/workClassKey",
+  );
+}
+
+function aggregateActualConsumption(
+  values: readonly ActualConsumptionValue[],
+): ReadonlyMap<string, number> {
+  const totals = new Map<string, number>();
+  for (const value of values) {
+    const total = (totals.get(value.resourceKey) ?? 0) + value.value;
+    if (!Number.isSafeInteger(total)) {
+      throw new StatefulInputError(
+        "actualConsumption",
+        "aggregate resource consumption must be a safe integer",
+      );
+    }
+    totals.set(value.resourceKey, total);
+  }
+  return totals;
 }
 
 function validateActualConsumptionValue(value: unknown, index: number): void {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   AdmissionInputError,
@@ -26,6 +27,7 @@ import type {
   FlakeBrakeStore,
   IssueGrantInput,
   ModificationOption,
+  OwnerDecisionInput,
   ProposedObligation,
   ResourceDemand,
   SchedulingConstraint,
@@ -288,6 +290,73 @@ function durableState(path: string): Readonly<Record<string, readonly string[]>>
   } finally {
     database.close();
   }
+}
+
+function recordOwnerDecisionInWorker(
+  path: string,
+  input: OwnerDecisionInput,
+): Promise<unknown> {
+  const moduleUrl = new URL("../src/index.js", import.meta.url).href;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(
+      `
+        const { parentPort, workerData } = require("node:worker_threads");
+        void (async () => {
+          let store;
+          try {
+            const flakebrake = await import(workerData.moduleUrl);
+            store = flakebrake.createStore({
+              path: workerData.path,
+              now: () => workerData.now,
+            });
+            const result = store.recordOwnerDecision(workerData.input);
+            store.close();
+            store = undefined;
+            parentPort.postMessage({ ok: true, result });
+          } catch (error) {
+            store?.close();
+            parentPort.postMessage({
+              ok: false,
+              name: error instanceof Error ? error.name : "Error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })();
+      `,
+      {
+        eval: true,
+        workerData: { input, moduleUrl, now: START, path },
+      },
+    );
+    worker.once("message", (message: unknown) => {
+      settled = true;
+      if (
+        typeof message === "object" &&
+        message !== null &&
+        "ok" in message &&
+        message.ok === true &&
+        "result" in message
+      ) {
+        resolve(message.result);
+        return;
+      }
+      reject(
+        new Error(
+          `owner-decision worker failed: ${JSON.stringify(message)}`,
+        ),
+      );
+    });
+    worker.once("error", (error) => {
+      settled = true;
+      reject(error);
+    });
+    worker.once("exit", (code) => {
+      if (!settled && code !== 0) {
+        reject(new Error(`owner-decision worker exited with code ${code}`));
+      }
+    });
+  });
 }
 
 function thrownIdentity(operation: () => unknown): string {
@@ -2018,6 +2087,350 @@ describe("M2 final audit accounting, time, model, and terminal boundaries", () =
       } finally {
         dispose(item);
       }
+    }
+  });
+});
+
+describe("M2 Qodo PR #3 regressions", () => {
+  test("identical MODIFY replay returns the original readmission with zero mutation", () => {
+    const item = tempStore(4);
+    let reopened: FlakeBrakeStore | null = null;
+    try {
+      const replan = item.store.evaluateAndRecordAdmission({ proposal: rush() });
+      assert.equal(replan.decision, "REPLAN");
+      const candidate = replan.candidatePlans.find(
+        (value) =>
+          value.feasible &&
+          value.affectedObligations.some(
+            (change) => change.obligationId === "rush-order",
+          ),
+      );
+      assert.ok(candidate);
+      const input = {
+        kind: "MODIFY",
+        admissionRecordId: replan.admissionRecordId,
+        ownerDecisionId: "qodo-modify-replay",
+        approverId: "owner-1",
+        selectedPlanId: candidate.candidatePlanId,
+      } as const;
+      const first = item.store.recordOwnerDecision(input);
+      assert.equal(first.status, "READMITTED");
+      const beforeReplay = durableState(item.path);
+      const replay = item.store.recordOwnerDecision(input);
+      assert.deepEqual(replay, first);
+      assert.deepEqual(durableState(item.path), beforeReplay);
+      assert.throws(
+        () =>
+          item.store.recordOwnerDecision({
+            ...input,
+            approverId: "different-owner",
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), beforeReplay);
+
+      item.store.close();
+      reopened = createStore({ path: item.path, now: () => START });
+      const restartBefore = durableState(item.path);
+      assert.deepEqual(reopened.recordOwnerDecision(input), first);
+      assert.deepEqual(durableState(item.path), restartBefore);
+    } finally {
+      reopened?.close();
+      dispose(item);
+    }
+  });
+
+  test("concurrent identical MODIFY retries converge on one durable successor", async () => {
+    const item = tempStore(4);
+    let reopened: FlakeBrakeStore | null = null;
+    try {
+      const replan = item.store.evaluateAndRecordAdmission({ proposal: rush() });
+      assert.equal(replan.decision, "REPLAN");
+      const candidate = replan.candidatePlans.find(
+        (value) =>
+          value.feasible &&
+          value.affectedObligations.some(
+            (change) => change.obligationId === "rush-order",
+          ),
+      );
+      assert.ok(candidate);
+      const input: OwnerDecisionInput = {
+        kind: "MODIFY",
+        admissionRecordId: replan.admissionRecordId,
+        ownerDecisionId: "qodo-concurrent-modify",
+        approverId: "owner-1",
+        selectedPlanId: candidate.candidatePlanId,
+      };
+      item.store.close();
+      const [left, right] = await Promise.all([
+        recordOwnerDecisionInWorker(item.path, input),
+        recordOwnerDecisionInWorker(item.path, input),
+      ]);
+      assert.deepEqual(left, right);
+
+      reopened = createStore({ path: item.path, now: () => START });
+      const afterConcurrent = durableState(item.path);
+      assert.equal(afterConcurrent["owner_decisions"]?.length, 1);
+      assert.equal(afterConcurrent["admission_records"]?.length, 2);
+      assert.deepEqual(reopened.recordOwnerDecision(input), left);
+      assert.deepEqual(durableState(item.path), afterConcurrent);
+    } finally {
+      reopened?.close();
+      dispose(item);
+    }
+  });
+
+  test("terminal actuals preserve two work classes for one resource", () => {
+    const item = tempStore();
+    let reopened: FlakeBrakeStore | null = null;
+    try {
+      const fixture = acceptAndGrant(item.store);
+      const claim = item.store.claimExecution({
+        ...claimInput(item.store, fixture, "qodo-work-class-attempt"),
+        affectedResourceIds: [AGENT],
+        resourceCapacityClaims: demand({ agent: 3, human: 0, production: 0 }),
+        temporalClaim: null,
+        claimAccounting: "additional",
+      });
+      const input: ExecutionTerminalInput = {
+        terminalEventId: "qodo-work-class-terminal",
+        executionAttemptId: claim.executionAttemptId,
+        status: "VERIFIED_SUCCESS",
+        receiptReference: "receipt:qodo-work-class",
+        observedAfterState: { reservation: "created" },
+        actualConsumption: [
+          {
+            resourceKey: AGENT,
+            workClassKey: "protected-order:agent",
+            value: 1,
+          },
+          {
+            resourceKey: AGENT,
+            workClassKey: "rush-order:agent",
+            value: 2,
+          },
+        ],
+      };
+      const result = item.store.recordExecutionTerminal(input);
+      assert.equal(result.claimState, "terminal_verified");
+      assert.equal(
+        item.store
+          .getAdmissionRecord(fixture.admission.admissionRecordId)
+          .addenda.filter((addendum) => addendum.kind === "actual_consumption")
+          .length,
+        2,
+      );
+      const database = new DatabaseSync(item.path);
+      try {
+        const row = database
+          .prepare(
+            `SELECT body_json FROM realized_consumption_facts
+              WHERE execution_attempt_id = ?`,
+          )
+          .get(claim.executionAttemptId) as Record<string, unknown>;
+        const fact = JSON.parse(String(row["body_json"])) as {
+          readonly actualConsumptionCoordinates: readonly unknown[];
+          readonly resourceClaims: Readonly<Record<string, number>>;
+        };
+        assert.equal(fact.actualConsumptionCoordinates.length, 2);
+        assert.equal(fact.resourceClaims[AGENT], 3);
+      } finally {
+        database.close();
+      }
+      const beforeReplay = durableState(item.path);
+      assert.deepEqual(item.store.recordExecutionTerminal(input), {
+        ...result,
+        replayed: true,
+      });
+      assert.deepEqual(durableState(item.path), beforeReplay);
+
+      item.store.close();
+      reopened = createStore({ path: item.path, now: () => START });
+      const restartBefore = durableState(item.path);
+      assert.deepEqual(reopened.recordExecutionTerminal(input), {
+        ...result,
+        replayed: true,
+      });
+      assert.deepEqual(durableState(item.path), restartBefore);
+
+      const actuals = reopened
+        .getAdmissionRecord(fixture.admission.admissionRecordId)
+        .addenda.filter(
+          (addendum) =>
+            addendum.kind === "actual_consumption" &&
+            typeof addendum.body === "object" &&
+            addendum.body !== null &&
+            !Array.isArray(addendum.body) &&
+            (addendum.body as Readonly<Record<string, unknown>>)[
+              "workClassKey"
+            ] === "protected-order:agent",
+        );
+      assert.equal(actuals.length, 1);
+      reopened.recordCalibrationCorrection({
+        correctionFactId: "qodo-work-class-correction",
+        admissionRecordId: fixture.admission.admissionRecordId,
+        correctsActualConsumptionFactId: actuals[0]?.addendumId ?? "",
+        correctedActualConsumption: 4,
+        reason: "Exercise per-coordinate correction accounting",
+        sourceReceipt: "receipt:qodo-work-class-correction",
+      });
+      const later = reopened.evaluateAndRecordAdmission({
+        proposal: rush("qodo-later-order"),
+      });
+      const realized = later.fixedInFlightExecutionReservations.find(
+        (reservation) =>
+          reservation.executionAttemptId === claim.executionAttemptId,
+      );
+      assert.ok(realized);
+      assert.equal(realized.resourceClaims[AGENT], 6);
+    } finally {
+      reopened?.close();
+      dispose(item);
+    }
+  });
+
+  test("duplicate resource/work-class consumption remains fail-closed", () => {
+    const item = tempStore();
+    try {
+      const fixture = acceptAndGrant(item.store);
+      const claim = item.store.claimExecution({
+        ...claimInput(item.store, fixture, "qodo-duplicate-coordinate-attempt"),
+        affectedResourceIds: [AGENT],
+        resourceCapacityClaims: demand({ agent: 3, human: 0, production: 0 }),
+        temporalClaim: null,
+        claimAccounting: "additional",
+      });
+      const before = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.recordExecutionTerminal({
+            terminalEventId: "qodo-duplicate-coordinate-terminal",
+            executionAttemptId: claim.executionAttemptId,
+            status: "VERIFIED_SUCCESS",
+            receiptReference: "receipt:qodo-duplicate-coordinate",
+            observedAfterState: { reservation: "created" },
+            actualConsumption: [
+              {
+                resourceKey: AGENT,
+                workClassKey: "rush-order:agent",
+                value: 1,
+              },
+              {
+                resourceKey: AGENT,
+                workClassKey: "rush-order:agent",
+                value: 2,
+              },
+            ],
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), before);
+    } finally {
+      dispose(item);
+    }
+  });
+
+  test("revoked grant allowance cannot receive an active denial exception", () => {
+    const item = tempStore();
+    try {
+      const fixture = acceptAndGrant(item.store);
+      item.store.createDenial({
+        denialId: "qodo-revoked-parent",
+        deniedEffectFingerprint: effect(50),
+        deniedScope: scope(fixture.admission.promiseBasisId, 100, 10),
+        objectiveId: "rush-order-objective",
+        approverId: "owner-1",
+        evidencePacketId: "qodo-revoked-evidence",
+        missionId: "qodo-revoked-mission",
+        reason: "Exercise revoked allowance exception rejection",
+      });
+      const issued = item.store.issueGrant(
+        issueInput(
+          item.store.getPortfolio().versions,
+          fixture.admission,
+          "qodo-revoked-grant",
+          "qodo-revoked-decision",
+          "qodo-revoked-bundle",
+          scope(fixture.admission.promiseBasisId, 10, 2),
+          {
+            parentDenialId: "qodo-revoked-parent",
+            changeClass: "narrower_scope",
+          },
+        ),
+      );
+      item.store.revokeGrantAllowance(
+        issued.grantAllowanceKey,
+        "revoked before exception creation",
+      );
+      assert.equal(
+        item.store.getGrantAllowance(issued.grantAllowanceKey).status,
+        "revoked",
+      );
+      const before = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.createDenialException({
+            denialExceptionId: "qodo-revoked-exception",
+            parentDenialId: "qodo-revoked-parent",
+            ownerDecisionId: "qodo-revoked-decision",
+            grantAllowanceKey: issued.grantAllowanceKey,
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), before);
+    } finally {
+      dispose(item);
+    }
+  });
+
+  test("scope-expired allowance is rejected at authoritative transaction time", () => {
+    let clock = START;
+    const item = tempStoreFromState(initialState(), () => clock);
+    try {
+      const fixture = acceptAndGrant(item.store);
+      item.store.createDenial({
+        denialId: "qodo-expired-parent",
+        deniedEffectFingerprint: effect(50),
+        deniedScope: scope(fixture.admission.promiseBasisId, 100, 10),
+        objectiveId: "rush-order-objective",
+        approverId: "owner-1",
+        evidencePacketId: "qodo-expired-evidence",
+        missionId: "qodo-expired-mission",
+        reason: "Exercise authoritative-time allowance expiry",
+      });
+      const issued = item.store.issueGrant(
+        issueInput(
+          item.store.getPortfolio().versions,
+          fixture.admission,
+          "qodo-expired-grant",
+          "qodo-expired-decision",
+          "qodo-expired-bundle",
+          scope(fixture.admission.promiseBasisId, 10, 2, FIVE_MINUTES),
+          {
+            parentDenialId: "qodo-expired-parent",
+            changeClass: "narrower_scope",
+          },
+        ),
+      );
+      clock = END;
+      assert.equal(
+        item.store.getGrantAllowance(issued.grantAllowanceKey).status,
+        "expired",
+      );
+      const before = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.createDenialException({
+            denialExceptionId: "qodo-expired-exception",
+            parentDenialId: "qodo-expired-parent",
+            ownerDecisionId: "qodo-expired-decision",
+            grantAllowanceKey: issued.grantAllowanceKey,
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), before);
+    } finally {
+      dispose(item);
     }
   });
 });
