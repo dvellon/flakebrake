@@ -269,6 +269,7 @@ export function flakeBrakeRootAgentSpec(
     model: { name: modelName },
     instructions: rootAgentInstructions(),
     config: {
+      askUserQuestions: { enabled: false },
       iterationLimit: 96,
       sandbox: { enabled: true, fileDownloads: false },
       dynamicSubAgents: { enabled: true },

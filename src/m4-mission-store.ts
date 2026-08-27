@@ -64,10 +64,27 @@ export interface M4BridgeOutcome {
   readonly createdAt: string;
 }
 
+export interface M4SuccessorIntentInput {
+  readonly missionId: string;
+  readonly trueforgeSessionId: string;
+  readonly previousTurnId: string;
+  readonly input: JsonValue;
+  readonly ownerToken: string;
+}
+
+export interface M4SuccessorIntent extends M4SuccessorIntentInput {
+  readonly intentKey: string;
+  readonly inputDigest: string;
+  readonly successorTurnId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export interface M4MissionSnapshot {
   readonly mission: M4MissionBinding;
   readonly bridgeActions: readonly M4BridgeAction[];
   readonly bridgeOutcomes: readonly M4BridgeOutcome[];
+  readonly successorIntents: readonly M4SuccessorIntent[];
 }
 
 export interface M4MissionStoreOptions {
@@ -139,6 +156,20 @@ export class M4MissionStore {
         result_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         UNIQUE (bridge_key, status)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS m4_successor_intents (
+        intent_key TEXT PRIMARY KEY,
+        mission_id TEXT NOT NULL REFERENCES m4_missions(mission_id),
+        trueforge_session_id TEXT NOT NULL,
+        previous_turn_id TEXT NOT NULL,
+        input_digest TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        owner_token TEXT NOT NULL,
+        successor_turn_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (trueforge_session_id, previous_turn_id)
       ) STRICT;
 
       CREATE TRIGGER IF NOT EXISTS m4_bridge_actions_immutable_update
@@ -321,6 +352,109 @@ export class M4MissionStore {
     });
   }
 
+  public claimSuccessorIntent(input: M4SuccessorIntentInput): {
+    readonly intent: M4SuccessorIntent;
+    readonly claimed: boolean;
+  } {
+    validateSuccessorIntent(input);
+    const intentKey = successorIntentIdentity(input);
+    const inputJson = canonicalSerialize(input.input);
+    const inputDigest = digest(inputJson);
+    return inImmediateTransaction(this.#database, () => {
+      const existing = this.#successorIntent(intentKey);
+      if (existing !== null) {
+        assertSameSuccessorIntent(existing, input, inputDigest);
+        return { intent: existing, claimed: existing.ownerToken === input.ownerToken };
+      }
+      const mission = requireMission(this.#mission(input.missionId), input.missionId);
+      if (mission.trueforgeSessionId !== input.trueforgeSessionId) {
+        throw new Error("Successor intent session does not match mission binding");
+      }
+      const createdAt = this.#timestamp();
+      this.#database
+        .prepare(
+          `INSERT INTO m4_successor_intents
+             (intent_key, mission_id, trueforge_session_id, previous_turn_id,
+              input_digest, input_json, owner_token, successor_turn_id,
+              created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        )
+        .run(
+          intentKey,
+          input.missionId,
+          input.trueforgeSessionId,
+          input.previousTurnId,
+          inputDigest,
+          inputJson,
+          input.ownerToken,
+          createdAt,
+          createdAt,
+        );
+      return {
+        intent: requireSuccessorIntent(this.#successorIntent(intentKey), intentKey),
+        claimed: true,
+      };
+    });
+  }
+
+  public reassignSuccessorIntent(
+    intentKey: string,
+    expectedOwnerToken: string,
+    nextOwnerToken: string,
+  ): M4SuccessorIntent {
+    requireText(intentKey, "intentKey");
+    requireText(expectedOwnerToken, "expectedOwnerToken");
+    requireText(nextOwnerToken, "nextOwnerToken");
+    return inImmediateTransaction(this.#database, () => {
+      const current = requireSuccessorIntent(
+        this.#successorIntent(intentKey),
+        intentKey,
+      );
+      if (current.successorTurnId !== null) return current;
+      if (current.ownerToken !== expectedOwnerToken) {
+        return current;
+      }
+      this.#database
+        .prepare(
+          `UPDATE m4_successor_intents
+              SET owner_token = ?, updated_at = ?
+            WHERE intent_key = ? AND owner_token = ? AND successor_turn_id IS NULL`,
+        )
+        .run(nextOwnerToken, this.#timestamp(), intentKey, expectedOwnerToken);
+      return requireSuccessorIntent(this.#successorIntent(intentKey), intentKey);
+    });
+  }
+
+  public resolveSuccessorIntent(
+    intentKey: string,
+    successorTurnId: string,
+  ): M4SuccessorIntent {
+    requireText(intentKey, "intentKey");
+    requireText(successorTurnId, "successorTurnId");
+    return inImmediateTransaction(this.#database, () => {
+      const current = requireSuccessorIntent(
+        this.#successorIntent(intentKey),
+        intentKey,
+      );
+      if (
+        current.successorTurnId !== null &&
+        current.successorTurnId !== successorTurnId
+      ) {
+        throw new Error(`Successor intent ${intentKey} resolved to a sibling turn`);
+      }
+      if (current.successorTurnId === null) {
+        this.#database
+          .prepare(
+            `UPDATE m4_successor_intents
+                SET successor_turn_id = ?, updated_at = ?
+              WHERE intent_key = ? AND successor_turn_id IS NULL`,
+          )
+          .run(successorTurnId, this.#timestamp(), intentKey);
+      }
+      return requireSuccessorIntent(this.#successorIntent(intentKey), intentKey);
+    });
+  }
+
   public getSnapshot(missionId: string): M4MissionSnapshot {
     const mission = requireMission(this.#mission(missionId), missionId);
     const actionRows = this.#database
@@ -343,7 +477,20 @@ export class M4MissionStore {
         bridgeOutcomeFromRow,
       ),
     );
-    return deepFreeze({ mission, bridgeActions: actions, bridgeOutcomes: outcomes });
+    const successorIntents = (this.#database
+      .prepare(
+        `SELECT intent_key, mission_id, trueforge_session_id, previous_turn_id,
+                input_digest, input_json, owner_token, successor_turn_id,
+                created_at, updated_at
+           FROM m4_successor_intents WHERE mission_id = ? ORDER BY intent_key`,
+      )
+      .all(missionId) as Record<string, unknown>[]).map(successorIntentFromRow);
+    return deepFreeze({
+      mission,
+      bridgeActions: actions,
+      bridgeOutcomes: outcomes,
+      successorIntents,
+    });
   }
 
   public getSnapshotOrNull(missionId: string): M4MissionSnapshot | null {
@@ -369,6 +516,13 @@ export class M4MissionStore {
       .prepare("SELECT * FROM m4_bridge_actions WHERE bridge_key = ?")
       .get(bridgeKey) as Record<string, unknown> | undefined;
     return row === undefined ? null : bridgeActionFromRow(row);
+  }
+
+  #successorIntent(intentKey: string): M4SuccessorIntent | null {
+    const row = this.#database
+      .prepare("SELECT * FROM m4_successor_intents WHERE intent_key = ?")
+      .get(intentKey) as Record<string, unknown> | undefined;
+    return row === undefined ? null : successorIntentFromRow(row);
   }
 
   #timestamp(): string {
@@ -442,6 +596,27 @@ function bridgeOutcomeFromRow(row: Record<string, unknown>): M4BridgeOutcome {
   };
 }
 
+function successorIntentFromRow(row: Record<string, unknown>): M4SuccessorIntent {
+  return {
+    intentKey: text(row["intent_key"], "intent_key"),
+    missionId: text(row["mission_id"], "mission_id"),
+    trueforgeSessionId: text(
+      row["trueforge_session_id"],
+      "trueforge_session_id",
+    ),
+    previousTurnId: text(row["previous_turn_id"], "previous_turn_id"),
+    inputDigest: text(row["input_digest"], "input_digest"),
+    input: parseCanonicalJson<JsonValue>(row["input_json"], "successor input"),
+    ownerToken: text(row["owner_token"], "owner_token"),
+    successorTurnId: nullableText(
+      row["successor_turn_id"],
+      "successor_turn_id",
+    ),
+    createdAt: text(row["created_at"], "created_at"),
+    updatedAt: text(row["updated_at"], "updated_at"),
+  };
+}
+
 function bindingMaterial(binding: M4MissionBinding): M4MissionBindingInput {
   return {
     missionId: binding.missionId,
@@ -459,6 +634,13 @@ function bridgeIdentity(input: M4BridgeActionInput): string {
     input.trueforgeTurnId,
     input.trueforgeThreadId,
     input.trueforgeToolCallId,
+  ]);
+}
+
+function successorIntentIdentity(input: M4SuccessorIntentInput): string {
+  return stableTupleId("m4-successor-intent", [
+    input.trueforgeSessionId,
+    input.previousTurnId,
   ]);
 }
 
@@ -485,6 +667,32 @@ function validateBridgeAction(input: M4BridgeActionInput): void {
   canonicalSerialize(input.arguments);
 }
 
+function validateSuccessorIntent(input: M4SuccessorIntentInput): void {
+  requireText(input.missionId, "missionId");
+  requireText(input.trueforgeSessionId, "trueforgeSessionId");
+  requireText(input.previousTurnId, "previousTurnId");
+  requireText(input.ownerToken, "ownerToken");
+  canonicalSerialize(input.input);
+}
+
+function assertSameSuccessorIntent(
+  existing: M4SuccessorIntent,
+  requested: M4SuccessorIntentInput,
+  inputDigest: string,
+): void {
+  if (
+    existing.missionId !== requested.missionId ||
+    existing.trueforgeSessionId !== requested.trueforgeSessionId ||
+    existing.previousTurnId !== requested.previousTurnId ||
+    existing.inputDigest !== inputDigest ||
+    canonicalSerialize(existing.input) !== canonicalSerialize(requested.input)
+  ) {
+    throw new Error(
+      `TrueForge predecessor ${requested.previousTurnId} was replayed with conflicting input`,
+    );
+  }
+}
+
 function requireMission(
   value: M4MissionBinding | null,
   missionId: string,
@@ -498,6 +706,14 @@ function requireBridgeAction(
   bridgeKey: string,
 ): M4BridgeAction {
   if (value === null) throw new Error(`M4 bridge action ${bridgeKey} not found`);
+  return value;
+}
+
+function requireSuccessorIntent(
+  value: M4SuccessorIntent | null,
+  intentKey: string,
+): M4SuccessorIntent {
+  if (value === null) throw new Error(`M4 successor intent ${intentKey} not found`);
   return value;
 }
 

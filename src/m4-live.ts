@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
 
+import { canonicalSerialize } from "./canonical.js";
 import {
   M4MissionController,
   deterministicM4OwnerDecisions,
@@ -16,7 +17,7 @@ import {
   createHeroInitialState,
 } from "./hero-fixture.js";
 import { SyntheticFactoryEnvironment } from "./factory-environment.js";
-import { createStore } from "./store.js";
+import { createStore, type FlakeBrakeStore } from "./store.js";
 import {
   ensureFlakeBrakeRootAgent,
   registerFactoryMcpConnectors,
@@ -148,7 +149,7 @@ export async function runLiveM4Mission(
           .flatMap((admission) => admission.addenda)
           .filter((addendum) => addendum.kind === "actual_consumption").length,
       };
-      assertLiveAcceptance(result);
+      assertLiveAcceptance(result, store, factory);
       return result;
     } finally {
       factory.close();
@@ -161,7 +162,11 @@ export async function runLiveM4Mission(
   }
 }
 
-function assertLiveAcceptance(result: LiveM4MissionResult): void {
+function assertLiveAcceptance(
+  result: LiveM4MissionResult,
+  store: FlakeBrakeStore,
+  factory: SyntheticFactoryEnvironment,
+): void {
   if (
     result.subagentThreads.length !== 3 ||
     new Set(result.subagentThreads.map((thread) => thread.threadId)).size !== 3
@@ -221,6 +226,215 @@ function assertLiveAcceptance(result: LiveM4MissionResult): void {
   ) {
     throw new Error("Live M4 acceptance did not conserve exact-once effects");
   }
+  assertDurableHeroAcceptance(result, store, factory);
+}
+
+function assertDurableHeroAcceptance(
+  result: LiveM4MissionResult,
+  store: FlakeBrakeStore,
+  factory: SyntheticFactoryEnvironment,
+): void {
+  const history = store.getAdmissionHistory();
+  const initial = history.find(
+    (candidate) =>
+      candidate.record.portfolioVersion === "portfolio/v1" &&
+      candidate.record.decision === "REPLAN",
+  );
+  const fresh = history.find((candidate) =>
+    candidate.addenda.some(
+      (addendum) =>
+        addendum.kind === "readmission_link" &&
+        jsonRecord(addendum.body, "M4 readmission link")["kind"] ===
+          "M4_POST_MODIFICATION_ADMISSION",
+    ),
+  );
+  if (
+    initial === undefined ||
+    fresh === undefined ||
+    fresh.record.portfolioVersion !== "portfolio/v2" ||
+    fresh.record.decision !== "ADMITTABLE" ||
+    initial.addenda.some((addendum) => addendum.kind === "acceptance_commit") ||
+    fresh.addenda.filter((addendum) => addendum.kind === "acceptance_commit")
+      .length !== 1
+  ) {
+    throw new Error(
+      "Live M4 acceptance did not bind Promise acceptance to one fresh v2 ADMITTABLE basis",
+    );
+  }
+
+  const attempt = store.getExecutionAttempt("attempt/m4-approved-alternative");
+  if (
+    attempt.admissionRecordId !== fresh.record.admissionRecordId ||
+    attempt.result.grantExecutionOrdinal !== 1 ||
+    attempt.input.resourceCapacityClaims["agent_work_units"] !== 6 ||
+    attempt.input.resourceCapacityClaims["production_cell_minutes"] !== 30
+  ) {
+    throw new Error("Live M4 execution was not bound to the exact fresh admission");
+  }
+  const reservation = store
+    .getReservations(true)
+    .find(
+      (candidate) =>
+        candidate.executionAttemptId === attempt.executionAttemptId,
+    );
+  const fence = store.getExecutionFence(attempt.executionAttemptId);
+  if (
+    reservation?.claimState !== "terminal_verified" ||
+    fence?.status !== "factory_result_bound" ||
+    fence.resultBinding === null ||
+    factory.getMutationCount() !== 1
+  ) {
+    throw new Error(
+      "Live M4 root completion did not follow one receipt-bound terminal verification",
+    );
+  }
+
+  const portfolio = store.getPortfolio();
+  const initialProtected = createHeroInitialState().acceptedObligations.find(
+    (order) => order.obligationId === "order/protected-medical",
+  );
+  const currentProtected = portfolio.acceptedObligations.find(
+    (order) => order.obligationId === "order/protected-medical",
+  );
+  const bestEffort = portfolio.acceptedObligations.find(
+    (order) => order.obligationId === "order/best-effort-display",
+  );
+  if (
+    canonicalSerialize(currentProtected) !== canonicalSerialize(initialProtected) ||
+    bestEffort?.serviceLevel["quantity"] !== 8
+  ) {
+    throw new Error(
+      "Live M4 acceptance changed protected work or missed the approved quantity reduction",
+    );
+  }
+
+  const actuals = fresh.addenda
+    .filter((addendum) => addendum.kind === "actual_consumption")
+    .map((addendum) => jsonRecord(addendum.body, "actual consumption"));
+  const actualByResource = new Map(
+    actuals.map((actual) => [
+      actual["resourceKey"],
+      actual["actualConsumption"],
+    ]),
+  );
+  if (
+    actualByResource.get("agent_work_units") !== 6 ||
+    actualByResource.get("production_cell_minutes") !== 30
+  ) {
+    throw new Error("Live M4 actual consumption was not exactly agent 6 and production 30");
+  }
+
+  const actions = result.mission.missionSnapshot.bridgeActions;
+  const denied = actions.find(
+    (action) =>
+      action.bridgeKey === result.mission.approvals[2]?.bridgeKey,
+  );
+  const allowed = actions.find(
+    (action) =>
+      action.bridgeKey === result.mission.approvals[4]?.bridgeKey,
+  );
+  const deniedArguments = jsonRecord(denied?.arguments, "denied schedule arguments");
+  const allowedArguments = jsonRecord(
+    allowed?.arguments,
+    "approved schedule arguments",
+  );
+  const deniedInterval = scheduleEffectInterval(deniedArguments);
+  const allowedInterval = scheduleEffectInterval(allowedArguments);
+  if (
+    deniedInterval.start !== "2026-08-26T09:10:00.000Z" ||
+    deniedInterval.end !== "2026-08-26T09:40:00.000Z" ||
+    allowedInterval.start !== "2026-08-26T09:40:00.000Z" ||
+    allowedInterval.end !== "2026-08-26T10:10:00.000Z"
+  ) {
+    throw new Error("Live M4 denial or approved alternative interval was not exact");
+  }
+
+  assertIndependentVerificationOrder(result);
+}
+
+function scheduleEffectInterval(
+  arguments_: Readonly<Record<string, unknown>>,
+): { readonly start: unknown; readonly end: unknown } {
+  const claim = jsonRecord(arguments_["claim"], "schedule claim");
+  const effect = jsonRecord(claim["effect"], "schedule effect");
+  const material = jsonRecord(
+    effect["materialParameters"],
+    "schedule material parameters",
+  );
+  return { start: material["start"], end: material["end"] };
+}
+
+function assertIndependentVerificationOrder(result: LiveM4MissionResult): void {
+  const events = result.mission.trueforgeEvents.map((item) => item.event);
+  const toolNames = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "model.message") continue;
+    for (const call of event.toolCalls ?? []) {
+      if (call.type === "function") toolNames.set(call.id, persistedToolName(call));
+    }
+  }
+  const responseIndexes = (name: string): number[] =>
+    events.flatMap((event, index) =>
+      event.type === "tool.response" && toolNames.get(event.toolCallId) === name
+        ? [index]
+        : [],
+    );
+  const mutations = responseIndexes("create_schedule_reservation");
+  const reads = responseIndexes("read_schedule_state");
+  const verifications = responseIndexes("verify_schedule_execution");
+  const statuses = responseIndexes("read_execution_status");
+  const mutation = mutations.at(-1) ?? -1;
+  const verification = verifications.at(-1) ?? -1;
+  const terminal = statuses.at(-1) ?? -1;
+  const independentRead = reads.some(
+    (index) => index > mutation && index < verification,
+  );
+  const rootDone = events.findIndex(
+    (event, index) =>
+      index > terminal &&
+      event.type === "turn.done" &&
+      event.state.status === "done",
+  );
+  if (
+    mutation < 0 ||
+    !independentRead ||
+    verification <= mutation ||
+    terminal <= verification ||
+    rootDone <= terminal
+  ) {
+    throw new Error(
+      `Live M4 did not read back before verification and complete only after terminal success (mutation=${String(
+        mutation,
+      )}, reads=${reads.join(",")}, verification=${String(
+        verification,
+      )}, terminal=${String(terminal)}, rootDone=${String(rootDone)})`,
+    );
+  }
+}
+
+function persistedToolName(call: TrueForgeApi.ToolCall): string {
+  if (call.function.name !== "call_tool") return call.function.name;
+  try {
+    const envelope = jsonRecord(
+      JSON.parse(call.function.arguments) as unknown,
+      "generic MCP call",
+    );
+    return typeof envelope["tool_name"] === "string"
+      ? envelope["tool_name"]
+      : call.function.name;
+  } catch {
+    return call.function.name;
+  }
+}
+
+function jsonRecord(
+  value: unknown,
+  label: string,
+): Readonly<Record<string, unknown>> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} is not an object`);
+  }
+  return value as Readonly<Record<string, unknown>>;
 }
 
 interface M0Configuration {

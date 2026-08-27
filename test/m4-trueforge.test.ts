@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -8,18 +9,25 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  TrueForge,
+  TrueForgeApi,
+} from "@truefoundry/trueforge-sdk";
 
 import { canonicalSerialize } from "../src/canonical.js";
 import {
   FACTORY_MCP_SERVICE_NAMES,
   FLAKEBRAKE_ROOT_AGENT_NAME,
+  HERO_ENVIRONMENT_ID,
   HERO_HORIZON_END,
   HERO_RESOURCE_KEYS,
+  M4MissionController,
   M4MissionStore,
   TRUEFORGE_SDK_VERSION,
   TRUEFORGE_SERVER_VERSION,
   SyntheticFactoryEnvironment,
   createHeroInitialState,
+  createHeroProposal,
   createStore,
   flakeBrakeRootAgentSpec,
   runDeterministicM4Mission,
@@ -171,6 +179,132 @@ describe("M4 genuine Streamable HTTP MCP transport", () => {
       });
     }
   });
+
+  test("3. portfolio v2 and a fresh ADMITTABLE basis precede Promise acceptance", async () => {
+    await withHttpClient(
+      fixture.cluster,
+      "factory-change-control",
+      async (client) => {
+        resultObject(
+          (await client.callTool({
+            name: "record_current_admission",
+            arguments: {},
+          })) as CallToolResult,
+        );
+        const preparedModification = resultObject(
+          (await client.callTool({
+            name: "prepare_portfolio_modification",
+            arguments: {},
+          })) as CallToolResult,
+        );
+        const modificationArguments = record(
+          preparedModification["arguments"],
+          "portfolio modification arguments",
+        );
+        const [leftSelection, rightSelection] = await Promise.all([
+          client.callTool({
+            name: "select_portfolio_modification",
+            arguments: modificationArguments,
+          }) as Promise<CallToolResult>,
+          client.callTool({
+            name: "select_portfolio_modification",
+            arguments: modificationArguments,
+          }) as Promise<CallToolResult>,
+        ]);
+        assert.equal(
+          canonicalSerialize(resultObject(leftSelection)),
+          canonicalSerialize(resultObject(rightSelection)),
+        );
+
+        const storeBeforeAcceptance = createStore({ path: fixture.m2Path });
+        let freshAdmissionId: string;
+        try {
+          const history = storeBeforeAcceptance.getAdmissionHistory();
+          const initial = history.find(
+            (candidate) =>
+              candidate.record.portfolioVersion === "portfolio/v1" &&
+              candidate.record.decision === "REPLAN",
+          );
+          assert.ok(initial);
+          assert.equal(
+            initial.addenda.some(
+              (addendum) => addendum.kind === "acceptance_commit",
+            ),
+            false,
+            "the stale v1 REPLAN admission is never accepted",
+          );
+          assert.equal(
+            storeBeforeAcceptance.getPortfolio().versions.portfolioVersion,
+            "portfolio/v2",
+          );
+          assert.equal(
+            storeBeforeAcceptance
+              .getPortfolio()
+              .acceptedObligations.find(
+                (order) => order.obligationId === "order/best-effort-display",
+              )?.serviceLevel["quantity"],
+            8,
+          );
+          const fresh = history.find(
+            (candidate) =>
+              candidate.record.portfolioVersion === "portfolio/v2" &&
+              candidate.record.decision === "ADMITTABLE",
+          );
+          assert.ok(fresh, "a fresh authoritative v2 admission must exist");
+          freshAdmissionId = fresh.record.admissionRecordId;
+        } finally {
+          storeBeforeAcceptance.close();
+        }
+
+        const beforeConflict = m2Snapshot(fixture.m2Path);
+        const conflicting = (await client.callTool({
+          name: "select_portfolio_modification",
+          arguments: {
+            ...modificationArguments,
+            approver_id: "owner/conflicting-replay",
+          },
+        })) as CallToolResult;
+        assert.equal(conflicting.isError, true);
+        assert.equal(m2Snapshot(fixture.m2Path), beforeConflict);
+
+        const preparedAcceptance = resultObject(
+          (await client.callTool({
+            name: "prepare_promise_acceptance",
+            arguments: {},
+          })) as CallToolResult,
+        );
+        const acceptanceArguments = record(
+          preparedAcceptance["arguments"],
+          "promise acceptance arguments",
+        );
+        assert.equal(
+          acceptanceArguments["admission_record_id"],
+          freshAdmissionId,
+        );
+        await client.callTool({
+          name: "accept_promise",
+          arguments: acceptanceArguments,
+        });
+
+        const storeAfterAcceptance = createStore({ path: fixture.m2Path });
+        try {
+          const accepted = storeAfterAcceptance.getAdmissionRecord(
+            freshAdmissionId,
+          );
+          assert.equal(accepted.record.decision, "ADMITTABLE");
+          assert.equal(accepted.record.portfolioVersion, "portfolio/v2");
+          assert.equal(
+            accepted.addenda.filter(
+              (addendum) => addendum.kind === "acceptance_commit",
+            ).length,
+            1,
+          );
+        } finally {
+          storeAfterAcceptance.close();
+        }
+      },
+    );
+  });
 });
 
 describe("M4 genuine TrueForge deterministic mission", () => {
@@ -218,6 +352,7 @@ describe("M4 genuine TrueForge deterministic mission", () => {
       "0.1.3",
     );
     const spec = flakeBrakeRootAgentSpec("flakebrake-deterministic/m4-mission");
+    assert.deepEqual(spec.config?.askUserQuestions, { enabled: false });
     assert.deepEqual(spec.config?.dynamicSubAgents, { enabled: true });
     assert.deepEqual(spec.config?.sandbox, {
       enabled: true,
@@ -354,6 +489,97 @@ describe("M4 genuine TrueForge deterministic mission", () => {
     } finally {
       store.close();
     }
+  });
+
+  test("7b. the hero binds acceptance and execution only to the fresh v2 ADMITTABLE record", () => {
+    const store = createStore({ path: options.m2DatabasePath });
+    try {
+      const history = store.getAdmissionHistory();
+      const initial = history.find(
+        (candidate) =>
+          candidate.record.portfolioVersion === "portfolio/v1" &&
+          candidate.record.decision === "REPLAN",
+      );
+      const fresh = history.find((candidate) =>
+        candidate.addenda.some(
+          (addendum) =>
+            addendum.kind === "readmission_link" &&
+            record(addendum.body, "fresh readmission link")["kind"] ===
+              "M4_POST_MODIFICATION_ADMISSION",
+        ),
+      );
+      assert.ok(initial);
+      assert.ok(fresh);
+      assert.equal(fresh.record.portfolioVersion, "portfolio/v2");
+      assert.equal(fresh.record.decision, "ADMITTABLE");
+      assert.equal(
+        initial.addenda.some(
+          (addendum) => addendum.kind === "acceptance_commit",
+        ),
+        false,
+      );
+      assert.equal(
+        fresh.addenda.filter(
+          (addendum) => addendum.kind === "acceptance_commit",
+        ).length,
+        1,
+      );
+      assert.equal(
+        first.finalAttempt.admissionRecordId,
+        fresh.record.admissionRecordId,
+      );
+      assert.equal(
+        store
+          .getPortfolio()
+          .acceptedObligations.find(
+            (order) => order.obligationId === "order/best-effort-display",
+          )?.serviceLevel["quantity"],
+        8,
+      );
+    } finally {
+      store.close();
+    }
+
+    const actions = first.mission.missionSnapshot.bridgeActions;
+    const modification = actions.find(
+      (action) => action.toolName === "select_portfolio_modification",
+    );
+    const acceptance = actions.find(
+      (action) => action.toolName === "accept_promise",
+    );
+    assert.ok(modification);
+    assert.ok(acceptance);
+    assert.equal(
+      record(modification.arguments, "modification bridge arguments")[
+        "admission_record_id"
+      ],
+      storeAdmissionId(options.m2DatabasePath, "REPLAN", "portfolio/v1"),
+    );
+    assert.equal(
+      record(acceptance.arguments, "acceptance bridge arguments")[
+        "admission_record_id"
+      ],
+      first.finalAttempt.admissionRecordId,
+    );
+
+    const ordered = first.mission.trueforgeEvents.map((item) => item.event);
+    const readBack = ordered.findIndex(
+      (event) =>
+        event.type === "tool.response" &&
+        event.toolCallId === "read-after-write",
+    );
+    const verified = ordered.findIndex(
+      (event) =>
+        event.type === "tool.response" &&
+        event.toolCallId === "verify-authoritatively",
+    );
+    const terminal = ordered.findIndex(
+      (event) =>
+        event.type === "tool.response" &&
+        event.toolCallId === "read-terminal-status",
+    );
+    assert.ok(readBack >= 0 && readBack < verified);
+    assert.ok(verified < terminal);
   });
 
   test("8. five native pauses bind owner decisions, durable denial, and alternate-tool rejection", () => {
@@ -503,10 +729,537 @@ describe("M4 genuine TrueForge deterministic mission", () => {
           }),
         /reused/u,
       );
+      const intent = snapshot.successorIntents.find(
+        (candidate) => candidate.previousTurnId === existing.trueforgeTurnId,
+      );
+      assert.ok(intent);
+      const beforeIntentReplay = canonicalSerialize(
+        store.getSnapshot(first.mission.missionId),
+      );
+      const replayed = store.claimSuccessorIntent({
+        missionId: intent.missionId,
+        trueforgeSessionId: intent.trueforgeSessionId,
+        previousTurnId: intent.previousTurnId,
+        input: intent.input,
+        ownerToken: "successor-owner/999999/replay",
+      });
+      assert.equal(replayed.claimed, false);
+      assert.equal(replayed.intent.intentKey, intent.intentKey);
+      assert.equal(
+        canonicalSerialize(store.getSnapshot(first.mission.missionId)),
+        beforeIntentReplay,
+      );
+      assert.throws(
+        () =>
+          store.claimSuccessorIntent({
+            missionId: intent.missionId,
+            trueforgeSessionId: intent.trueforgeSessionId,
+            previousTurnId: intent.previousTurnId,
+            input: [{ type: "user.message", content: "conflicting replay" }],
+            ownerToken: "successor-owner/999999/conflict",
+          }),
+        /conflicting input/u,
+      );
+      assert.equal(
+        canonicalSerialize(store.getSnapshot(first.mission.missionId)),
+        beforeIntentReplay,
+      );
     } finally {
       store.close();
     }
   });
+
+  test(
+    "14. a lost approval response recovers the exact completed successor without a sibling",
+    { timeout: 120_000 },
+    async () => {
+      const paused = first.mission.approvals[0];
+      assert.ok(paused);
+      const store = new M4MissionStore({
+        path: options.missionDatabasePath,
+        now: () => HERO_HORIZON_END,
+      });
+      try {
+        store.advanceCursor(first.mission.missionId, paused.turnId, 0);
+      } finally {
+        store.close();
+      }
+
+      const recovered = await runDeterministicM4Mission(options);
+      assert.equal(
+        recovered.trueforgeModelRequests,
+        0,
+        "the completed successor must be recovered instead of recreated",
+      );
+      const originalEvents = new Map(
+        first.mission.trueforgeEvents.map((item) => [
+          `${item.turnId}:${item.event.id}`,
+          canonicalSerialize(item.event),
+        ]),
+      );
+      const recoveredEvents = new Map(
+        recovered.mission.trueforgeEvents.map((item) => [
+          `${item.turnId}:${item.event.id}`,
+          canonicalSerialize(item.event),
+        ]),
+      );
+      assert.deepEqual([...recoveredEvents.keys()].sort(), [...originalEvents.keys()].sort());
+      for (const [identity, event] of originalEvents) {
+        assert.equal(recoveredEvents.get(identity), event);
+      }
+      assert.equal(recovered.mission.missionSnapshot.bridgeActions.length, 5);
+      assert.equal(controlledWriteCount(recovered), 1);
+      assert.equal(recovered.actualConsumptionFacts, 2);
+    },
+  );
+});
+
+test(
+  "15. a provider done turn without a terminal attempt continues the bounded durable phase",
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-nonterminal-"));
+    const m2Path = join(directory, "m2.sqlite");
+    const factoryPath = join(directory, "factory.sqlite");
+    const missionPath = join(directory, "mission.sqlite");
+    const missionId = "mission/nonterminal-provider-done";
+    const sessionId = "session/nonterminal-provider-done";
+    const turnId = "turn/nonterminal-provider-done";
+    const factory = new SyntheticFactoryEnvironment({
+      path: factoryPath,
+      now: () => HERO_HORIZON_END,
+    });
+    factory.close();
+    const m2Store = createStore({
+      path: m2Path,
+      initialState: createHeroInitialState(),
+      authoritativeFactoryDatabasePath: factoryPath,
+      now: () => HERO_HORIZON_END,
+    });
+    assert.equal(
+      m2Store.evaluateAndRecordAdmission({ proposal: createHeroProposal() })
+        .decision,
+      "REPLAN",
+    );
+    m2Store.close();
+
+    const done: TrueForgeApi.TurnDoneEvent = {
+      id: "event/nonterminal-provider-done",
+      type: "turn.done",
+      threadId: null,
+      createdAt: HERO_HORIZON_END,
+      state: {
+        status: "done",
+        completedAt: HERO_HORIZON_END,
+        output: null,
+        requiredActions: [],
+      },
+    };
+    let continuationCalls = 0;
+    const trueforgeClient = {
+      sessions: {
+        getTurn: async () => ({ data: { state: done.state } }),
+        listTurnEvents: async () => asyncPage([done]),
+        listTurns: async () => asyncPage([]),
+        createTurnStream: async (
+          receivedSessionId: string,
+          request: {
+            previousTurnId: string;
+            input: TrueForgeApi.TurnInputItem[];
+          },
+        ) => {
+          continuationCalls += 1;
+          assert.equal(receivedSessionId, sessionId);
+          assert.equal(request.previousTurnId, turnId);
+          assert.match(canonicalSerialize(request.input), /REPLAN/u);
+          throw new Error("planned bounded nonterminal continuation");
+        },
+      },
+    } as unknown as TrueForge;
+    const missionStore = new M4MissionStore({
+      path: missionPath,
+      now: () => HERO_HORIZON_END,
+    });
+    try {
+      missionStore.bindMission({
+        missionId,
+        environmentId: HERO_ENVIRONMENT_ID,
+        trueforgeAgentId: "agent/nonterminal-provider-done",
+        trueforgeSessionId: sessionId,
+        m2EnvironmentIdentity: databaseIdentity(m2Path),
+        factoryEnvironmentIdentity: databaseIdentity(factoryPath),
+      });
+      missionStore.advanceCursor(missionId, turnId, 1);
+      const controller = new M4MissionController({
+        missionId,
+        environmentId: HERO_ENVIRONMENT_ID,
+        trueforgeAgentId: "agent/nonterminal-provider-done",
+        trueforgeSessionId: sessionId,
+        trueforgeClient,
+        missionStore,
+        m2DatabasePath: m2Path,
+        factoryDatabasePath: factoryPath,
+        ownerDecisionProvider: () => ({ status: "allow" }),
+      });
+      await assert.rejects(
+        controller.runToCompletion(),
+        /planned bounded nonterminal continuation/u,
+      );
+      assert.equal(continuationCalls, 1);
+    } finally {
+      missionStore.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("16. concurrent exact successor claims converge and a conflicting replay is inert", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-successor-"));
+  const path = join(directory, "mission.sqlite");
+  const missionId = "mission/concurrent-successor";
+  const sessionId = "session/concurrent-successor";
+  const left = new M4MissionStore({ path, now: () => HERO_HORIZON_END });
+  const right = new M4MissionStore({ path, now: () => HERO_HORIZON_END });
+  try {
+    left.bindMission({
+      missionId,
+      environmentId: HERO_ENVIRONMENT_ID,
+      trueforgeAgentId: "agent/concurrent-successor",
+      trueforgeSessionId: sessionId,
+      m2EnvironmentIdentity: databaseIdentity("m2/concurrent-successor"),
+      factoryEnvironmentIdentity: databaseIdentity(
+        "factory/concurrent-successor",
+      ),
+    });
+    const common = {
+      missionId,
+      trueforgeSessionId: sessionId,
+      previousTurnId: "turn/paused-predecessor",
+      input: [
+        {
+          type: "user.tool_approval",
+          threadId: "thread/root",
+          toolCallId: "tool/approval",
+          approval: { status: "allow" },
+        },
+      ],
+    } as const;
+    const [firstClaim, secondClaim] = await Promise.all([
+      new Promise<ReturnType<M4MissionStore["claimSuccessorIntent"]>>(
+        (resolve) =>
+          setImmediate(() =>
+            resolve(
+              left.claimSuccessorIntent({
+                ...common,
+                ownerToken: "successor-owner/100001/left",
+              }),
+            ),
+          ),
+      ),
+      new Promise<ReturnType<M4MissionStore["claimSuccessorIntent"]>>(
+        (resolve) =>
+          setImmediate(() =>
+            resolve(
+              right.claimSuccessorIntent({
+                ...common,
+                ownerToken: "successor-owner/100002/right",
+              }),
+            ),
+          ),
+      ),
+    ]);
+    assert.equal(firstClaim.intent.intentKey, secondClaim.intent.intentKey);
+    assert.deepEqual(
+      [firstClaim.claimed, secondClaim.claimed].sort(),
+      [false, true],
+    );
+    assert.equal(left.getSnapshot(missionId).successorIntents.length, 1);
+    const beforeConflict = canonicalSerialize(left.getSnapshot(missionId));
+    assert.throws(
+      () =>
+        right.claimSuccessorIntent({
+          ...common,
+          input: [
+            {
+              type: "user.tool_approval",
+              threadId: "thread/root",
+              toolCallId: "tool/approval",
+              approval: { status: "deny", reason: "conflicting decision" },
+            },
+          ],
+          ownerToken: "successor-owner/100003/conflict",
+        }),
+      /conflicting input/u,
+    );
+    assert.equal(
+      canonicalSerialize(left.getSnapshot(missionId)),
+      beforeConflict,
+    );
+  } finally {
+    right.close();
+    left.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("17. malformed approval arguments are denied before durable business mutation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-malformed-approval-"));
+  const m2Path = join(directory, "m2.sqlite");
+  const factoryPath = join(directory, "factory.sqlite");
+  const missionPath = join(directory, "mission.sqlite");
+  const missionId = "mission/malformed-approval";
+  const sessionId = "session/malformed-approval";
+  const turnId = "turn/malformed-approval";
+  const toolCallId = "tool/malformed-submit";
+  const sourceEventId = "event/malformed-submit";
+  const factory = new SyntheticFactoryEnvironment({
+    path: factoryPath,
+    now: () => HERO_HORIZON_END,
+  });
+  factory.close();
+  const initialStore = createStore({
+    path: m2Path,
+    initialState: createHeroInitialState(),
+    authoritativeFactoryDatabasePath: factoryPath,
+    now: () => HERO_HORIZON_END,
+  });
+  initialStore.close();
+  const before = m2Snapshot(m2Path);
+  const modelEvent = {
+    id: sourceEventId,
+    type: "model.message",
+    threadId: "main",
+    createdAt: HERO_HORIZON_END,
+    toolCalls: [
+      {
+        id: toolCallId,
+        type: "function",
+        function: {
+          name: "submit_schedule_change",
+          arguments: JSON.stringify({
+            execution_attempt_id: "attempt/malformed-submit",
+            claim: {},
+            schedule_change: "not-an-object",
+          }),
+        },
+        toolInfo: {
+          type: "mcp",
+          name: "submit_schedule_change",
+          serverId: "factory-change-control",
+          serverName: "factory-change-control",
+        },
+      },
+    ],
+  } as TrueForgeApi.ModelMessageEvent;
+  const required = {
+    id: "event/malformed-approval-required",
+    type: "tool.approval_required",
+    threadId: "main",
+    createdAt: HERO_HORIZON_END,
+    toolCalls: [{ id: toolCallId, sourceEventId }],
+  } as TrueForgeApi.ToolApprovalRequiredEvent;
+  const done = {
+    id: "event/malformed-turn-done",
+    type: "turn.done",
+    threadId: null,
+    createdAt: HERO_HORIZON_END,
+    state: {
+      status: "done",
+      completedAt: HERO_HORIZON_END,
+      output: null,
+      requiredActions: [required],
+    },
+  } as TrueForgeApi.TurnDoneEvent;
+  let continuationCalls = 0;
+  const trueforgeClient = {
+    sessions: {
+      getTurn: async () => ({ data: { id: turnId, state: done.state } }),
+      listTurnEvents: async () => asyncPage([modelEvent, required, done]),
+      listTurns: async () => asyncPage([]),
+      createTurnStream: async (
+        receivedSessionId: string,
+        request: {
+          previousTurnId: string;
+          input: TrueForgeApi.TurnInputItem[];
+        },
+      ) => {
+        continuationCalls += 1;
+        assert.equal(receivedSessionId, sessionId);
+        assert.equal(request.previousTurnId, turnId);
+        assert.equal(request.input.length, 1);
+        const input = request.input[0];
+        assert.equal(input?.type, "user.tool_approval");
+        if (input?.type !== "user.tool_approval") assert.fail("approval input missing");
+        assert.equal(input.toolCallId, toolCallId);
+        assert.equal(input.approval.status, "deny");
+        assert.match(
+          input.approval.status === "deny" ? input.approval.reason ?? "" : "",
+          /schedule_change must be an object/u,
+        );
+        throw new Error("planned malformed-approval continuation");
+      },
+    },
+  } as unknown as TrueForge;
+  const missionStore = new M4MissionStore({
+    path: missionPath,
+    now: () => HERO_HORIZON_END,
+  });
+  try {
+    missionStore.bindMission({
+      missionId,
+      environmentId: HERO_ENVIRONMENT_ID,
+      trueforgeAgentId: "agent/malformed-approval",
+      trueforgeSessionId: sessionId,
+      m2EnvironmentIdentity: databaseIdentity(m2Path),
+      factoryEnvironmentIdentity: databaseIdentity(factoryPath),
+    });
+    missionStore.advanceCursor(missionId, turnId, 3);
+    const controller = new M4MissionController({
+      missionId,
+      environmentId: HERO_ENVIRONMENT_ID,
+      trueforgeAgentId: "agent/malformed-approval",
+      trueforgeSessionId: sessionId,
+      trueforgeClient,
+      missionStore,
+      m2DatabasePath: m2Path,
+      factoryDatabasePath: factoryPath,
+      ownerDecisionProvider: () => ({ status: "allow" }),
+    });
+    await assert.rejects(
+      controller.runToCompletion(),
+      /planned malformed-approval continuation/u,
+    );
+    assert.equal(continuationCalls, 1);
+    assert.equal(missionStore.getSnapshot(missionId).bridgeActions.length, 0);
+    assert.equal(m2Snapshot(m2Path), before);
+  } finally {
+    missionStore.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("18. grouped approval calls are denied and retried only sequentially", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-grouped-approval-"));
+  const m2Path = join(directory, "never-created-m2.sqlite");
+  const factoryPath = join(directory, "never-created-factory.sqlite");
+  const missionPath = join(directory, "mission.sqlite");
+  const missionId = "mission/grouped-approval";
+  const sessionId = "session/grouped-approval";
+  const turnId = "turn/grouped-approval";
+  const calls = ["tool/grouped-left", "tool/grouped-right"];
+  const modelEvent = {
+    id: "event/grouped-source",
+    type: "model.message",
+    threadId: "main",
+    createdAt: HERO_HORIZON_END,
+    toolCalls: calls.map((id, index) => ({
+      id,
+      type: "function",
+      function: {
+        name:
+          index === 0
+            ? "create_schedule_reservation"
+            : "submit_schedule_change",
+        arguments: "{}",
+      },
+      toolInfo: {
+        type: "mcp",
+        name:
+          index === 0
+            ? "create_schedule_reservation"
+            : "submit_schedule_change",
+        serverId: "factory-change-control",
+        serverName: "factory-change-control",
+      },
+    })),
+  } as TrueForgeApi.ModelMessageEvent;
+  const required = {
+    id: "event/grouped-required",
+    type: "tool.approval_required",
+    threadId: "main",
+    createdAt: HERO_HORIZON_END,
+    toolCalls: calls.map((id) => ({ id, sourceEventId: modelEvent.id })),
+  } as TrueForgeApi.ToolApprovalRequiredEvent;
+  const done = {
+    id: "event/grouped-done",
+    type: "turn.done",
+    threadId: null,
+    createdAt: HERO_HORIZON_END,
+    state: {
+      status: "done",
+      completedAt: HERO_HORIZON_END,
+      output: null,
+      requiredActions: [required],
+    },
+  } as TrueForgeApi.TurnDoneEvent;
+  let continuationCalls = 0;
+  const trueforgeClient = {
+    sessions: {
+      getTurn: async () => ({ data: { id: turnId, state: done.state } }),
+      listTurnEvents: async () => asyncPage([modelEvent, required, done]),
+      listTurns: async () => asyncPage([]),
+      createTurnStream: async (
+        _receivedSessionId: string,
+        request: { input: TrueForgeApi.TurnInputItem[] },
+      ) => {
+        continuationCalls += 1;
+        assert.equal(request.input.length, 2);
+        assert.deepEqual(
+          request.input.map((input) =>
+            input.type === "user.tool_approval"
+              ? [input.toolCallId, input.approval.status]
+              : ["wrong-input", "wrong-input"],
+          ),
+          calls.map((id) => [id, "deny"]),
+        );
+        assert.ok(
+          request.input.every(
+            (input) =>
+              input.type === "user.tool_approval" &&
+              input.approval.status === "deny" &&
+              input.approval.reason?.includes("retried sequentially") === true,
+          ),
+        );
+        throw new Error("planned grouped-approval continuation");
+      },
+    },
+  } as unknown as TrueForge;
+  const missionStore = new M4MissionStore({
+    path: missionPath,
+    now: () => HERO_HORIZON_END,
+  });
+  try {
+    missionStore.bindMission({
+      missionId,
+      environmentId: HERO_ENVIRONMENT_ID,
+      trueforgeAgentId: "agent/grouped-approval",
+      trueforgeSessionId: sessionId,
+      m2EnvironmentIdentity: databaseIdentity(m2Path),
+      factoryEnvironmentIdentity: databaseIdentity(factoryPath),
+    });
+    missionStore.advanceCursor(missionId, turnId, 3);
+    const controller = new M4MissionController({
+      missionId,
+      environmentId: HERO_ENVIRONMENT_ID,
+      trueforgeAgentId: "agent/grouped-approval",
+      trueforgeSessionId: sessionId,
+      trueforgeClient,
+      missionStore,
+      m2DatabasePath: m2Path,
+      factoryDatabasePath: factoryPath,
+      ownerDecisionProvider: () => ({ status: "allow" }),
+    });
+    await assert.rejects(
+      controller.runToCompletion(),
+      /planned grouped-approval continuation/u,
+    );
+    assert.equal(continuationCalls, 1);
+    assert.equal(missionStore.getSnapshot(missionId).bridgeActions.length, 0);
+    assert.equal(existsSync(m2Path), false);
+    assert.equal(existsSync(factoryPath), false);
+  } finally {
+    missionStore.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test(
@@ -651,4 +1404,58 @@ function controlledWriteCount(result: DeterministicM4MissionResult): number {
       (reservation) => reservation.sourceExecutionAttemptId !== null,
     ).length ?? 0
   );
+}
+
+function m2Snapshot(path: string): string {
+  const store = createStore({ path });
+  try {
+    return canonicalSerialize({
+      portfolio: store.getPortfolio(),
+      admissions: store.getAdmissionHistory(),
+      denials: store.getDenials(),
+    });
+  } finally {
+    store.close();
+  }
+}
+
+function storeAdmissionId(
+  path: string,
+  decision: "ADMITTABLE" | "REPLAN" | "REJECT",
+  portfolioVersion: string,
+): string {
+  const store = createStore({ path });
+  try {
+    const admission = store
+      .getAdmissionHistory()
+      .find(
+        (candidate) =>
+          candidate.record.decision === decision &&
+          candidate.record.portfolioVersion === portfolioVersion,
+      );
+    assert.ok(admission);
+    return admission.record.admissionRecordId;
+  } finally {
+    store.close();
+  }
+}
+
+function record(value: unknown, field: string): Record<string, unknown> {
+  assert.ok(
+    value !== null && typeof value === "object" && !Array.isArray(value),
+    `${field} must be an object`,
+  );
+  return value as Record<string, unknown>;
+}
+
+function databaseIdentity(path: string): string {
+  return `sha256:${createHash("sha256").update(path).digest("hex")}`;
+}
+
+function asyncPage<T>(values: readonly T[]): AsyncIterable<T> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield* values;
+    },
+  };
 }

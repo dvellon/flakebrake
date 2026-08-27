@@ -503,7 +503,7 @@ export function m4MutationArguments(
 ): Record<string, unknown> {
   return withAuthoritativeStore(options, (store) => {
     const accepted = selectedReadmission(store);
-    const selectedPlanId = selectedHeroPlan(latestAdmission(store, "REPLAN"));
+    const selectedPlanId = selectedAdmissionPlan(accepted);
     const versions = store.getPortfolio().versions;
     const scope = heroExecutionScope(accepted.promiseBasisId);
     const allowanceKey = canonicalGrantAllowanceKey(
@@ -571,7 +571,7 @@ export function m4AcceptanceArguments(
 ): Record<string, unknown> {
   return withAuthoritativeStore(options, (store) => {
     const accepted = selectedReadmission(store);
-    const selectedPlanId = selectedHeroPlan(latestAdmission(store, "REPLAN"));
+    const selectedPlanId = selectedAdmissionPlan(accepted);
     return {
       admission_record_id: accepted.admissionRecordId,
       selected_plan_id: selectedPlanId,
@@ -811,6 +811,13 @@ function selectedHeroPlan(record: AdmissionRecordBody): string {
   return candidate.candidatePlanId;
 }
 
+function selectedAdmissionPlan(record: AdmissionRecordBody): string {
+  if (record.selectedPlan.kind !== "selected") {
+    throw new Error("M4 authoritative admission has no selected plan");
+  }
+  return record.selectedPlan.selectedPlanId;
+}
+
 function latestAdmission(
   store: FlakeBrakeStore,
   decision: AdmissionRecordBody["decision"],
@@ -825,11 +832,11 @@ function latestAdmission(
 function selectedReadmission(store: FlakeBrakeStore): AdmissionRecordBody {
   const record = store.getAdmissionHistory().find((candidate) =>
     candidate.addenda.some((addendum) => {
-      if (addendum.kind !== "owner_choice") return false;
+      if (addendum.kind !== "readmission_link") return false;
       const body = addendum.body;
       return (
         isJsonObject(body) &&
-        body["kind"] === "MODIFY_SELECTION_CONFIRMED"
+        body["kind"] === "M4_POST_MODIFICATION_ADMISSION"
       );
     }),
   )?.record;

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -13,10 +14,16 @@ import { z } from "zod";
 import { canonicalSerialize, compareStableStrings } from "./canonical.js";
 import type {
   AcceptedObligation,
+  AdmissionResult,
   JsonValue,
   ProposedObligation,
+  ReplanCandidate,
 } from "./domain.js";
-import type { ApprovalScope } from "./stateful-domain.js";
+import type {
+  AdmissionRecordBody,
+  ApprovalScope,
+  OwnerDecisionInput,
+} from "./stateful-domain.js";
 import {
   type AuthorizedScheduleMutation,
   type CanonicalScheduleCommand,
@@ -33,6 +40,14 @@ import { stableTupleId } from "./identity.js";
 import { StrictJsonLineInput } from "./mcp-stdio-guard.js";
 import { createStore } from "./store.js";
 import type { FlakeBrakeStore } from "./store.js";
+import {
+  canonicalJson,
+  inImmediateTransaction,
+  openSqlite,
+  parseCanonicalJson,
+} from "./sqlite.js";
+import type { SqliteDatabase } from "./sqlite.js";
+import { advanceVersions, readVersions } from "./versioning.js";
 
 export const FACTORY_MCP_SERVICE_NAMES = [
   "factory-orders",
@@ -969,13 +984,7 @@ function registerM4ChangeControlTools(
     },
     (input) =>
       toolResult(
-        store.recordOwnerDecision({
-          kind: "MODIFY",
-          admissionRecordId: input.admission_record_id,
-          selectedPlanId: input.selected_plan_id,
-          ownerDecisionId: input.owner_decision_id,
-          approverId: input.approver_id,
-        }),
+        applyM4PortfolioModification(store, m2DatabasePath, input),
       ),
   );
 
@@ -1136,6 +1145,472 @@ function registerM4ChangeControlTools(
     ({ execution_attempt_id }) =>
       toolResult(store.verifyExecutionAuthoritatively(execution_attempt_id)),
   );
+}
+
+function applyM4PortfolioModification(
+  store: FlakeBrakeStore,
+  m2DatabasePath: string,
+  input: z.infer<typeof selectPortfolioModificationSchema>,
+): {
+  readonly status: "READMITTED";
+  readonly ownerDecisionId: string;
+  readonly freshAdmissionRecord: AdmissionRecordBody;
+} {
+  const source = store.getAdmissionRecord(input.admission_record_id);
+  if (source.record.decision !== "REPLAN") {
+    throw new TypeError("M4 portfolio modification requires a REPLAN admission");
+  }
+  if (
+    source.addenda.some((addendum) => addendum.kind === "acceptance_commit")
+  ) {
+    throw new TypeError("The source REPLAN admission was already accepted");
+  }
+  const candidate = source.record.candidatePlans.find(
+    (item) => item.candidatePlanId === input.selected_plan_id,
+  );
+  if (candidate?.feasible !== true) {
+    throw new TypeError("M4 portfolio modification requires a feasible plan");
+  }
+  const decision: OwnerDecisionInput = {
+    kind: "MODIFY",
+    admissionRecordId: input.admission_record_id,
+    selectedPlanId: input.selected_plan_id,
+    ownerDecisionId: input.owner_decision_id,
+    approverId: input.approver_id,
+  };
+
+  const database = openSqlite(m2DatabasePath);
+  let linkedAdmissionId: string | null;
+  try {
+    linkedAdmissionId = inImmediateTransaction(database, () => {
+      const linked = m4LinkedAdmissionId(database, input.admission_record_id);
+      const existingDecision = database
+        .prepare(
+          "SELECT body_json FROM owner_decisions WHERE owner_decision_id = ?",
+        )
+        .get(input.owner_decision_id) as Record<string, unknown> | undefined;
+      if (existingDecision !== undefined) {
+        const stored = parseCanonicalJson<OwnerDecisionInput>(
+          existingDecision["body_json"],
+          "M4 portfolio owner decision",
+        );
+        if (canonicalSerialize(stored) !== canonicalSerialize(decision)) {
+          throw new TypeError("M4 owner decision identity was reused");
+        }
+        if (linked === null) {
+          assertM4ModifiedPortfolio(database, source.record, candidate);
+        }
+        return linked;
+      }
+      if (linked !== null) {
+        throw new Error("M4 readmission link exists without its owner decision");
+      }
+      const currentVersions = readVersions(database);
+      if (
+        currentVersions.portfolioVersion !== source.record.portfolioVersion
+      ) {
+        throw new TypeError("M4 source REPLAN portfolio basis is stale");
+      }
+      const currentPortfolio = readM4Portfolio(database);
+      if (
+        canonicalSerialize(currentPortfolio) !==
+        canonicalSerialize(source.record.m1Result.promiseBasis.acceptedPortfolio)
+      ) {
+        throw new TypeError("M4 source REPLAN portfolio bytes are stale");
+      }
+      const modified = materializeM4Portfolio(source.record, candidate);
+      for (const obligation of modified) {
+        database
+          .prepare(
+            `UPDATE portfolio_obligations SET body_json = ?
+              WHERE obligation_id = ?`,
+          )
+          .run(canonicalJson(obligation), obligation.obligationId);
+      }
+      database
+        .prepare(
+          `INSERT INTO owner_decisions
+             (owner_decision_id, created_at, body_json) VALUES (?, ?, ?)`,
+        )
+        .run(input.owner_decision_id, HERO_HORIZON_END, canonicalJson(decision));
+      appendM4Addendum(
+        database,
+        stableTupleId("m4-portfolio-owner-choice", [
+          input.admission_record_id,
+          input.owner_decision_id,
+          input.selected_plan_id,
+        ]),
+        input.admission_record_id,
+        "owner_choice",
+        decision,
+      );
+      const next = advanceVersions(database, new Set(["portfolio"]));
+      const expectedNext = nextPortfolioVersion(source.record.portfolioVersion);
+      if (next.portfolioVersion !== expectedNext) {
+        throw new Error("M4 portfolio modification did not create exact v2 basis");
+      }
+      return null;
+    });
+  } finally {
+    database.close();
+  }
+
+  if (linkedAdmissionId !== null) {
+    const linked = store.getAdmissionRecord(linkedAdmissionId).record;
+    assertM4FreshAdmission(linked, source.record.admissionRecordId);
+    return {
+      status: "READMITTED",
+      ownerDecisionId: input.owner_decision_id,
+      freshAdmissionRecord: linked,
+    };
+  }
+
+  const evaluation = store.evaluateCurrentAdmission({
+    proposal: source.record.proposalSnapshot,
+    assumptions: source.record.m1Result.promiseBasis.assumptions,
+    combinedDecisionProofs:
+      source.record.m1Result.promiseBasis.combinedDecisionProofs,
+  });
+  if (evaluation.result.decision !== "ADMITTABLE") {
+    throw new Error(
+      `M4 post-modification readmission must be ADMITTABLE, got ${evaluation.result.decision}`,
+    );
+  }
+  const freshDatabase = openSqlite(m2DatabasePath);
+  let fresh: AdmissionRecordBody;
+  try {
+    fresh = inImmediateTransaction(freshDatabase, () => {
+      const current = readVersions(freshDatabase);
+      if (
+        current.portfolioVersion !== evaluation.result.basis.portfolioVersion ||
+        current.capacityModelVersion !==
+          evaluation.result.basis.capacityModelVersion ||
+        current.capacityPlanVersion !==
+          evaluation.result.basis.capacityPlanVersion ||
+        current.authorizationStateVersion !==
+          evaluation.result.basis.authorizationStateVersion
+      ) {
+        throw new TypeError("M4 readmission basis changed before persistence");
+      }
+      const existingLink = m4LinkedAdmissionId(
+        freshDatabase,
+        source.record.admissionRecordId,
+      );
+      if (existingLink !== null) {
+        return readM4Admission(freshDatabase, existingLink);
+      }
+      const matching = (
+        freshDatabase
+          .prepare(
+            `SELECT body_json FROM admission_records
+              WHERE proposal_obligation_id = ? AND decision = 'ADMITTABLE'
+              ORDER BY created_at, admission_record_id`,
+          )
+          .all(source.record.proposalSnapshot.obligationId) as Record<
+          string,
+          unknown
+        >[]
+      )
+        .map((row) =>
+          parseCanonicalJson<AdmissionRecordBody>(
+            row["body_json"],
+            "M4 candidate readmission",
+          ),
+        )
+        .filter(
+          (record) =>
+            record.portfolioVersion ===
+              evaluation.result.basis.portfolioVersion &&
+            canonicalSerialize(record.m1Result) ===
+              canonicalSerialize(evaluation.result),
+        );
+      if (matching.length > 1) {
+        throw new Error("M4 post-modification admission was duplicated");
+      }
+      const record = matching[0] ?? m4AdmissionRecord(evaluation.result);
+      if (matching.length === 0) {
+        freshDatabase
+          .prepare(
+            `INSERT INTO admission_records
+               (admission_record_id, created_at, decision,
+                proposal_obligation_id, body_json)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(
+            record.admissionRecordId,
+            record.createdAt,
+            record.decision,
+            record.proposalSnapshot.obligationId,
+            canonicalJson(record),
+          );
+      }
+      appendM4Addendum(
+        freshDatabase,
+        stableTupleId("m4-source-readmission-link", [
+          source.record.admissionRecordId,
+          input.owner_decision_id,
+          record.admissionRecordId,
+        ]),
+        source.record.admissionRecordId,
+        "readmission_link",
+        {
+          kind: "M4_PORTFOLIO_MODIFICATION_READMISSION",
+          ownerDecisionId: input.owner_decision_id,
+          selectedPlanId: input.selected_plan_id,
+          freshAdmissionRecordId: record.admissionRecordId,
+        },
+      );
+      appendM4Addendum(
+        freshDatabase,
+        stableTupleId("m4-fresh-readmission-link", [
+          source.record.admissionRecordId,
+          input.owner_decision_id,
+          record.admissionRecordId,
+        ]),
+        record.admissionRecordId,
+        "readmission_link",
+        {
+          kind: "M4_POST_MODIFICATION_ADMISSION",
+          sourceAdmissionRecordId: source.record.admissionRecordId,
+          ownerDecisionId: input.owner_decision_id,
+          selectedModificationPlanId: input.selected_plan_id,
+        },
+      );
+      return record;
+    });
+  } finally {
+    freshDatabase.close();
+  }
+  assertM4FreshAdmission(fresh, source.record.admissionRecordId);
+  return {
+    status: "READMITTED",
+    ownerDecisionId: input.owner_decision_id,
+    freshAdmissionRecord: fresh,
+  };
+}
+
+function materializeM4Portfolio(
+  source: AdmissionRecordBody,
+  candidate: ReplanCandidate,
+): readonly AcceptedObligation[] {
+  if (
+    candidate.affectedObligations.some(
+      (change) => change.obligationStatus !== "accepted",
+    )
+  ) {
+    throw new TypeError(
+      "M4 selected modification must change only an existing accepted order",
+    );
+  }
+  let changed = 0;
+  const materialized = source.m1Result.promiseBasis.acceptedPortfolio.map(
+    (obligation) => {
+      const change = candidate.affectedObligations.find(
+        (item) => item.obligationId === obligation.obligationId,
+      );
+      if (change === undefined) return obligation;
+      if (obligation.protected) {
+        throw new TypeError("M4 selected modification cannot change protected work");
+      }
+      const option = obligation.modificationOptions.find(
+        (item) => item.optionId === change.optionId,
+      );
+      if (option === undefined) {
+        throw new TypeError("M4 selected modification option is missing");
+      }
+      changed += 1;
+      return JSON.parse(
+        canonicalSerialize({
+          ...obligation,
+          serviceLevel: { ...obligation.serviceLevel, ...option.changes },
+          resourceDemand: option.resourceDemand,
+        }),
+      ) as AcceptedObligation;
+    },
+  );
+  if (changed === 0) {
+    throw new TypeError("M4 selected modification changed no accepted order");
+  }
+  return materialized;
+}
+
+function assertM4ModifiedPortfolio(
+  database: SqliteDatabase,
+  source: AdmissionRecordBody,
+  candidate: ReplanCandidate,
+): void {
+  const current = readM4Portfolio(database);
+  const expected = materializeM4Portfolio(source, candidate);
+  if (canonicalSerialize(current) !== canonicalSerialize(expected)) {
+    throw new TypeError("M4 replay found conflicting portfolio bytes");
+  }
+  if (
+    readVersions(database).portfolioVersion !==
+    nextPortfolioVersion(source.portfolioVersion)
+  ) {
+    throw new TypeError("M4 replay found a conflicting portfolio version");
+  }
+}
+
+function readM4Portfolio(database: SqliteDatabase): readonly AcceptedObligation[] {
+  return (
+    database
+      .prepare(
+        "SELECT body_json FROM portfolio_obligations ORDER BY obligation_id",
+      )
+      .all() as Record<string, unknown>[]
+  ).map((row) =>
+    parseCanonicalJson<AcceptedObligation>(row["body_json"], "M4 portfolio"),
+  );
+}
+
+function nextPortfolioVersion(version: string): string {
+  const match = /^portfolio\/v([1-9][0-9]*)$/u.exec(version);
+  if (match === null) throw new TypeError("Invalid M4 portfolio version");
+  return `portfolio/v${String(Number(match[1]) + 1)}`;
+}
+
+function m4AdmissionRecord(result: AdmissionResult): AdmissionRecordBody {
+  if (result.decision !== "ADMITTABLE") {
+    throw new TypeError("M4 fresh admission must be ADMITTABLE");
+  }
+  const selectedPlanId = result.promiseBasis.selectedPlanIds[0];
+  if (selectedPlanId === undefined) {
+    throw new Error("M4 fresh admission omitted its direct selected plan");
+  }
+  const expected = result.expectedBasis;
+  const record: AdmissionRecordBody = {
+    schemaVersion: "flakebrake-admission-record/v0.1-m2",
+    admissionRecordId: `admission/${randomUUID()}`,
+    promiseBasisId: stableTupleId("promise-basis", [
+      asJsonValue(result.promiseBasis),
+    ]),
+    createdAt: HERO_HORIZON_END,
+    decision: result.decision,
+    portfolioVersion: result.basis.portfolioVersion,
+    expectedPortfolioVersion: expected.expectedPortfolioVersion,
+    capacityModelVersion: result.basis.capacityModelVersion,
+    expectedCapacityModelVersion: expected.expectedCapacityModelVersion,
+    capacityPlanVersion: result.basis.capacityPlanVersion,
+    expectedCapacityPlanVersion: expected.expectedCapacityPlanVersion,
+    authorizationStateVersion: result.basis.authorizationStateVersion,
+    expectedAuthorizationStateVersion:
+      expected.expectedAuthorizationStateVersion,
+    calibrationFrontierDigest: result.basis.calibrationFrontierDigest,
+    expectedCalibrationFrontierDigest:
+      expected.expectedCalibrationFrontierDigest,
+    calibrationFrontierProvenance:
+      result.basis.calibrationFrontierProvenance,
+    fixedInFlightExecutionReservations: result.basis.fixedCapacityReservations,
+    proposalSnapshot: result.promiseBasis.proposal,
+    candidatePlans: result.promiseBasis.candidatePlans,
+    selectedPlan: { kind: "selected", selectedPlanId },
+    capacityBefore: result.directPlan.capacityBefore,
+    predictedConsumption: result.directPlan.predictedConsumption,
+    capacityAfter: result.directPlan.capacityAfter,
+    protectedObligationSlack: result.directPlan.protectedObligationSlack,
+    bindingResourceFacts: result.directPlan.bindingOrLimitingResources,
+    ownerChoice: "PENDING_OWNER_CHOICE",
+    actualConsumption: "NOT_YET_KNOWN",
+    outcome: "NOT_YET_KNOWN",
+    additiveCorrections: "NOT_YET_KNOWN",
+    m1Result: result,
+  };
+  return JSON.parse(canonicalSerialize(record)) as AdmissionRecordBody;
+}
+
+function m4LinkedAdmissionId(
+  database: SqliteDatabase,
+  sourceAdmissionRecordId: string,
+): string | null {
+  const rows = database
+    .prepare(
+      `SELECT body_json FROM admission_addenda
+        WHERE admission_record_id = ? AND kind = 'readmission_link'
+        ORDER BY sequence`,
+    )
+    .all(sourceAdmissionRecordId) as Record<string, unknown>[];
+  for (const row of rows) {
+    const body = parseCanonicalJson<JsonValue>(
+      row["body_json"],
+      "M4 source readmission link",
+    );
+    if (!isM4JsonObject(body)) continue;
+    if (body["kind"] !== "M4_PORTFOLIO_MODIFICATION_READMISSION") continue;
+    const freshAdmissionRecordId = body["freshAdmissionRecordId"];
+    if (typeof freshAdmissionRecordId !== "string") {
+      throw new TypeError("M4 source readmission link is malformed");
+    }
+    return freshAdmissionRecordId;
+  }
+  return null;
+}
+
+function isM4JsonObject(
+  value: JsonValue,
+): value is Readonly<Record<string, JsonValue>> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readM4Admission(
+  database: SqliteDatabase,
+  admissionRecordId: string,
+): AdmissionRecordBody {
+  const row = database
+    .prepare("SELECT body_json FROM admission_records WHERE admission_record_id = ?")
+    .get(admissionRecordId) as Record<string, unknown> | undefined;
+  if (row === undefined) throw new Error("M4 linked admission is missing");
+  return parseCanonicalJson<AdmissionRecordBody>(
+    row["body_json"],
+    "M4 linked admission",
+  );
+}
+
+function appendM4Addendum(
+  database: SqliteDatabase,
+  addendumId: string,
+  admissionRecordId: string,
+  kind: "owner_choice" | "readmission_link",
+  body: unknown,
+): void {
+  const bodyJson = canonicalJson(body);
+  const existing = database
+    .prepare(
+      `SELECT admission_record_id, created_at, kind, body_json
+         FROM admission_addenda WHERE addendum_id = ?`,
+    )
+    .get(addendumId) as Record<string, unknown> | undefined;
+  if (existing !== undefined) {
+    if (
+      existing["admission_record_id"] !== admissionRecordId ||
+      existing["created_at"] !== HERO_HORIZON_END ||
+      existing["kind"] !== kind ||
+      existing["body_json"] !== bodyJson
+    ) {
+      throw new Error(`M4 addendum ${addendumId} conflicts`);
+    }
+    return;
+  }
+  database
+    .prepare(
+      `INSERT INTO admission_addenda
+         (addendum_id, admission_record_id, created_at, kind, body_json)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(addendumId, admissionRecordId, HERO_HORIZON_END, kind, bodyJson);
+}
+
+function assertM4FreshAdmission(
+  record: AdmissionRecordBody,
+  sourceAdmissionRecordId: string,
+): void {
+  if (
+    record.decision !== "ADMITTABLE" ||
+    record.portfolioVersion !== "portfolio/v2" ||
+    record.admissionRecordId === sourceAdmissionRecordId
+  ) {
+    throw new TypeError("M4 linked admission is not the fresh v2 ADMITTABLE basis");
+  }
 }
 
 function recordCurrentM4AdmissionOrReplay(

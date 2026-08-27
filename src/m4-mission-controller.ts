@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   TrueForge,
@@ -120,6 +120,41 @@ interface ResolvedToolCall {
   readonly arguments: Record<string, unknown>;
 }
 
+interface PreparedApproval {
+  readonly bridgeKey: string | null;
+  readonly input: TrueForgeApi.UserToolApprovalEvent;
+}
+
+class InvalidM4ApprovalInputError extends Error {
+  public readonly tool: ResolvedToolCall;
+
+  public constructor(tool: ResolvedToolCall, cause: unknown) {
+    super(
+      `FlakeBrake rejected malformed ${tool.name} arguments: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+      { cause },
+    );
+    this.name = "InvalidM4ApprovalInputError";
+    this.tool = tool;
+  }
+}
+
+type DurableMissionPhase =
+  | {
+      readonly complete: true;
+      readonly attempt: ReturnType<FlakeBrakeStore["getExecutionAttempt"]>;
+    }
+  | {
+      readonly complete: false;
+      readonly continuation: string;
+      readonly executionAttemptId: string | null;
+      readonly factoryReceiptId: string | null;
+    };
+
+const ACTIVE_SUCCESSOR_OWNERS = new Set<string>();
+const MAX_BOUNDED_CONTINUATIONS = 12;
+
 /**
  * Headless coordinator for native TrueForge pauses. It never executes an agent
  * loop or tool itself. Its only cross-system responsibility is to bind the
@@ -154,6 +189,8 @@ export class M4MissionController {
     let turn = await this.#initialOrCurrentTurn();
     let disconnectedAndResumed = turn.disconnectedAndResumed;
     let recoveredFailedTurns = 0;
+    let boundedContinuations = 0;
+    let invalidApprovalRecoveries = 0;
     while (true) {
       if (turn.done.state.status !== "done") {
         recoveredFailedTurns += 1;
@@ -173,46 +210,33 @@ export class M4MissionController {
       await this.#recordCompletedToolResponses(turn.events);
       const required = requiredApprovals(turn.done);
       if (required.length === 0) {
-        const store = this.#store();
-        let attempt: ReturnType<FlakeBrakeStore["getExecutionAttempt"]>;
-        try {
-          attempt = store.getExecutionAttempt(
-            "attempt/m4-approved-alternative",
-          );
-          const reservation = store
-            .getReservations(true)
-            .find(
-              (candidate) =>
-                candidate.executionAttemptId === attempt.executionAttemptId,
+        const resolvedSuccessor = await this.#resolvedSuccessor(turn.turnId);
+        if (resolvedSuccessor !== null) {
+          turn = await this.#consumePersistedTurn(resolvedSuccessor);
+          disconnectedAndResumed = true;
+          continue;
+        }
+        const phase = this.#durableMissionPhase();
+        if (!phase.complete) {
+          boundedContinuations += 1;
+          if (boundedContinuations > MAX_BOUNDED_CONTINUATIONS) {
+            throw new Error(
+              "TrueForge mission exceeded bounded durable-phase continuation limit",
             );
-          if (reservation?.claimState !== "terminal_verified") {
-            const factory = readAuthoritativeFactoryExecution(
-              this.#options.factoryDatabasePath,
-              attempt.executionAttemptId,
-            );
-            if (factory === null) {
-              throw new Error(
-                "TrueForge turn completed before a durable factory result",
-              );
-            }
+          }
+          if (phase.factoryReceiptId !== null && phase.executionAttemptId !== null) {
             await this.#checkpoint({
               phase: "factory_committed_before_verification",
               turnId: turn.turnId,
-              executionAttemptId: attempt.executionAttemptId,
-              receiptId: factory.result.receipt.receiptId,
+              executionAttemptId: phase.executionAttemptId,
+              receiptId: phase.factoryReceiptId,
             });
-            turn = await this.#createAndConsumeTurn(turn.turnId, [
-              {
-                type: "user.message",
-                content:
-                  "Continue with independent authoritative read-back and verification of the already committed factory result. Do not repeat the write.",
-              },
-            ]);
-            disconnectedAndResumed ||= turn.disconnectedAndResumed;
-            continue;
           }
-        } finally {
-          store.close();
+          turn = await this.#createAndConsumeTurn(turn.turnId, [
+            { type: "user.message", content: phase.continuation },
+          ]);
+          disconnectedAndResumed ||= turn.disconnectedAndResumed;
+          continue;
         }
         const persistedEvents = await this.#listSessionEvents(turn.turnId);
         // TrueForge's persisted session API is the authoritative reconstruction
@@ -227,7 +251,7 @@ export class M4MissionController {
           missionSnapshot,
           approvals,
           trueforgeEvents: allEvents,
-          finalAttempt: attempt,
+          finalAttempt: phase.attempt,
         };
         return {
           status: "VERIFIED_COMPLETE",
@@ -241,17 +265,70 @@ export class M4MissionController {
           projectionDigest: digest(projection),
         };
       }
-      const approvals = await Promise.all(
-        required.map((requiredAction) =>
-          this.#prepareApproval(turn.turnId, turn.events, requiredAction),
-        ),
-      );
+      const approvals: PreparedApproval[] = [];
+      for (const requiredAction of required) {
+        if (requiredAction.toolCalls.length === 0) {
+          throw new Error("TrueForge approval pause has no tool call");
+        }
+        if (requiredAction.toolCalls.length > 1) {
+          invalidApprovalRecoveries += 1;
+          if (invalidApprovalRecoveries > 3) {
+            throw new Error(
+              "TrueForge mission exceeded malformed approval recovery limit",
+            );
+          }
+          for (const reference of requiredAction.toolCalls) {
+            approvals.push({
+              bridgeKey: null,
+              input: {
+                type: "user.tool_approval",
+                threadId: requiredAction.threadId,
+                toolCallId: reference.id,
+                approval: {
+                  status: "deny",
+                  reason:
+                    "FlakeBrake requires approval-gated mission operations to be retried sequentially, one per pause",
+                },
+              },
+            });
+          }
+          continue;
+        }
+        try {
+          approvals.push(
+            await this.#prepareApproval(
+              turn.turnId,
+              turn.events,
+              requiredAction,
+            ),
+          );
+        } catch (error: unknown) {
+          if (!(error instanceof InvalidM4ApprovalInputError)) throw error;
+          invalidApprovalRecoveries += 1;
+          if (invalidApprovalRecoveries > 3) {
+            throw new Error(
+              "TrueForge mission exceeded malformed approval recovery limit",
+              { cause: error },
+            );
+          }
+          approvals.push({
+            bridgeKey: null,
+            input: {
+              type: "user.tool_approval",
+              threadId: error.tool.threadId,
+              toolCallId: error.tool.toolCallId,
+              approval: { status: "deny", reason: error.message },
+            },
+          });
+        }
+      }
       turn = await this.#createAndConsumeTurn(
         turn.turnId,
         approvals.map((approval) => approval.input),
       );
       disconnectedAndResumed ||= turn.disconnectedAndResumed;
       for (const approval of approvals) {
+        if (approval.bridgeKey === null) continue;
         this.#options.missionStore.recordBridgeOutcome(
           approval.bridgeKey,
           "trueforge_resumed",
@@ -322,12 +399,208 @@ export class M4MissionController {
     previousTurnId: TrueForgeApi.PreviousTurnIdInput,
     input: TrueForgeApi.TurnInputItem[],
   ): Promise<TurnResult> {
-    const stream = await this.#options.trueforgeClient.sessions.createTurnStream(
+    const persisted = await this.#findExactSuccessor(previousTurnId, input);
+    const ownerToken = `successor-owner/${String(process.pid)}/${randomUUID()}`;
+    const claimed = this.#options.missionStore.claimSuccessorIntent({
+      missionId: this.#options.missionId,
+      trueforgeSessionId: this.#options.trueforgeSessionId,
+      previousTurnId,
+      input: asJson(input),
+      ownerToken,
+    });
+    if (persisted !== null) {
+      this.#options.missionStore.resolveSuccessorIntent(
+        claimed.intent.intentKey,
+        persisted.id,
+      );
+      return this.#consumePersistedTurn(persisted);
+    }
+    if (claimed.intent.successorTurnId !== null) {
+      const successor = await this.#options.trueforgeClient.sessions.getTurn(
+        this.#options.trueforgeSessionId,
+        claimed.intent.successorTurnId,
+      );
+      return this.#consumePersistedTurn(successor.data);
+    }
+
+    let intent = claimed.intent;
+    if (!claimed.claimed) {
+      const recovered = await this.#waitForExactSuccessor(previousTurnId, input);
+      if (recovered !== null) {
+        this.#options.missionStore.resolveSuccessorIntent(
+          intent.intentKey,
+          recovered.id,
+        );
+        return this.#consumePersistedTurn(recovered);
+      }
+      if (successorOwnerIsActive(intent.ownerToken)) {
+        throw new Error(
+          `Exact TrueForge successor for ${previousTurnId} is still being created`,
+        );
+      }
+      intent = this.#options.missionStore.reassignSuccessorIntent(
+        intent.intentKey,
+        intent.ownerToken,
+        ownerToken,
+      );
+      if (intent.ownerToken !== ownerToken) {
+        throw new Error(
+          `Exact TrueForge successor for ${previousTurnId} has another durable owner`,
+        );
+      }
+    }
+
+    ACTIVE_SUCCESSOR_OWNERS.add(ownerToken);
+    try {
+      const recovered = await this.#findExactSuccessor(previousTurnId, input);
+      if (recovered !== null) {
+        this.#options.missionStore.resolveSuccessorIntent(
+          intent.intentKey,
+          recovered.id,
+        );
+        return this.#consumePersistedTurn(recovered);
+      }
+      const stream = await this.#options.trueforgeClient.sessions.createTurnStream(
+        this.#options.trueforgeSessionId,
+        { previousTurnId, input },
+        { timeoutInSeconds: 120 },
+      );
+      const result = await this.#consumeStream(stream, null, 0);
+      this.#options.missionStore.resolveSuccessorIntent(
+        intent.intentKey,
+        result.turnId,
+      );
+      return result;
+    } catch (error: unknown) {
+      const cursor = this.#options.missionStore.getSnapshot(
+        this.#options.missionId,
+      ).mission.currentTurnId;
+      const expectedCursor = previousTurnId === "none" ? null : previousTurnId;
+      if (cursor !== expectedCursor) throw error;
+      const recovered = await this.#findExactSuccessor(previousTurnId, input);
+      if (recovered !== null) {
+        this.#options.missionStore.resolveSuccessorIntent(
+          intent.intentKey,
+          recovered.id,
+        );
+        return this.#consumePersistedTurn(recovered);
+      }
+      throw error;
+    } finally {
+      ACTIVE_SUCCESSOR_OWNERS.delete(ownerToken);
+    }
+  }
+
+  async #findExactSuccessor(
+    previousTurnId: TrueForgeApi.PreviousTurnIdInput,
+    input: TrueForgeApi.TurnInputItem[],
+  ): Promise<TrueForgeApi.Turn | null> {
+    const expectedPrevious =
+      previousTurnId === "none" ? null : previousTurnId;
+    if (expectedPrevious === "auto") {
+      throw new Error("M4 successor reconciliation forbids auto previousTurnId");
+    }
+    const page = await this.#options.trueforgeClient.sessions.listTurns(
       this.#options.trueforgeSessionId,
-      { previousTurnId, input },
-      { timeoutInSeconds: 120 },
+      { limit: 25 },
     );
-    return this.#consumeStream(stream, null, 0);
+    const siblings: TrueForgeApi.Turn[] = [];
+    for await (const candidate of page) {
+      if (candidate.previousTurnId === expectedPrevious) siblings.push(candidate);
+    }
+    const expectedInput = canonicalSerialize(input);
+    const exact = siblings.filter(
+      (candidate) => canonicalSerialize(candidate.input ?? []) === expectedInput,
+    );
+    if (exact.length > 1 || (exact.length === 1 && siblings.length > 1)) {
+      throw new Error(
+        `TrueForge predecessor ${previousTurnId} already has sibling successors`,
+      );
+    }
+    if (exact.length === 0 && siblings.length > 0) {
+      throw new Error(
+        `TrueForge predecessor ${previousTurnId} has a conflicting successor input`,
+      );
+    }
+    return exact[0] ?? null;
+  }
+
+  async #waitForExactSuccessor(
+    previousTurnId: TrueForgeApi.PreviousTurnIdInput,
+    input: TrueForgeApi.TurnInputItem[],
+  ): Promise<TrueForgeApi.Turn | null> {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const recovered = await this.#findExactSuccessor(previousTurnId, input);
+      if (recovered !== null) return recovered;
+      await delay(25);
+    }
+    return null;
+  }
+
+  async #consumePersistedTurn(turn: TrueForgeApi.Turn): Promise<TurnResult> {
+    if (turn.state.status === "running") {
+      const snapshot = this.#options.missionStore.getSnapshot(
+        this.#options.missionId,
+      );
+      const afterSequenceNumber =
+        snapshot.mission.currentTurnId === turn.id
+          ? snapshot.mission.lastEventSequence
+          : 0;
+      return this.#subscribeAndConsume(turn.id, afterSequenceNumber);
+    }
+    const events = await this.#listTurnEvents(turn.id);
+    const done = [...events]
+      .reverse()
+      .find(
+        (event): event is TrueForgeApi.TurnDoneEvent =>
+          event.type === "turn.done",
+      );
+    if (done === undefined) {
+      throw new Error(`Persisted successor ${turn.id} has no terminal event`);
+    }
+    this.#options.missionStore.advanceCursor(
+      this.#options.missionId,
+      turn.id,
+      events.length,
+    );
+    return {
+      turnId: turn.id,
+      events,
+      done,
+      disconnectedAndResumed: true,
+    };
+  }
+
+  async #resolvedSuccessor(previousTurnId: string): Promise<TrueForgeApi.Turn | null> {
+    const matching = this.#options.missionStore
+      .getSnapshot(this.#options.missionId)
+      .successorIntents.filter(
+        (intent) =>
+          intent.previousTurnId === previousTurnId &&
+          intent.successorTurnId !== null,
+      );
+    if (matching.length > 1) {
+      throw new Error(
+        `TrueForge predecessor ${previousTurnId} has multiple durable successors`,
+      );
+    }
+    const intent = matching[0];
+    if (intent?.successorTurnId === null || intent === undefined) return null;
+    const response = await this.#options.trueforgeClient.sessions.getTurn(
+      this.#options.trueforgeSessionId,
+      intent.successorTurnId,
+    );
+    const successor = response.data;
+    if (
+      successor.previousTurnId !== previousTurnId ||
+      canonicalSerialize(successor.input ?? []) !==
+        canonicalSerialize(intent.input)
+    ) {
+      throw new Error(
+        `Durable TrueForge successor ${successor.id} conflicts with its intent`,
+      );
+    }
+    return successor;
   }
 
   async #subscribeAndConsume(
@@ -405,10 +678,7 @@ export class M4MissionController {
     turnId: string,
     events: readonly TrueForgeApi.SessionEvent[],
     required: TrueForgeApi.ToolApprovalRequiredEvent,
-  ): Promise<{
-    readonly bridgeKey: string;
-    readonly input: TrueForgeApi.UserToolApprovalEvent;
-  }> {
+  ): Promise<PreparedApproval> {
     if (required.toolCalls.length !== 1) {
       throw new Error("M4 requires one approval-gated tool per pause");
     }
@@ -427,6 +697,17 @@ export class M4MissionController {
       );
     }
     const actionKind = actionKindFor(resolved.name);
+    if (
+      resolved.name === "create_schedule_reservation" ||
+      resolved.name === "submit_schedule_change"
+    ) {
+      try {
+        claimInputFromM4MutationArguments(resolved.arguments);
+        effectFromM4MutationArguments(resolved.arguments);
+      } catch (error: unknown) {
+        throw new InvalidM4ApprovalInputError(resolved, error);
+      }
+    }
     const action = this.#options.missionStore.recordBridgeAction({
       missionId: this.#options.missionId,
       trueforgeSessionId: this.#options.trueforgeSessionId,
@@ -725,6 +1006,117 @@ export class M4MissionController {
     return events.reverse();
   }
 
+  #durableMissionPhase(): DurableMissionPhase {
+    const store = this.#store();
+    try {
+      const history = store.getAdmissionHistory();
+      const initialReplan = history.find(
+        (candidate) => candidate.record.decision === "REPLAN",
+      );
+      if (initialReplan === undefined) {
+        return {
+          complete: false,
+          continuation:
+            "Continue the bounded FlakeBrake mission from durable state: obtain and record the authoritative current admission before requesting any owner choice or effect.",
+          executionAttemptId: null,
+          factoryReceiptId: null,
+        };
+      }
+      const fresh = history.find((candidate) =>
+        candidate.addenda.some(
+          (addendum) =>
+            addendum.kind === "readmission_link" &&
+            isM4PostModificationAdmission(addendum.body),
+        ),
+      );
+      if (fresh === undefined) {
+        return {
+          complete: false,
+          continuation:
+            "Continue the bounded mission from the durable REPLAN phase. Use the exact prepared owner-approved existing-order modification, durably create portfolio v2, and obtain its fresh authoritative ADMITTABLE readmission before exposing Promise acceptance.",
+          executionAttemptId: null,
+          factoryReceiptId: null,
+        };
+      }
+      if (fresh.record.decision !== "ADMITTABLE") {
+        throw new Error("M4 post-modification admission is not ADMITTABLE");
+      }
+      const accepted = fresh.addenda.some(
+        (addendum) => addendum.kind === "acceptance_commit",
+      );
+      if (!accepted) {
+        return {
+          complete: false,
+          continuation:
+            "Continue the bounded mission from the durable portfolio-v2 ADMITTABLE phase. Prepare and request ACCEPT PROMISE only for that fresh immutable admission basis.",
+          executionAttemptId: null,
+          factoryReceiptId: null,
+        };
+      }
+
+      const claimedApprovals = this.#approvals.filter(
+        (approval) =>
+          approval.decision === "allow" &&
+          approval.executionAttemptId !== null,
+      );
+      if (claimedApprovals.length > 1) {
+        throw new Error("M4 mission has multiple approved execution attempts");
+      }
+      const executionAttemptId = claimedApprovals[0]?.executionAttemptId ?? null;
+      if (executionAttemptId === null) {
+        return {
+          complete: false,
+          continuation:
+            "Continue the bounded mission from the durable accepted Promise Basis. Preserve prior denial facts, use only exact prepared schedule arguments, and advance the required denied-primary, equivalent-denial, then distinct-alternative phases without repeating completed work.",
+          executionAttemptId: null,
+          factoryReceiptId: null,
+        };
+      }
+      const attempt = store.getExecutionAttempt(executionAttemptId);
+      const reservation = store
+        .getReservations(true)
+        .find(
+          (candidate) =>
+            candidate.executionAttemptId === executionAttemptId,
+        );
+      if (reservation === undefined) {
+        throw new Error(
+          `Approved M4 attempt ${executionAttemptId} has no durable reservation`,
+        );
+      }
+      if (reservation.claimState === "terminal_verified") {
+        return { complete: true, attempt };
+      }
+      if (reservation.claimState !== "claimed_nonterminal") {
+        throw new Error(
+          `Approved M4 attempt ${executionAttemptId} ended ${reservation.claimState}`,
+        );
+      }
+      const factory = readAuthoritativeFactoryExecution(
+        this.#options.factoryDatabasePath,
+        executionAttemptId,
+      );
+      if (factory === null) {
+        return {
+          complete: false,
+          continuation:
+            `Continue the bounded mission for the already claimed exact attempt ${executionAttemptId}. Resume its existing provider-owned consequential tool call; do not invent another attempt, repeat the claim, or fall back to local execution.`,
+          executionAttemptId,
+          factoryReceiptId: null,
+        };
+      }
+      return {
+        complete: false,
+        continuation:
+          "Continue with independent authoritative read-back and verification of the already committed factory result. Do not repeat the write.",
+        executionAttemptId,
+        factoryReceiptId: factory.result.receipt.receiptId,
+      };
+    } finally {
+      store.close();
+    }
+  }
+
   #store(): FlakeBrakeStore {
     return createStore({
       path: this.#options.m2DatabasePath,
@@ -933,6 +1325,16 @@ function ownerDecision(value: JsonValue): M4OwnerApprovalDecision {
   throw new TypeError("Owner decision status is invalid");
 }
 
+function isM4PostModificationAdmission(value: JsonValue): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  return (
+    (value as Readonly<Record<string, JsonValue>>)["kind"] ===
+    "M4_POST_MODIFICATION_ADMISSION"
+  );
+}
+
 function jsonObject(
   value: JsonValue,
   field: string,
@@ -960,6 +1362,24 @@ function jsonNullableString(
 
 function asJson(value: unknown): JsonValue {
   return JSON.parse(canonicalSerialize(value)) as JsonValue;
+}
+
+function successorOwnerIsActive(ownerToken: string): boolean {
+  if (ACTIVE_SUCCESSOR_OWNERS.has(ownerToken)) return true;
+  const match = /^successor-owner\/([1-9][0-9]*)\//u.exec(ownerToken);
+  if (match === null) return false;
+  const ownerPid = Number(match[1]);
+  if (!Number.isSafeInteger(ownerPid) || ownerPid === process.pid) return false;
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function databaseIdentity(path: string): string {
