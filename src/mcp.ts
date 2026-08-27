@@ -16,12 +16,19 @@ import type {
   JsonValue,
   ProposedObligation,
 } from "./domain.js";
+import type { ApprovalScope } from "./stateful-domain.js";
 import {
   type AuthorizedScheduleMutation,
   type CanonicalScheduleCommand,
+  readAuthoritativeFactoryExecution,
   SyntheticFactoryEnvironment,
 } from "./factory-environment.js";
 import { HERO_HORIZON_END, createHeroProposal } from "./hero-fixture.js";
+import {
+  m4AcceptanceArguments,
+  m4MutationToolArguments,
+  m4PortfolioModificationArguments,
+} from "./m4-deterministic-model.js";
 import { stableTupleId } from "./identity.js";
 import { StrictJsonLineInput } from "./mcp-stdio-guard.js";
 import { createStore } from "./store.js";
@@ -41,6 +48,8 @@ export interface FactoryMcpServiceOptions {
   readonly factoryDatabasePath: string;
   readonly m2DatabasePath: string;
   readonly now?: () => string;
+  /** Additive M4 owner-decision and authoritative-verification tools. */
+  readonly enableM4Tools?: boolean;
 }
 
 export interface RunningFactoryMcpService {
@@ -74,6 +83,13 @@ const READ_ONLY_ANNOTATIONS = {
 const CONSEQUENTIAL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
+const LEDGER_WRITE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
   idempotentHint: true,
   openWorldHint: false,
 } as const;
@@ -204,6 +220,87 @@ const simulationInputSchema = z
   })
   .strict();
 
+const typedConstraintSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("equals"), value: z.union([z.string(), z.number(), z.boolean(), z.null()]) }).strict(),
+  z.object({ kind: z.literal("set"), values: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).min(1).max(64) }).strict(),
+  z.object({ kind: z.literal("range"), minimum: z.number().finite(), maximum: z.number().finite() }).strict(),
+]);
+
+const approvalScopeSchema = z
+  .object({
+    scopeSchemaVersion: z.literal("microfactory-approval-scope/v1"),
+    environmentId: z.string().min(1).max(128),
+    allowedEffectSchemaVersions: z
+      .array(z.enum(["microfactory-effect/v1", "microfactory-effect/v2"]))
+      .min(1)
+      .max(2),
+    allowedEffectTypes: z.array(z.literal("schedule_reservation")).min(1).max(1),
+    allowedTargetTypes: z.array(z.literal("production_cell")).min(1).max(1),
+    allowedTargetIds: z.array(z.string().min(1).max(128)).min(1).max(16),
+    allowedOperations: z.array(z.literal("reserve")).min(1).max(1),
+    materialParameterConstraints: z.record(z.string().min(1).max(128), typedConstraintSchema),
+    resourceConstraints: z.record(z.string().min(1).max(128), typedConstraintSchema),
+    objectiveId: z.string().min(1).max(512),
+    promiseBasisId: z.string().min(1).max(256),
+    approverId: z.string().min(1).max(256),
+    validFrom: z.string().datetime({ offset: true }),
+    validUntil: z.string().datetime({ offset: true }),
+    maxExecutions: z.number().int().positive().max(32),
+  })
+  .strict();
+
+const selectPortfolioModificationSchema = z
+  .object({
+    admission_record_id: z.string().min(1).max(256),
+    selected_plan_id: z.string().min(1).max(256),
+    owner_decision_id: z.string().min(1).max(256),
+    approver_id: z.string().min(1).max(256),
+  })
+  .strict();
+
+const acceptPromiseSchema = z
+  .object({
+    admission_record_id: z.string().min(1).max(256),
+    selected_plan_id: z.string().min(1).max(256),
+    owner_decision_id: z.string().min(1).max(256),
+    approver_id: z.string().min(1).max(256),
+    expected_portfolio_version: z.string().min(1).max(128),
+    expected_capacity_model_version: z.string().min(1).max(128),
+    expected_capacity_plan_version: z.string().min(1).max(128),
+    expected_authorization_state_version: z.string().min(1).max(128),
+    expected_calibration_frontier_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    grant: z
+      .object({
+        grant_id: z.string().min(1).max(256),
+        grant_version: z.string().min(1).max(128),
+        grant_owner_decision_id: z.string().min(1).max(256),
+        selected_bundle_id: z.string().min(1).max(256),
+        scope: approvalScopeSchema,
+      })
+      .strict(),
+  })
+  .strict();
+
+const executionStatusSchema = z
+  .object({ execution_attempt_id: z.string().min(1).max(256) })
+  .strict();
+
+const prepareScheduleEffectSchema = z
+  .object({
+    tool_name: z.enum([
+      "create_schedule_reservation",
+      "submit_schedule_change",
+    ]),
+    execution_attempt_id: z.string().min(1).max(256),
+    effect_schema_version: z.enum([
+      "microfactory-effect/v1",
+      "microfactory-effect/v2",
+    ]),
+    start: z.string().datetime({ offset: true }),
+    end: z.string().datetime({ offset: true }),
+  })
+  .strict();
+
 export function createFactoryMcpService(
   serviceName: FactoryMcpServiceName,
   options: FactoryMcpServiceOptions,
@@ -255,6 +352,14 @@ export function createFactoryMcpService(
           requireM2Store(m2Store),
           requireFactory(factory),
         );
+        if (options.enableM4Tools === true) {
+          registerM4ChangeControlTools(
+            server,
+            requireM2Store(m2Store),
+            options.m2DatabasePath,
+            options.factoryDatabasePath,
+          );
+        }
         break;
       default:
         assertNever(serviceName);
@@ -830,6 +935,287 @@ function registerChangeControlTools(
       );
     },
   );
+}
+
+function registerM4ChangeControlTools(
+  server: McpServer,
+  store: FlakeBrakeStore,
+  m2DatabasePath: string,
+  factoryDatabasePath: string,
+): void {
+  server.registerTool(
+    "record_current_admission",
+    {
+      title: "Record current rush admission",
+      description:
+        "Run the existing M1 kernel against the current authoritative M2 basis and durably record its immutable admission result.",
+      inputSchema: noArgumentsSchema,
+      annotations: LEDGER_WRITE_ANNOTATIONS,
+    },
+    () =>
+      toolResult(
+        recordCurrentM4AdmissionOrReplay(store),
+      ),
+  );
+
+  server.registerTool(
+    "select_portfolio_modification",
+    {
+      title: "Select approved portfolio modification",
+      description:
+        "Record the exact owner-approved M1 replan candidate and perform the authoritative fresh admission.",
+      inputSchema: selectPortfolioModificationSchema,
+      annotations: CONSEQUENTIAL_ANNOTATIONS,
+    },
+    (input) =>
+      toolResult(
+        store.recordOwnerDecision({
+          kind: "MODIFY",
+          admissionRecordId: input.admission_record_id,
+          selectedPlanId: input.selected_plan_id,
+          ownerDecisionId: input.owner_decision_id,
+          approverId: input.approver_id,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "accept_promise",
+    {
+      title: "Accept promise and bounded execution scope",
+      description:
+        "Commit the exact owner-accepted promise and issue its exact M2 bounded execution grant. Both identities are immutable and replay-safe.",
+      inputSchema: acceptPromiseSchema,
+      annotations: CONSEQUENTIAL_ANNOTATIONS,
+    },
+    (input) => {
+      const acceptance = acceptPromiseOrReplay(store, input);
+      if (acceptance.status !== "COMMITTED") return toolResult({ acceptance });
+      const current = store.getPortfolio().versions;
+      const grant = store.issueGrant({
+        grantId: input.grant.grant_id,
+        grantVersion: input.grant.grant_version,
+        admissionRecordId: input.admission_record_id,
+        promiseBasisId: input.grant.scope.promiseBasisId,
+        acceptedOwnerDecisionId: input.owner_decision_id,
+        ownerDecisionId: input.grant.grant_owner_decision_id,
+        selectedBundleId: input.grant.selected_bundle_id,
+        selectedPlanId: input.selected_plan_id,
+        scope: input.grant.scope as ApprovalScope,
+        postDenialAuthorization: null,
+        expectedPortfolioVersion: current.portfolioVersion,
+        expectedCapacityModelVersion: current.capacityModelVersion,
+        expectedCapacityPlanVersion: current.capacityPlanVersion,
+      });
+      return toolResult({ acceptance, grant });
+    },
+  );
+
+  server.registerTool(
+    "prepare_portfolio_modification",
+    {
+      title: "Prepare exact portfolio modification",
+      description:
+        "Read the latest recorded M1 REPLAN and return the exact selected lexicographic winner arguments without recording an owner decision.",
+      inputSchema: noArgumentsSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    () =>
+      toolResult({
+        toolName: "select_portfolio_modification",
+        arguments: m4PortfolioModificationArguments({
+          m2DatabasePath,
+          factoryDatabasePath,
+        }),
+      }),
+  );
+
+  server.registerTool(
+    "prepare_promise_acceptance",
+    {
+      title: "Prepare exact promise acceptance",
+      description:
+        "Read the current selected M2 replan and return the exact bounded accept_promise arguments without recording a decision.",
+      inputSchema: noArgumentsSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    () =>
+      toolResult({
+        toolName: "accept_promise",
+        arguments: m4AcceptanceArguments({
+          m2DatabasePath,
+          factoryDatabasePath,
+        }),
+      }),
+  );
+
+  server.registerTool(
+    "prepare_schedule_effect",
+    {
+      title: "Prepare exact bounded schedule effect",
+      description:
+        "Read the current M2 and factory basis and return strict arguments for one named consequential adapter without claiming or mutating.",
+      inputSchema: prepareScheduleEffectSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    (input) =>
+      toolResult({
+        toolName: input.tool_name,
+        arguments: m4MutationToolArguments(
+          input.tool_name,
+          { m2DatabasePath, factoryDatabasePath },
+          input.execution_attempt_id,
+          input.effect_schema_version,
+          input.start,
+          input.end,
+        ),
+      }),
+  );
+
+  server.registerTool(
+    "read_execution_status",
+    {
+      title: "Read authoritative execution status",
+      description:
+        "Read the immutable M2 execution attempt, execution fence, reservation, and authoritative factory result linkage.",
+      inputSchema: executionStatusSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    ({ execution_attempt_id }) => {
+      const attempt = store.getExecutionAttempt(execution_attempt_id);
+      const fence = store.getExecutionFence(execution_attempt_id);
+      const reservation =
+        store
+          .getReservations(true)
+          .find(
+            (candidate) =>
+              candidate.executionAttemptId === execution_attempt_id,
+          ) ?? null;
+      const factory = readAuthoritativeFactoryExecution(
+        factoryDatabasePath,
+        execution_attempt_id,
+      );
+      return toolResult({
+        executionAttemptId: attempt.executionAttemptId,
+        admissionRecordId: attempt.admissionRecordId,
+        claimState: reservation?.claimState ?? null,
+        terminalVerified: reservation?.claimState === "terminal_verified",
+        fence:
+          fence === null
+            ? null
+            : {
+                fenceId: fence.fenceId,
+                status: fence.status,
+                environmentId: fence.environmentId,
+                resultBinding: fence.resultBinding,
+              },
+        factory:
+          factory === null
+            ? null
+            : {
+                environmentId: factory.environmentId,
+                stateVersion: factory.currentState.stateVersion,
+                currentStateDigest: factory.currentStateDigest,
+                mutationStatus: factory.result.status,
+                receiptId: factory.result.receipt.receiptId,
+                receiptDigest: factory.resultDigest,
+              },
+      });
+    },
+  );
+
+  server.registerTool(
+    "verify_schedule_execution",
+    {
+      title: "Authoritatively verify schedule execution",
+      description:
+        "Independently acquire the durable factory result, receipt, event, and read-back, then record M2 verified completion and actuals exactly once.",
+      inputSchema: executionStatusSchema,
+      annotations: CONSEQUENTIAL_ANNOTATIONS,
+    },
+    ({ execution_attempt_id }) =>
+      toolResult(store.verifyExecutionAuthoritatively(execution_attempt_id)),
+  );
+}
+
+function recordCurrentM4AdmissionOrReplay(
+  store: FlakeBrakeStore,
+): ReturnType<FlakeBrakeStore["evaluateAndRecordAdmission"]> {
+  const proposal = createHeroProposal();
+  const recorded = store
+    .getAdmissionHistory()
+    .find(
+      (candidate) =>
+        candidate.record.proposalSnapshot.obligationId ===
+        proposal.obligationId,
+    );
+  return (
+    recorded?.record ?? store.evaluateAndRecordAdmission({ proposal })
+  );
+}
+
+function acceptPromiseOrReplay(
+  store: FlakeBrakeStore,
+  input: z.infer<typeof acceptPromiseSchema>,
+): ReturnType<FlakeBrakeStore["acceptPromise"]> {
+  const admission = store.getAdmissionRecord(input.admission_record_id);
+  const committed = admission.addenda.find((addendum) => {
+    if (addendum.kind !== "acceptance_commit") return false;
+    if (
+      addendum.body === null ||
+      typeof addendum.body !== "object" ||
+      Array.isArray(addendum.body)
+    ) {
+      return false;
+    }
+    const body = addendum.body as Readonly<Record<string, JsonValue>>;
+    return (
+      body["ownerDecisionId"] === input.owner_decision_id &&
+      body["selectedPlanId"] === input.selected_plan_id
+    );
+  });
+  if (committed !== undefined) {
+    if (
+      input.expected_portfolio_version !== admission.record.portfolioVersion ||
+      input.expected_capacity_model_version !==
+        admission.record.capacityModelVersion ||
+      input.expected_capacity_plan_version !== admission.record.capacityPlanVersion ||
+      input.expected_authorization_state_version !==
+        admission.record.authorizationStateVersion ||
+      input.expected_calibration_frontier_digest !==
+        admission.record.calibrationFrontierDigest
+    ) {
+      throw new TypeError("Replay acceptance basis differs from the immutable admission");
+    }
+    const body = committed.body as Record<string, JsonValue>;
+    const committedPortfolioVersion = body["committedPortfolioVersion"];
+    if (typeof committedPortfolioVersion !== "string") {
+      throw new TypeError("Acceptance commit is missing its portfolio version");
+    }
+    return {
+      status: "COMMITTED",
+      admissionRecordId: input.admission_record_id,
+      selectedPlanId: input.selected_plan_id,
+      versions: {
+        portfolioVersion: committedPortfolioVersion,
+        capacityModelVersion: admission.record.capacityModelVersion,
+        capacityPlanVersion: admission.record.capacityPlanVersion,
+        authorizationStateVersion: admission.record.authorizationStateVersion,
+      },
+    };
+  }
+  return store.acceptPromise({
+    admissionRecordId: input.admission_record_id,
+    selectedPlanId: input.selected_plan_id,
+    ownerDecisionId: input.owner_decision_id,
+    approverId: input.approver_id,
+    expectedPortfolioVersion: input.expected_portfolio_version,
+    expectedCapacityModelVersion: input.expected_capacity_model_version,
+    expectedCapacityPlanVersion: input.expected_capacity_plan_version,
+    expectedAuthorizationStateVersion: input.expected_authorization_state_version,
+    expectedCalibrationFrontierDigest:
+      input.expected_calibration_frontier_digest,
+  });
 }
 
 function normalizedMutation(
