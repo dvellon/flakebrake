@@ -442,15 +442,8 @@ export async function startFactoryMcpCluster(
         await client.connect(transport);
         return connection;
       } catch (error: unknown) {
-        try {
-          await client.close();
-        } catch {
-          try {
-            await transport.close();
-          } catch {
-            // The original connection failure remains authoritative.
-          }
-        }
+        const cleanupErrors = await closeClientWithTransportFallback(connection);
+        attachCleanupErrors(error, cleanupErrors);
         throw error;
       }
     }),
@@ -462,9 +455,14 @@ export async function startFactoryMcpCluster(
     (attempt): attempt is PromiseRejectedResult => attempt.status === "rejected",
   );
   if (failed !== undefined) {
-    await Promise.allSettled(
-      connections.map((connection) => connection.client.close()),
-    );
+    const cleanupErrors = (
+      await Promise.all(
+        connections.map((connection) =>
+          closeClientWithTransportFallback(connection),
+        ),
+      )
+    ).flat();
+    attachCleanupErrors(failed.reason, cleanupErrors);
     throw failed.reason;
   }
   {
@@ -915,6 +913,57 @@ function throwCleanupFailures(failures: readonly unknown[], message: string): vo
   if (failures.length === 0) return;
   if (failures.length === 1) throw failures[0];
   throw new AggregateError(failures, message);
+}
+
+async function closeClientWithTransportFallback(
+  connection: FactoryMcpClientConnection,
+): Promise<unknown[]> {
+  let clientCloseError: unknown;
+  try {
+    await connection.client.close();
+    if (connection.transport.pid === null) return [];
+    clientCloseError = new Error(
+      `Client close did not release ${connection.serviceName} transport`,
+    );
+  } catch (error: unknown) {
+    clientCloseError = error;
+  }
+  const cleanupErrors = [clientCloseError];
+  try {
+    await connection.transport.close();
+  } catch (transportCloseError: unknown) {
+    cleanupErrors.push(transportCloseError);
+  }
+  return cleanupErrors;
+}
+
+function attachCleanupErrors(
+  primaryError: unknown,
+  cleanupErrors: readonly unknown[],
+): void {
+  if (
+    cleanupErrors.length === 0 ||
+    !(primaryError instanceof Error) ||
+    !Object.isExtensible(primaryError)
+  ) {
+    return;
+  }
+  const existing = (primaryError as Error & { cleanupErrors?: unknown })
+    .cleanupErrors;
+  const combined = [
+    ...(Array.isArray(existing) ? existing : []),
+    ...cleanupErrors,
+  ];
+  try {
+    Object.defineProperty(primaryError, "cleanupErrors", {
+      configurable: true,
+      enumerable: false,
+      value: Object.freeze(combined),
+      writable: false,
+    });
+  } catch {
+    // A non-configurable application error remains the authoritative failure.
+  }
 }
 
 function asJsonValue(value: unknown): JsonValue {

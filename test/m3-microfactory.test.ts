@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
@@ -2551,5 +2553,211 @@ describe("M3 Qodo PR #4 regressions", () => {
     assert.equal(unterminated.rejections.length, 1);
     assert.match(String(unterminated.rejections[0]), /exceeds 10 MiB/u);
     assert.equal(unterminated.output.length, 0);
+  });
+
+  test("41. partial cluster startup falls back to every owned transport", async () => {
+    const exerciseRollback = async (
+      clientCloseMode: "reject" | "leave_transport_open",
+      fallbackRejects: boolean,
+    ): Promise<{
+      readonly rejection: unknown;
+      readonly startupFailure: Error;
+      readonly clientCloseFailure: Error;
+      readonly transportCloseFailure: Error;
+      readonly firstPidBeforeRollback: number | null;
+      readonly firstPidAfterRollback: number | null;
+      readonly firstClientCloseAttempts: number;
+      readonly firstTransportCloseAttempts: number;
+      readonly otherClientCloseAttempts: readonly number[];
+      readonly otherTransportCloseAttempts: readonly number[];
+      readonly cleanupErrors: readonly unknown[];
+    }> => {
+      const fixture = initializeReadFixture();
+      const clientPrototype = Client.prototype as unknown as {
+        connect: (transport: StdioClientTransport) => Promise<void>;
+        close: () => Promise<void>;
+      };
+      const transportPrototype = StdioClientTransport.prototype as unknown as {
+        close: () => Promise<void>;
+      };
+      const originalConnect = clientPrototype.connect;
+      const originalClientClose = clientPrototype.close;
+      const originalTransportClose = transportPrototype.close;
+      const startupFailure = new Error("injected later cluster startup failure");
+      const clientCloseFailure = new Error(
+        "injected connected-client close failure",
+      );
+      const transportCloseFailure = new Error(
+        "injected transport fallback failure",
+      );
+      let resolveFirstConnection: (() => void) | undefined;
+      const firstConnection = new Promise<void>((resolve) => {
+        resolveFirstConnection = resolve;
+      });
+      let connectOrdinal = 0;
+      let firstClient: object | undefined;
+      let firstTransport: StdioClientTransport | undefined;
+      let firstPidBeforeRollback: number | null = null;
+      const successfulClients: object[] = [];
+      const transports = new Map<object, StdioClientTransport>();
+      const clientCloseAttempts = new Map<object, number>();
+      const transportCloseAttempts = new Map<StdioClientTransport, number>();
+      let rejection: unknown;
+      let firstPidAfterRollback: number | null = null;
+      let cleanupErrors: readonly unknown[] = [];
+
+      clientPrototype.connect = async function connect(
+        transport: StdioClientTransport,
+      ): Promise<void> {
+        const ordinal = connectOrdinal;
+        connectOrdinal += 1;
+        transports.set(this, transport);
+        if (ordinal === 1) {
+          await firstConnection;
+          throw startupFailure;
+        }
+        if (ordinal > 1) await firstConnection;
+        await Reflect.apply(originalConnect, this, [transport]);
+        successfulClients.push(this);
+        if (ordinal === 0) {
+          firstClient = this;
+          firstTransport = transport;
+          firstPidBeforeRollback = transport.pid;
+          resolveFirstConnection?.();
+        }
+      };
+      clientPrototype.close = async function closeClient(): Promise<void> {
+        clientCloseAttempts.set(
+          this,
+          (clientCloseAttempts.get(this) ?? 0) + 1,
+        );
+        if (this === firstClient) {
+          if (clientCloseMode === "reject") throw clientCloseFailure;
+          return;
+        }
+        await Reflect.apply(originalClientClose, this, []);
+      };
+      transportPrototype.close = async function closeTransport(): Promise<void> {
+        const transport = this as unknown as StdioClientTransport;
+        transportCloseAttempts.set(
+          transport,
+          (transportCloseAttempts.get(transport) ?? 0) + 1,
+        );
+        if (transport === firstTransport && fallbackRejects) {
+          throw transportCloseFailure;
+        }
+        await Reflect.apply(originalTransportClose, this, []);
+      };
+
+      try {
+        try {
+          await startFactoryMcpCluster({
+            factoryDatabasePath: fixture.factoryPath,
+            m2DatabasePath: fixture.m2Path,
+            stderr: "pipe",
+          });
+        } catch (error: unknown) {
+          rejection = error;
+        }
+        firstPidAfterRollback = firstTransport?.pid ?? null;
+        cleanupErrors =
+          rejection instanceof Error &&
+          Array.isArray(
+            (rejection as Error & { cleanupErrors?: unknown }).cleanupErrors,
+          )
+            ? (rejection as Error & { cleanupErrors: readonly unknown[] })
+                .cleanupErrors
+            : [];
+      } finally {
+        clientPrototype.connect = originalConnect;
+        clientPrototype.close = originalClientClose;
+        transportPrototype.close = originalTransportClose;
+        await Promise.allSettled(
+          [...transports.values()].map((transport) =>
+            Reflect.apply(originalTransportClose, transport, []),
+          ),
+        );
+        const cleanCluster = await startFactoryMcpCluster({
+          factoryDatabasePath: fixture.factoryPath,
+          m2DatabasePath: fixture.m2Path,
+          stderr: "pipe",
+        });
+        await cleanCluster.close();
+        removeFixture(fixture);
+      }
+
+      const otherClients = successfulClients.filter(
+        (client) => client !== firstClient,
+      );
+      return {
+        rejection,
+        startupFailure,
+        clientCloseFailure,
+        transportCloseFailure,
+        firstPidBeforeRollback,
+        firstPidAfterRollback,
+        firstClientCloseAttempts:
+          firstClient === undefined ? 0 : (clientCloseAttempts.get(firstClient) ?? 0),
+        firstTransportCloseAttempts:
+          firstTransport === undefined
+            ? 0
+            : (transportCloseAttempts.get(firstTransport) ?? 0),
+        otherClientCloseAttempts: otherClients.map(
+          (client) => clientCloseAttempts.get(client) ?? 0,
+        ),
+        otherTransportCloseAttempts: otherClients.map((client) =>
+          transportCloseAttempts.get(transports.get(client)!) ?? 0,
+        ),
+        cleanupErrors,
+      };
+    };
+
+    const fallbackSucceeds = await exerciseRollback("reject", false);
+    const fallbackRejects = await exerciseRollback("reject", true);
+    const closeLeavesTransportOpen = await exerciseRollback(
+      "leave_transport_open",
+      false,
+    );
+
+    for (const observation of [
+      fallbackSucceeds,
+      fallbackRejects,
+      closeLeavesTransportOpen,
+    ]) {
+      assert.equal(observation.rejection, observation.startupFailure);
+      assert.notEqual(observation.firstPidBeforeRollback, null);
+      assert.equal(observation.firstClientCloseAttempts, 1);
+      assert.equal(observation.firstTransportCloseAttempts, 1);
+      assert.ok(observation.otherClientCloseAttempts.length >= 1);
+      assert.ok(observation.otherClientCloseAttempts.every((count) => count === 1));
+      assert.ok(
+        observation.otherTransportCloseAttempts.every((count) => count === 1),
+      );
+    }
+    assert.ok(
+      fallbackSucceeds.cleanupErrors.includes(
+        fallbackSucceeds.clientCloseFailure,
+      ),
+    );
+    assert.equal(fallbackSucceeds.firstPidAfterRollback, null);
+    assert.equal(fallbackSucceeds.cleanupErrors.length, 1);
+    assert.ok(
+      fallbackRejects.cleanupErrors.includes(
+        fallbackRejects.clientCloseFailure,
+      ),
+    );
+    assert.notEqual(fallbackRejects.firstPidAfterRollback, null);
+    assert.ok(
+      fallbackRejects.cleanupErrors.includes(
+        fallbackRejects.transportCloseFailure,
+      ),
+    );
+    assert.equal(fallbackRejects.cleanupErrors.length, 2);
+    assert.equal(closeLeavesTransportOpen.firstPidAfterRollback, null);
+    assert.equal(closeLeavesTransportOpen.cleanupErrors.length, 1);
+    assert.match(
+      String(closeLeavesTransportOpen.cleanupErrors[0]),
+      /did not release factory-orders transport/u,
+    );
   });
 });
