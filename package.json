@@ -10,11 +10,17 @@
   "types": "dist/src/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "mcp:all": "npm run build --silent && node dist/src/mcp-cli.js --all",
+    "mcp:serve": "npm run build --silent && node dist/src/mcp-cli.js",
     "test": "npm run build --silent && node --test --experimental-test-isolation=none dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
   }
 }
