@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -25,6 +31,31 @@ interface TableSignature {
 
 const SQLITE_MEMORY_PATH = ":memory:";
 const SQLITE_MEMORY_IDENTITY_PATH = "sqlite-memory/current-connection";
+const DATABASE_INCARNATION_OBJECTS = new Set([
+  "database_incarnation",
+  "database_incarnation_immutable_update",
+  "database_incarnation_immutable_delete",
+]);
+
+/**
+ * Versioned fingerprints for the only pre-incarnation and current schemas
+ * supported by this release. They cover normalized sqlite_schema SQL plus
+ * stable table, column, index, foreign-key, STRICT, and WITHOUT ROWID metadata.
+ */
+const SUPPORTED_SCHEMA_FINGERPRINTS = {
+  factory: {
+    current:
+      "sha256:b221fb4683f52d06afaf0cd3598f5e432558fd1c1a12caac001cb79ad2883f61",
+    legacy:
+      "sha256:5a415a8585c2123f8b505191de53e621c85f1d0d1d6f7212451252f6877a1052",
+  },
+  m2: {
+    current:
+      "sha256:073643b3e726b82774613fa39e2eaa8dbe5198c4d597da8b992dd7eacdb4dea9",
+    legacy:
+      "sha256:98b14c1aa3ca2ff98d493f1bc9123e38813bfd43debea051b6741e46485feb97",
+  },
+} as const;
 
 /** Exact pre-incarnation M2 table/column signature supplied by reviewed M2. */
 const M2_LEGACY_SIGNATURE: readonly TableSignature[] = [
@@ -263,12 +294,39 @@ const IMMUTABLE_TABLES = [
 ] as const;
 
 export function openSqlite(path: string): SqliteDatabase {
+  return openInitializedSqlite(path, "m2", initializeSchema);
+}
+
+/** Open, initialize, and retain one SQLite handle with failure-atomic ownership. */
+export function openInitializedSqlite(
+  path: string,
+  kind: DatabaseInstanceKind,
+  initializeApplicationSchema: (database: SqliteDatabase) => void,
+): SqliteDatabase {
+  const artifactSnapshot = isSqliteMemoryPath(path)
+    ? null
+    : captureSqliteArtifactSnapshot(path);
   const database = new DatabaseSync(path);
+  let persistentInitializationStarted = false;
   try {
-    initializeSqliteStore(database, path, "m2", initializeSchema);
+    initializeSqliteStore(database, path, kind, initializeApplicationSchema, {
+      beforePersistentInitialization: () => {
+        persistentInitializationStarted = true;
+      },
+    });
     return database;
   } catch (error: unknown) {
     closeSqliteAfterInitializationFailure(database, error);
+    if (
+      artifactSnapshot !== null &&
+      (persistentInitializationStarted || !artifactSnapshot.mainExisted)
+    ) {
+      try {
+        restoreSqliteArtifactSnapshot(artifactSnapshot);
+      } catch (cleanupError: unknown) {
+        attachInitializationCleanupDiagnostic(error, cleanupError);
+      }
+    }
     throw error;
   }
 }
@@ -283,6 +341,9 @@ export function initializeSqliteStore(
   path: string,
   kind: DatabaseInstanceKind,
   initializeApplicationSchema: (database: SqliteDatabase) => void,
+  hooks: {
+    readonly beforePersistentInitialization?: () => void;
+  } = {},
 ): string {
   const classification = classifySqliteDatabase(database);
   assertCompatibleDatabaseClassification(classification, kind);
@@ -291,15 +352,22 @@ export function initializeSqliteStore(
   database.exec("PRAGMA busy_timeout = 5000");
   database.exec("PRAGMA synchronous = FULL");
 
+  hooks.beforePersistentInitialization?.();
+  if (!isSqliteMemoryPath(path)) {
+    const currentJournalMode = readJournalMode(database);
+    if (currentJournalMode !== "wal") {
+      database.exec("PRAGMA journal_mode = WAL");
+      if (readJournalMode(database) !== "wal") {
+        throw new Error("SQLite WAL journal mode could not be established");
+      }
+    }
+  }
+
   let incarnationId = "";
   inImmediateTransaction(database, () => {
     initializeApplicationSchema(database);
     incarnationId = ensureDatabaseIncarnation(database, kind);
   });
-
-  // journal_mode is persistent, so it is deliberately deferred until the
-  // requested kind and the entire atomic schema transaction have succeeded.
-  if (!isSqliteMemoryPath(path)) database.exec("PRAGMA journal_mode = WAL");
   return incarnationId;
 }
 
@@ -328,6 +396,52 @@ export function closeSqliteAfterInitializationFailure(
   } catch (cleanupError: unknown) {
     attachInitializationCleanupDiagnostic(primaryError, cleanupError);
   }
+}
+
+interface SqliteArtifactSnapshot {
+  readonly artifacts: readonly {
+    readonly bytes: Uint8Array | null;
+    readonly path: string;
+  }[];
+  readonly mainExisted: boolean;
+}
+
+function captureSqliteArtifactSnapshot(path: string): SqliteArtifactSnapshot {
+  const canonicalPath = canonicalDatabasePath(path);
+  const artifactPaths = [
+    canonicalPath,
+    `${canonicalPath}-wal`,
+    `${canonicalPath}-shm`,
+    `${canonicalPath}-journal`,
+  ];
+  return {
+    artifacts: artifactPaths.map((artifactPath) => ({
+      bytes: existsSync(artifactPath) ? readFileSync(artifactPath) : null,
+      path: artifactPath,
+    })),
+    mainExisted: existsSync(canonicalPath),
+  };
+}
+
+function restoreSqliteArtifactSnapshot(snapshot: SqliteArtifactSnapshot): void {
+  for (const artifact of snapshot.artifacts) {
+    if (artifact.bytes === null) {
+      rmSync(artifact.path, { force: true });
+    } else {
+      writeFileSync(artifact.path, artifact.bytes);
+    }
+  }
+}
+
+function readJournalMode(database: SqliteDatabase): string {
+  const row = database.prepare("PRAGMA journal_mode").get() as
+    | Record<string, unknown>
+    | undefined;
+  const mode = row?.["journal_mode"];
+  if (typeof mode !== "string" || mode.length === 0) {
+    throw new Error("SQLite journal mode is unreadable");
+  }
+  return mode.toLowerCase();
 }
 
 export function ensureDatabaseIncarnation(
@@ -402,13 +516,12 @@ function classifySqliteDatabase(
       tableNames,
       FACTORY_LEGACY_SIGNATURE,
     );
-    const matchesM2 = signatureMatches(database, tableNames, M2_LEGACY_SIGNATURE);
-    const matchesFactory = signatureMatches(
-      database,
-      tableNames,
-      FACTORY_LEGACY_SIGNATURE,
-    );
     const hasIncarnationTable = tableNames.has("database_incarnation");
+    const applicationFingerprint = readSchemaFingerprint(database, false);
+    const matchesM2 =
+      applicationFingerprint === SUPPORTED_SCHEMA_FINGERPRINTS.m2.legacy;
+    const matchesFactory =
+      applicationFingerprint === SUPPORTED_SCHEMA_FINGERPRINTS.factory.legacy;
 
     if (hasIncarnationTable) {
       const markerKind = readValidatedIncarnationKind(database, schemaObjects);
@@ -419,10 +532,10 @@ function classifySqliteDatabase(
       ) {
         return "ambiguous/cross-contaminated";
       }
-      if (markerKind === "m2") {
-        return matchesM2 ? "current m2" : "corrupt/partial";
-      }
-      return matchesFactory ? "current factory" : "corrupt/partial";
+      const expected = SUPPORTED_SCHEMA_FINGERPRINTS[markerKind].current;
+      return readSchemaFingerprint(database, true) === expected
+        ? `current ${markerKind}`
+        : "corrupt/partial";
     }
 
     if (
@@ -467,16 +580,122 @@ function signatureHasAnyTable(
   return signature.some(({ name }) => tableNames.has(name));
 }
 
-function signatureMatches(
+function readSchemaFingerprint(
   database: SqliteDatabase,
-  tableNames: ReadonlySet<string>,
-  signature: readonly TableSignature[],
-): boolean {
-  return signature.every(
-    ({ name, columns }) =>
-      tableNames.has(name) &&
-      stringArraysEqual(readTableColumns(database, name), columns),
-  );
+  includeIncarnation: boolean,
+): string {
+  const schemaObjects = (
+    database
+      .prepare(
+        `SELECT type, name, tbl_name, sql
+           FROM sqlite_schema
+          WHERE name NOT LIKE 'sqlite_%'
+          ORDER BY type, name`,
+      )
+      .all() as Record<string, unknown>[]
+  )
+    .filter(
+      (row) =>
+        includeIncarnation ||
+        !DATABASE_INCARNATION_OBJECTS.has(String(row["name"])),
+    )
+    .map((row) => ({
+      name: String(row["name"]),
+      sql:
+        typeof row["sql"] === "string"
+          ? normalizeSchemaSql(row["sql"])
+          : null,
+      tableName: String(row["tbl_name"]),
+      type: String(row["type"]),
+    }));
+  const tableNames = schemaObjects
+    .filter((row) => row.type === "table")
+    .map((row) => row.name);
+  const tableList = database.prepare("PRAGMA table_list").all() as Record<
+    string,
+    unknown
+  >[];
+  const tables = tableNames.map((tableName) => {
+    const table = tableList.find(
+      (row) => row["schema"] === "main" && row["name"] === tableName,
+    );
+    if (table === undefined) {
+      throw new Error(`SQLite table metadata is missing for ${tableName}`);
+    }
+    const indexList = readPragmaRows(database, "index_list", tableName);
+    return {
+      columns: readPragmaRows(database, "table_xinfo", tableName).map(
+        (row) => ({
+          cid: row["cid"],
+          defaultValue: row["dflt_value"],
+          hidden: row["hidden"],
+          name: row["name"],
+          notNull: row["notnull"],
+          primaryKeyOrdinal: row["pk"],
+          type: row["type"],
+        }),
+      ),
+      foreignKeys: readPragmaRows(database, "foreign_key_list", tableName).map(
+        (row) => ({
+          from: row["from"],
+          id: row["id"],
+          match: row["match"],
+          onDelete: row["on_delete"],
+          onUpdate: row["on_update"],
+          sequence: row["seq"],
+          table: row["table"],
+          to: row["to"],
+        }),
+      ),
+      indexes: indexList
+        .map((row) => ({
+          columns: readPragmaRows(
+            database,
+            "index_xinfo",
+            String(row["name"]),
+          ).map((column) => ({
+            cid: column["cid"],
+            collation: column["coll"],
+            descending: column["desc"],
+            key: column["key"],
+            name: column["name"],
+            sequence: column["seqno"],
+          })),
+          name: row["name"],
+          origin: row["origin"],
+          partial: row["partial"],
+          unique: row["unique"],
+        }))
+        .sort((left, right) =>
+          String(left.name).localeCompare(String(right.name)),
+        ),
+      name: tableName,
+      options: {
+        columns: table["ncol"],
+        strict: table["strict"],
+        withoutRowid: table["wr"],
+      },
+    };
+  });
+  return `sha256:${createHash("sha256")
+    .update(canonicalSerialize({ objects: schemaObjects, tables }))
+    .digest("hex")}`;
+}
+
+function readPragmaRows(
+  database: SqliteDatabase,
+  pragma: "foreign_key_list" | "index_list" | "index_xinfo" | "table_xinfo",
+  objectName: string,
+): Record<string, unknown>[] {
+  const escaped = objectName.replaceAll('"', '""');
+  return database.prepare(`PRAGMA ${pragma}("${escaped}")`).all() as Record<
+    string,
+    unknown
+  >[];
+}
+
+function normalizeSchemaSql(sql: string): string {
+  return sql.replaceAll(/\s+/gu, " ").trim();
 }
 
 function readTableColumns(

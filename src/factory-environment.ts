@@ -20,8 +20,8 @@ import {
   closeSqliteAfterInitializationFailure,
   databaseIdentityPath,
   databaseInstanceIdentityFromHandle,
-  initializeSqliteStore,
   inImmediateTransaction,
+  openInitializedSqlite,
 } from "./sqlite.js";
 import type { SqliteDatabase } from "./sqlite.js";
 import type {
@@ -165,14 +165,12 @@ export class SyntheticFactoryEnvironment {
     );
     this.#now = options.now ?? (() => HERO_HORIZON_END);
     this.#databasePath = databaseIdentityPath(options.path);
-    this.#database = new DatabaseSync(options.path);
+    this.#database = openInitializedSqlite(
+      options.path,
+      "factory",
+      initializeFactorySchema,
+    );
     try {
-      initializeSqliteStore(
-        this.#database,
-        options.path,
-        "factory",
-        initializeFactorySchema,
-      );
       inImmediateTransaction(this.#database, () => this.#seedIfEmpty());
     } catch (error: unknown) {
       closeSqliteAfterInitializationFailure(this.#database, error);
