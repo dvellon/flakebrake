@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
@@ -6,6 +7,7 @@ import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
 import { canonicalSerialize } from "./canonical.js";
 import {
   M4MissionController,
+  type M4ApprovalRecord,
   type M4MissionRunResult,
   type M4OwnerDecisionProvider,
 } from "./m4-mission-controller.js";
@@ -44,6 +46,10 @@ export type LiveM4AcquisitionStage =
   | "agent_ready"
   | "session_ready";
 
+export type LiveM4ValidationProfile =
+  | "full_hero_evidence"
+  | "operational_convergence";
+
 export interface LiveM4MissionOptions {
   readonly m2DatabasePath: string;
   readonly factoryDatabasePath: string;
@@ -52,6 +58,7 @@ export interface LiveM4MissionOptions {
   readonly localSandboxRootParent: string;
   readonly m0TrueForgeDatabasePath: string;
   readonly model?: string;
+  readonly validationProfile?: LiveM4ValidationProfile;
   readonly ownerDecisionProvider: M4OwnerDecisionProvider;
   readonly lifecycleObserver?: (
     stage: LiveM4AcquisitionStage,
@@ -107,6 +114,9 @@ export async function runLiveM4Mission(
   ) {
     throw new TypeError("An explicit M0 TrueForge database path is required");
   }
+  const validationProfile = requireLiveValidationProfile(
+    options.validationProfile ?? "full_hero_evidence",
+  );
   const m0 = readM0Configuration(options.m0TrueForgeDatabasePath);
   const modelName = options.model ?? "openai/gpt-5-4-mini";
   if (!m0.modelNames.includes(modelName)) {
@@ -248,7 +258,7 @@ export async function runLiveM4Mission(
             .filter((addendum) => addendum.kind === "actual_consumption")
             .length,
         };
-        assertLiveAcceptance(result, store, factory);
+        assertLiveMissionEvidence(result, store, factory, validationProfile);
       } finally {
         factory.close();
         store.close();
@@ -417,11 +427,14 @@ function attachCleanupDiagnostics(
   });
 }
 
-function assertLiveAcceptance(
+export function assertLiveMissionEvidence(
   result: LiveM4MissionResult,
   store: FlakeBrakeStore,
   factory: SyntheticFactoryEnvironment,
+  profile: LiveM4ValidationProfile = "full_hero_evidence",
 ): void {
+  requireLiveValidationProfile(profile);
+  assertGenuineExternalModelExecution(result);
   if (
     result.subagentThreads.length !== 3 ||
     new Set(result.subagentThreads.map((thread) => thread.threadId)).size !== 3
@@ -436,9 +449,51 @@ function assertLiveAcceptance(
   if (assurance === undefined) {
     throw new Error("Live M4 acceptance is missing the assurance subagent");
   }
+  if (profile === "full_hero_evidence") {
+    assertFullHeroAssuranceEvidence(result, assurance.threadId);
+  }
+  const route = validateLiveApprovalInvariants(result, store, factory);
+  assertDurableHeroAcceptance(result, store, factory, route);
+}
+
+export function assertOperationalLiveConvergence(
+  first: LiveM4MissionResult,
+  second: LiveM4MissionResult,
+): void {
+  if (
+    first.mission.missionId !== second.mission.missionId ||
+    first.mission.trueforgeSessionId !== second.mission.trueforgeSessionId ||
+    first.mission.finalTurnId !== second.mission.finalTurnId ||
+    first.mission.projectionDigest !== second.mission.projectionDigest ||
+    first.mission.status !== "VERIFIED_COMPLETE" ||
+    second.mission.status !== "VERIFIED_COMPLETE"
+  ) {
+    throw new Error(
+      "Operational live aliases did not converge on one terminal mission projection",
+    );
+  }
+}
+
+function assertGenuineExternalModelExecution(result: LiveM4MissionResult): void {
+  if (
+    !result.model.startsWith("openai/") ||
+    !result.mission.trueforgeEvents.some(
+      (item) => item.event.type === "model.message",
+    )
+  ) {
+    throw new Error(
+      "Live M4 validation requires genuine external-model execution",
+    );
+  }
+}
+
+function assertFullHeroAssuranceEvidence(
+  result: LiveM4MissionResult,
+  assuranceThreadId: string,
+): void {
   const assuranceEvents = result.mission.trueforgeEvents
     .map((item) => item.event)
-    .filter((event) => event.threadId === assurance.threadId);
+    .filter((event) => event.threadId === assuranceThreadId);
   const usedSandbox = assuranceEvents.some(
     (event) =>
       event.type === "model.message" &&
@@ -462,34 +517,374 @@ function assertLiveAcceptance(
   ) {
     throw new Error("Live M4 acceptance did not use the Daytona sandbox");
   }
-  const approvals = result.mission.approvals.map((approval) => [
-    approval.toolName,
-    approval.decision,
-    approval.source,
-  ]);
-  const expected = [
-    ["select_portfolio_modification", "allow", "owner"],
-    ["accept_promise", "allow", "owner"],
-    ["create_schedule_reservation", "deny", "owner"],
-    ["submit_schedule_change", "deny", "active_m2_denial"],
-    ["create_schedule_reservation", "allow", "owner"],
-  ];
-  if (JSON.stringify(approvals) !== JSON.stringify(expected)) {
-    throw new Error("Live M4 acceptance approval sequence was not exact");
+}
+
+function requireLiveValidationProfile(
+  profile: LiveM4ValidationProfile,
+): LiveM4ValidationProfile {
+  if (
+    profile !== "full_hero_evidence" &&
+    profile !== "operational_convergence"
+  ) {
+    throw new TypeError(`Unsupported live validation profile ${String(profile)}`);
+  }
+  return profile;
+}
+
+interface LiveApprovalRoute {
+  readonly denied: M4ApprovalRecord;
+  readonly approved: M4ApprovalRecord;
+}
+
+/**
+ * Validate safety properties that are independent of an external planner's
+ * optional choice to demonstrate the active denial through a second adapter.
+ */
+export function assertLiveApprovalInvariants(
+  result: LiveM4MissionResult,
+  store: FlakeBrakeStore,
+  factory: SyntheticFactoryEnvironment,
+): void {
+  validateLiveApprovalInvariants(result, store, factory);
+}
+
+function validateLiveApprovalInvariants(
+  result: LiveM4MissionResult,
+  store: FlakeBrakeStore,
+  factory: SyntheticFactoryEnvironment,
+): LiveApprovalRoute {
+  const { missionSnapshot } = result.mission;
+  const binding = missionSnapshot.mission;
+  const approvals = [...result.mission.approvals];
+  if (
+    result.mission.status !== "VERIFIED_COMPLETE" ||
+    binding.missionId !== result.mission.missionId ||
+    binding.trueforgeSessionId !== result.mission.trueforgeSessionId ||
+    binding.currentTurnId !== result.mission.finalTurnId ||
+    result.mission.projectionDigest.length === 0
+  ) {
+    throw new Error(
+      "Live M4 acceptance did not retain one bound terminal mission projection",
+    );
+  }
+  const finalTurnDone = result.mission.trueforgeEvents.filter(
+    (item) =>
+      item.turnId === result.mission.finalTurnId &&
+      item.event.type === "turn.done" &&
+      item.event.state.status === "done",
+  );
+  if (finalTurnDone.length !== 1) {
+    throw new Error("Live M4 acceptance did not retain exactly one completed final turn");
+  }
+
+  const approvalKeys = approvals.map((approval) => approval.bridgeKey);
+  const approvalToolCalls = approvals.map((approval) => approval.toolCallId);
+  if (
+    new Set(approvalKeys).size !== approvals.length ||
+    new Set(approvalToolCalls).size !== approvals.length
+  ) {
+    throw new Error("Live M4 acceptance contains duplicate approval identities");
+  }
+  const actions = missionSnapshot.bridgeActions;
+  const actionByKey = new Map(actions.map((action) => [action.bridgeKey, action]));
+  if (
+    actions.length !== approvals.length ||
+    new Set(actions.map((action) => action.bridgeKey)).size !== actions.length
+  ) {
+    throw new Error("Live M4 acceptance contains duplicate or unbound actions");
+  }
+  const outcomeKeys = missionSnapshot.bridgeOutcomes.map(
+    (outcome) => `${outcome.bridgeKey}:${outcome.status}`,
+  );
+  if (new Set(outcomeKeys).size !== outcomeKeys.length) {
+    throw new Error("Live M4 acceptance contains duplicate durable outcomes");
+  }
+  for (const approval of approvals) {
+    const action = actionByKey.get(approval.bridgeKey);
+    if (
+      action === undefined ||
+      action.missionId !== result.mission.missionId ||
+      action.trueforgeSessionId !== result.mission.trueforgeSessionId ||
+      action.trueforgeTurnId !== approval.turnId ||
+      action.trueforgeThreadId !== approval.threadId ||
+      action.trueforgeToolCallId !== approval.toolCallId ||
+      action.toolName !== approval.toolName ||
+      action.argumentsDigest !== digestCanonical(action.arguments)
+    ) {
+      throw new Error("Live M4 approval is not bound to its exact durable action");
+    }
+    const bound = missionSnapshot.bridgeOutcomes.filter(
+      (outcome) =>
+        outcome.bridgeKey === approval.bridgeKey &&
+        outcome.status === "approval_bound",
+    );
+    if (
+      bound.length !== 1 ||
+      canonicalSerialize(bound[0]?.result) !== canonicalSerialize(approval)
+    ) {
+      throw new Error("Live M4 approval binding does not match its decision record");
+    }
+  }
+
+  const selection = approvals.filter(
+    (approval) => approval.toolName === "select_portfolio_modification",
+  );
+  if (
+    selection.length !== 1 ||
+    selection[0]?.source !== "owner" ||
+    selection[0].decision !== "allow"
+  ) {
+    throw new Error("Live M4 requires exactly one owner-approved portfolio selection");
+  }
+  const acceptance = approvals.filter(
+    (approval) => approval.toolName === "accept_promise",
+  );
+  if (
+    acceptance.length !== 1 ||
+    acceptance[0]?.source !== "owner" ||
+    acceptance[0].decision !== "allow"
+  ) {
+    throw new Error("Live M4 requires exactly one owner-approved promise acceptance");
   }
   if (
-    result.controlledWriteCount !== 1 ||
-    result.actualConsumptionFacts !== 2
+    approvals.some(
+      (approval) =>
+        approval.toolName !== "select_portfolio_modification" &&
+        approval.toolName !== "accept_promise" &&
+        !isConsequentialScheduleTool(approval.toolName),
+    )
   ) {
-    throw new Error("Live M4 acceptance did not conserve exact-once effects");
+    throw new Error("Live M4 acceptance contains an unsupported approval action");
   }
-  assertDurableHeroAcceptance(result, store, factory);
+
+  const ownerApprovals = approvals.filter(
+    (approval) => approval.source === "owner",
+  );
+  const ownerConsequential = ownerApprovals.filter((approval) =>
+    isConsequentialScheduleTool(approval.toolName),
+  );
+  const repeatedDenials = new Map<string, M4ApprovalRecord[]>();
+  for (const approval of approvals.filter(
+    (candidate) =>
+      candidate.decision === "deny" && candidate.denialId !== null,
+  )) {
+    const denialId = approval.denialId;
+    if (denialId === null) continue;
+    const group = repeatedDenials.get(denialId) ?? [];
+    group.push(approval);
+    repeatedDenials.set(denialId, group);
+  }
+  for (const group of repeatedDenials.values()) {
+    if (
+      group.length > 1 &&
+      (group.filter((approval) => approval.source === "owner").length !== 1 ||
+        group.filter((approval) => approval.source === "active_m2_denial")
+          .length !== group.length - 1)
+    ) {
+      throw new Error("Live M4 active M2 denial was reauthorized by an owner");
+    }
+  }
+  const approved = ownerConsequential.filter(
+    (approval) => approval.decision === "allow",
+  );
+  if (approved.length !== 1) {
+    throw new Error(
+      "Live M4 requires exactly one owner-approved consequential action",
+    );
+  }
+  const denied = ownerConsequential.filter(
+    (approval) => approval.decision === "deny",
+  );
+  if (denied.length !== 1) {
+    throw new Error(
+      "Live M4 requires exactly one owner-denied consequential action",
+    );
+  }
+  if (ownerApprovals.length !== 4) {
+    throw new Error("Live M4 requires exactly four external-owner calls");
+  }
+
+  const ownerOutcomes = missionSnapshot.bridgeOutcomes.filter(
+    (outcome) => outcome.status === "owner_decision_received",
+  );
+  if (ownerOutcomes.length !== 4) {
+    throw new Error("Live M4 durable owner-call count is not exactly four");
+  }
+  const ownerRequestDigests = new Set<string>();
+  for (const approval of ownerApprovals) {
+    if (
+      approval.ownerSourceIdentity === null ||
+      approval.ownerSourceIdentity.trim().length === 0
+    ) {
+      throw new Error("Live M4 owner approval is missing its owner source");
+    }
+    const action = actionByKey.get(approval.bridgeKey);
+    if (action === undefined) {
+      throw new Error("Live M4 owner approval has no durable action");
+    }
+    const expectedRequestDigest = digestCanonical({
+      missionId: action.missionId,
+      trueforgeSessionId: action.trueforgeSessionId,
+      trueforgeTurnId: action.trueforgeTurnId,
+      trueforgeThreadId: action.trueforgeThreadId,
+      trueforgeToolCallId: action.trueforgeToolCallId,
+      toolName: action.toolName,
+      arguments: action.arguments,
+      m2DatabaseInstanceIdentity: binding.m2EnvironmentIdentity,
+      factoryDatabaseInstanceIdentity: binding.factoryEnvironmentIdentity,
+      phase: ownerPhase(action.toolName),
+    });
+    const outcomes = ownerOutcomes.filter(
+      (outcome) => outcome.bridgeKey === approval.bridgeKey,
+    );
+    const durable = jsonRecord(outcomes[0]?.result, "owner decision");
+    const decision = jsonRecord(durable["decision"], "owner decision status");
+    if (
+      outcomes.length !== 1 ||
+      durable["requestDigest"] !== expectedRequestDigest ||
+      durable["ownerSourceIdentity"] !== approval.ownerSourceIdentity ||
+      decision["status"] !== approval.decision
+    ) {
+      throw new Error(
+        "Live M4 owner decision does not match its exact action digest and source",
+      );
+    }
+    ownerRequestDigests.add(expectedRequestDigest);
+  }
+  if (ownerRequestDigests.size !== 4) {
+    throw new Error("Live M4 external-owner calls are not distinct");
+  }
+
+  const deniedApproval = denied[0];
+  const approvedApproval = approved[0];
+  if (deniedApproval === undefined || approvedApproval === undefined) {
+    throw new Error("Live M4 consequential route is incomplete");
+  }
+
+  const mechanicalDenials = approvals.filter(
+    (approval) => approval.source === "active_m2_denial",
+  );
+  if (mechanicalDenials.length > 1) {
+    throw new Error("Live M4 contains duplicate active-M2 denial effects");
+  }
+  for (const mechanical of mechanicalDenials) {
+    if (
+      mechanical.decision !== "deny" ||
+      mechanical.ownerSourceIdentity !== null ||
+      mechanical.denialId === null ||
+      mechanical.denialId !== deniedApproval.denialId ||
+      ownerOutcomes.some((outcome) => outcome.bridgeKey === mechanical.bridgeKey)
+    ) {
+      throw new Error(
+        "Live M4 equivalent active-denial action was not mechanically denied",
+      );
+    }
+  }
+
+  const approvedAction = actionByKey.get(approvedApproval.bridgeKey);
+  const approvedAttemptId = approvedApproval.executionAttemptId;
+  if (
+    approvedAction === undefined ||
+    approvedAttemptId === null ||
+    actionAttemptId(
+      jsonRecord(approvedAction.arguments, "approved schedule arguments"),
+    ) !== approvedAttemptId ||
+    approvedApproval.denialId !== null
+  ) {
+    throw new Error(
+      "Live M4 approved consequential action is not bound to one attempt",
+    );
+  }
+  const deniedApprovals = approvals.filter(
+    (approval) => approval.decision === "deny",
+  );
+  for (const rejected of deniedApprovals) {
+    const action = actionByKey.get(rejected.bridgeKey);
+    if (action === undefined) {
+      throw new Error("Live M4 denied action has no durable action");
+    }
+    const attemptId = actionAttemptId(
+      jsonRecord(action.arguments, "denied schedule arguments"),
+    );
+    if (
+      rejected.executionAttemptId !== null ||
+      attemptId === approvedAttemptId ||
+      factory.readAuthoritativeExecution(attemptId) !== null
+    ) {
+      throw new Error("Live M4 denied action produced an unauthorized mutation");
+    }
+  }
+
+  const history = store.getAdmissionHistory();
+  const executionFacts = history
+    .flatMap((admission) => admission.addenda)
+    .filter((addendum) => addendum.kind === "execution_attempt");
+  const executionAttemptIds = new Set(
+    executionFacts.map((addendum) =>
+      String(
+        jsonRecord(addendum.body, "execution-attempt fact")[
+          "executionAttemptId"
+        ],
+      ),
+    ),
+  );
+  const acceptances = history
+    .flatMap((admission) => admission.addenda)
+    .filter((addendum) => addendum.kind === "acceptance_commit");
+  const actuals = history
+    .flatMap((admission) => admission.addenda)
+    .filter((addendum) => addendum.kind === "actual_consumption");
+  const reservations = store.getReservations(true);
+  const evidence = factory.readAuthoritativeExecution(approvedAttemptId);
+  if (
+    result.controlledWriteCount !== 1 ||
+    factory.getMutationCount() !== 1
+  ) {
+    throw new Error("Live M4 acceptance did not conserve one mutation");
+  }
+  if (
+    executionAttemptIds.size !== 1 ||
+    !executionAttemptIds.has(approvedAttemptId) ||
+    acceptances.length !== 1
+  ) {
+    throw new Error("Live M4 acceptance duplicated its attempt or acceptance");
+  }
+  if (
+    reservations.length !== 1 ||
+    reservations[0]?.executionAttemptId !== approvedAttemptId ||
+    reservations[0].claimState !== "terminal_verified"
+  ) {
+    throw new Error("Live M4 acceptance has a mixed or nonterminal attempt");
+  }
+  if (
+    evidence === null ||
+    evidence.request.executionAttemptId !== approvedAttemptId ||
+    evidence.result.receipt.executionAttemptId !== approvedAttemptId
+  ) {
+    throw new Error("Live M4 mutation receipt is not bound to the approved action");
+  }
+  if (
+    canonicalSerialize(evidence.request.claim) !==
+    canonicalSerialize(
+      jsonRecord(approvedAction.arguments, "approved schedule arguments")[
+        "claim"
+      ],
+    )
+  ) {
+    throw new Error("Live M4 mutation claim does not match its approved action");
+  }
+  if (result.actualConsumptionFacts !== 2 || actuals.length !== 2) {
+    throw new Error("Live M4 acceptance did not conserve two actual facts");
+  }
+
+  return { denied: deniedApproval, approved: approvedApproval };
 }
 
 function assertDurableHeroAcceptance(
   result: LiveM4MissionResult,
   store: FlakeBrakeStore,
   factory: SyntheticFactoryEnvironment,
+  route: LiveApprovalRoute,
 ): void {
   const history = store.getAdmissionHistory();
   const initial = history.find(
@@ -521,6 +916,7 @@ function assertDurableHeroAcceptance(
 
   const attempt = store.getExecutionAttempt("attempt/m4-approved-alternative");
   if (
+    route.approved.executionAttemptId !== attempt.executionAttemptId ||
     attempt.admissionRecordId !== fresh.record.admissionRecordId ||
     attempt.result.grantExecutionOrdinal !== 1 ||
     attempt.input.resourceCapacityClaims["agent_work_units"] !== 6 ||
@@ -588,10 +984,10 @@ function assertDurableHeroAcceptance(
 
   const actions = result.mission.missionSnapshot.bridgeActions;
   const denied = actions.find(
-    (action) => action.bridgeKey === result.mission.approvals[2]?.bridgeKey,
+    (action) => action.bridgeKey === route.denied.bridgeKey,
   );
   const allowed = actions.find(
-    (action) => action.bridgeKey === result.mission.approvals[4]?.bridgeKey,
+    (action) => action.bridgeKey === route.approved.bridgeKey,
   );
   const deniedArguments = jsonRecord(
     denied?.arguments,
@@ -614,7 +1010,40 @@ function assertDurableHeroAcceptance(
     );
   }
 
-  assertIndependentVerificationOrder(result);
+  assertIndependentVerificationOrder(result, route.approved.toolName);
+}
+
+function isConsequentialScheduleTool(toolName: string): boolean {
+  return (
+    toolName === "create_schedule_reservation" ||
+    toolName === "submit_schedule_change"
+  );
+}
+
+function ownerPhase(
+  toolName: string,
+): "portfolio_modification" | "promise_choice" | "consequential_effect" {
+  if (toolName === "select_portfolio_modification") {
+    return "portfolio_modification";
+  }
+  if (toolName === "accept_promise") return "promise_choice";
+  return "consequential_effect";
+}
+
+function actionAttemptId(
+  arguments_: Readonly<Record<string, unknown>>,
+): string {
+  const attemptId = arguments_["execution_attempt_id"];
+  if (typeof attemptId !== "string" || attemptId.length === 0) {
+    throw new Error("Live M4 consequential action has no execution attempt identity");
+  }
+  return attemptId;
+}
+
+function digestCanonical(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalSerialize(value))
+    .digest("hex")}`;
 }
 
 function scheduleEffectInterval(
@@ -629,7 +1058,10 @@ function scheduleEffectInterval(
   return { start: material["start"], end: material["end"] };
 }
 
-function assertIndependentVerificationOrder(result: LiveM4MissionResult): void {
+function assertIndependentVerificationOrder(
+  result: LiveM4MissionResult,
+  mutationToolName: string,
+): void {
   const events = result.mission.trueforgeEvents.map((item) => item.event);
   const toolNames = new Map<string, string>();
   for (const event of events) {
@@ -645,7 +1077,7 @@ function assertIndependentVerificationOrder(result: LiveM4MissionResult): void {
         ? [index]
         : [],
     );
-  const mutations = responseIndexes("create_schedule_reservation");
+  const mutations = responseIndexes(mutationToolName);
   const reads = responseIndexes("read_schedule_state");
   const verifications = responseIndexes("verify_schedule_execution");
   const mutation = mutations.at(-1) ?? -1;

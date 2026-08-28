@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -27,7 +28,13 @@ import type {
 } from "@truefoundry/trueforge-sdk";
 
 import { canonicalSerialize } from "../src/canonical.js";
-import { canonicalLiveDatabasePath } from "../src/m4-live.js";
+import {
+  assertLiveApprovalInvariants,
+  assertLiveMissionEvidence,
+  assertOperationalLiveConvergence,
+  canonicalLiveDatabasePath,
+  type LiveM4ValidationProfile,
+} from "../src/m4-live.js";
 import {
   FlakeBrakeStore,
   FACTORY_MCP_SERVICE_NAMES,
@@ -54,7 +61,13 @@ import {
   startFactoryMcpHttpService,
   type DeterministicM4MissionOptions,
   type DeterministicM4MissionResult,
+  type JsonValue,
   type LiveM4MissionOptions,
+  type LiveM4MissionResult,
+  type M4ApprovalRecord,
+  type M4BridgeAction,
+  type M4BridgeOutcome,
+  type M4MissionBinding,
   type M4MissionCheckpoint,
   type M4OwnerApprovalRequest,
   type RunningFactoryMcpHttpCluster,
@@ -62,6 +75,81 @@ import {
 
 const WINNER =
   "replan-plan/sha256:68fe99d3402893002930fa143b1089629e4722215d1624af5924d628430aafe2";
+
+const LIVE_DIAGNOSTIC_CONTINUATION_LIMIT = 12;
+const LIVE_DIAGNOSTIC_MARKER = "FLAKEBRAKE_LIVE_DIAGNOSTIC=";
+
+type LiveDiagnosticPhase =
+  | "awaiting_initial_admission"
+  | "awaiting_fresh_readmission"
+  | "awaiting_promise_acceptance"
+  | "awaiting_approved_attempt"
+  | "awaiting_factory_commit"
+  | "awaiting_independent_verification"
+  | "verified_complete";
+
+interface LiveDiagnosticCounts {
+  readonly admissions: number;
+  readonly acceptances: number;
+  readonly grants: number;
+  readonly attempts: number;
+  readonly fences: number;
+  readonly mutations: number;
+  readonly receipts: number;
+  readonly terminalEvents: number;
+  readonly actualFacts: number;
+}
+
+interface LiveFailureDiagnostic {
+  readonly schemaVersion: "flakebrake-live-failure-diagnostic/v1";
+  readonly capturedBeforeInvocationCleanup: true;
+  readonly configuredContinuationLimit: number;
+  readonly continuationCount: number;
+  readonly continuationRequests: number;
+  readonly symbolicDurablePhaseTransitions: readonly LiveDiagnosticPhase[];
+  readonly repetition: {
+    readonly detected: boolean;
+    readonly firstRepeatedPhase: LiveDiagnosticPhase | "unlocalized" | null;
+  };
+  readonly actions: readonly {
+    readonly actionType: string;
+    readonly actionKind: string;
+    readonly outcome: "allow" | "deny" | "unbound" | "invalid";
+    readonly approvalOrigin: "owner" | "mechanical_denial" | "none" | "invalid";
+  }[];
+  readonly externalOwnerCallCount: number;
+  readonly identities: {
+    readonly mission: string | null;
+    readonly session: string | null;
+    readonly cursor: string | null;
+  };
+  readonly missionTerminalDiscriminant: "nonterminal" | "terminal_verified";
+  readonly m2TerminalDiscriminant: LiveDiagnosticPhase;
+  readonly counts: LiveDiagnosticCounts;
+  readonly duplicateIndicators: {
+    readonly admissions: boolean;
+    readonly acceptances: boolean;
+    readonly grants: boolean;
+    readonly attempts: boolean;
+    readonly fences: boolean;
+    readonly mutations: boolean;
+    readonly receipts: boolean;
+    readonly terminalEvents: boolean;
+    readonly actualFacts: boolean;
+  };
+  readonly failureClosed: boolean;
+  readonly cleanup: {
+    listeners: "clean" | "leaked";
+    processes: "clean" | "leaked";
+    liveRunLock: "released" | "not_applicable";
+    invocationFiles: "pending" | "removed" | "present";
+  };
+}
+
+interface LiveDiagnosticError extends Error {
+  readonly flakeBrakeLiveDiagnostic: LiveFailureDiagnostic;
+  readonly flakeBrakeOriginalMessage: string;
+}
 
 interface HttpFixture {
   readonly directory: string;
@@ -649,6 +737,344 @@ describe("M4 genuine TrueForge deterministic mission", () => {
     );
   });
 
+  test("8a. live validator accepts the deterministic five-event route", () => {
+    assertLiveInvariantFixture(options, liveValidationFixture(first));
+  });
+
+  test("8b. live validator accepts the safe four-event shortcut", () => {
+    assertLiveInvariantFixture(
+      options,
+      safeShortcutLiveValidationFixture(liveValidationFixture(first)),
+    );
+  });
+
+  test("8c. live validator rejects a missing portfolio-selection approval", () => {
+    const fixture = liveValidationFixture(first);
+    const selection = fixture.mission.approvals.find(
+      (approval) => approval.toolName === "select_portfolio_modification",
+    );
+    assert.ok(selection);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          removeLiveFixtureApproval(fixture, selection.bridgeKey),
+        ),
+      /owner-approved portfolio selection/u,
+    );
+  });
+
+  test("8d. live validator rejects a missing promise acceptance", () => {
+    const fixture = liveValidationFixture(first);
+    const acceptance = fixture.mission.approvals.find(
+      (approval) => approval.toolName === "accept_promise",
+    );
+    assert.ok(acceptance);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          removeLiveFixtureApproval(fixture, acceptance.bridgeKey),
+        ),
+      /owner-approved promise acceptance/u,
+    );
+  });
+
+  test("8e. live validator rejects a route without a consequential denial", () => {
+    const fixture = safeShortcutLiveValidationFixture(
+      liveValidationFixture(first),
+    );
+    const denial = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "deny" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    assert.ok(denial);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          removeLiveFixtureApproval(fixture, denial.bridgeKey),
+        ),
+      /owner-denied consequential action/u,
+    );
+  });
+
+  test("8f. live validator rejects multiple approved consequential actions", () => {
+    const fixture = liveValidationFixture(first);
+    const denial = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "deny" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    assert.ok(denial);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          replaceLiveFixtureApproval(fixture, {
+            ...denial,
+            decision: "allow",
+            reason: "owner approved",
+            denialId: null,
+          }),
+        ),
+      /owner-approved consequential action/u,
+    );
+  });
+
+  test("8g. live validator rejects an owner decision/action digest mismatch", () => {
+    const fixture = liveValidationFixture(first);
+    const selection = fixture.mission.approvals.find(
+      (approval) => approval.toolName === "select_portfolio_modification",
+    );
+    assert.ok(selection);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          replaceOwnerOutcomeDigest(
+            fixture,
+            selection.bridgeKey,
+            "sha256:fixture-mismatch",
+          ),
+        ),
+      /exact action digest and source/u,
+    );
+  });
+
+  test("8h. live validator rejects mutation identity on a denied action", () => {
+    const fixture = liveValidationFixture(first);
+    const denial = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "deny" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    const approved = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "allow" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    assert.ok(denial);
+    assert.ok(approved?.executionAttemptId);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          replaceLiveFixtureApproval(fixture, {
+            ...denial,
+            executionAttemptId: approved.executionAttemptId,
+          }),
+        ),
+      /denied action produced an unauthorized mutation/u,
+    );
+  });
+
+  test("8i. live validator rejects active-denial owner reauthorization", () => {
+    const fixture = liveValidationFixture(first);
+    const ownerDenial = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "deny" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    const mechanical = fixture.mission.approvals.find(
+      (approval) => approval.source === "active_m2_denial",
+    );
+    assert.ok(ownerDenial?.ownerSourceIdentity);
+    assert.ok(mechanical);
+    const ownerSourceIdentity = ownerDenial.ownerSourceIdentity;
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          reauthorizeMechanicalDenial(
+            fixture,
+            mechanical,
+            ownerSourceIdentity,
+          ),
+        ),
+      /active M2 denial was reauthorized/u,
+    );
+  });
+
+  test("8j. live validator rejects duplicate effects and wrong owner-call counts", () => {
+    const fixture = liveValidationFixture(first);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(options, {
+          ...fixture,
+          controlledWriteCount: 2,
+        }),
+      /conserve one mutation/u,
+    );
+    const ownerOutcome = fixture.mission.missionSnapshot.bridgeOutcomes.find(
+      (outcome) => outcome.status === "owner_decision_received",
+    );
+    assert.ok(ownerOutcome);
+    assert.throws(
+      () =>
+        assertLiveInvariantFixture(
+          options,
+          removeLiveFixtureOutcome(fixture, ownerOutcome.bridgeEventId),
+        ),
+      /owner-call count is not exactly four/u,
+    );
+  });
+
+  test("8k. full hero evidence is the default and requires assurance sandbox completion", () => {
+    const complete = liveValidationFixture(first);
+    assertLiveEvidenceFixture(options, complete);
+    assertLiveEvidenceFixture(options, complete, "full_hero_evidence");
+    const missingAssurance = withoutAssuranceSandboxCompletion(complete);
+    assert.throws(
+      () => assertLiveEvidenceFixture(options, missingAssurance),
+      /assurance subagent did not complete genuine sandbox execution/u,
+    );
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          missingAssurance,
+          "full_hero_evidence",
+        ),
+      /assurance subagent did not complete genuine sandbox execution/u,
+    );
+  });
+
+  test("8l. operational convergence accepts terminal safety without repeated assurance", () => {
+    assertLiveEvidenceFixture(
+      options,
+      withoutAssuranceSandboxCompletion(liveValidationFixture(first)),
+      "operational_convergence",
+    );
+  });
+
+  test("8m. operational convergence requires genuine model and owner evidence", () => {
+    const fixture = liveValidationFixture(first);
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          { ...fixture, model: "fixture/deterministic" },
+          "operational_convergence",
+        ),
+      /genuine external-model execution/u,
+    );
+    const selection = fixture.mission.approvals.find(
+      (approval) => approval.toolName === "select_portfolio_modification",
+    );
+    assert.ok(selection);
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          removeLiveFixtureApproval(fixture, selection.bridgeKey),
+          "operational_convergence",
+        ),
+      /owner-approved portfolio selection/u,
+    );
+  });
+
+  test("8n. operational convergence rejects unsafe or nonconvergent outcomes", () => {
+    const fixture = liveValidationFixture(first);
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          {
+            ...fixture,
+            mission: { ...fixture.mission, finalTurnId: "turn/nonterminal" },
+          },
+          "operational_convergence",
+        ),
+      /terminal mission projection/u,
+    );
+    const denial = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "deny" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    const approved = fixture.mission.approvals.find(
+      (approval) =>
+        approval.source === "owner" &&
+        approval.decision === "allow" &&
+        isFixtureConsequentialTool(approval.toolName),
+    );
+    assert.ok(denial);
+    assert.ok(approved?.executionAttemptId);
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          replaceLiveFixtureApproval(fixture, {
+            ...denial,
+            executionAttemptId: approved.executionAttemptId,
+          }),
+          "operational_convergence",
+        ),
+      /denied action produced an unauthorized mutation/u,
+    );
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          { ...fixture, controlledWriteCount: 2 },
+          "operational_convergence",
+        ),
+      /conserve one mutation/u,
+    );
+    const selection = fixture.mission.approvals.find(
+      (approval) => approval.toolName === "select_portfolio_modification",
+    );
+    assert.ok(selection);
+    assert.throws(
+      () =>
+        assertLiveEvidenceFixture(
+          options,
+          replaceOwnerOutcomeDigest(
+            fixture,
+            selection.bridgeKey,
+            "sha256:profile-mismatch",
+          ),
+          "operational_convergence",
+        ),
+      /exact action digest and source/u,
+    );
+    assert.throws(
+      () =>
+        assertOperationalLiveConvergence(fixture, {
+          ...fixture,
+          mission: {
+            ...fixture.mission,
+            projectionDigest: "sha256:nonconvergent",
+          },
+        }),
+      /did not converge on one terminal mission projection/u,
+    );
+  });
+
+  test("8o. live callers select named profiles and retain the twelve-continuation bound", () => {
+    assert.equal(
+      liveOptions("/tmp/profile-full", {
+        validationProfile: "full_hero_evidence",
+      }).validationProfile,
+      "full_hero_evidence",
+    );
+    assert.equal(
+      liveOptions("/tmp/profile-operational", {
+        validationProfile: "operational_convergence",
+      }).validationProfile,
+      "operational_convergence",
+    );
+    assert.equal(LIVE_DIAGNOSTIC_CONTINUATION_LIMIT, 12);
+  });
+
   test("9. the bridge claims once before resume and ends with one fenced write and verified actuals", () => {
     assert.equal(first.finalAttempt.executionAttemptId, "attempt/m4-approved-alternative");
     assert.equal(first.finalAttempt.result.grantExecutionOrdinal, 1);
@@ -954,6 +1380,264 @@ test(
       missionStore.close();
       rmSync(directory, { recursive: true, force: true });
     }
+  },
+);
+
+test(
+  "Qodo diagnostic harness captures the unchanged continuation bound before cleanup",
+  async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-live-diagnostic-bound-"),
+    );
+    const m2Path = join(directory, "m2.sqlite");
+    const factoryPath = join(directory, "factory.sqlite");
+    const missionPath = join(directory, "mission.sqlite");
+    const missionId = "mission/diagnostic-redaction-sentinel";
+    const sessionId = "session/diagnostic-redaction-sentinel";
+    const initialTurnId = "turn/diagnostic-initial";
+    const factory = new SyntheticFactoryEnvironment({
+      path: factoryPath,
+      now: () => HERO_HORIZON_END,
+    });
+    factory.close();
+    const m2Store = createStore({
+      path: m2Path,
+      initialState: createHeroInitialState(),
+      authoritativeFactoryDatabasePath: factoryPath,
+      now: () => HERO_HORIZON_END,
+    });
+    m2Store.close();
+    let continuationRequests = 0;
+    let diagnostic: LiveFailureDiagnostic | undefined;
+    const doneEvent = (turnId: string): TrueForgeApi.TurnDoneEvent => ({
+      id: `event/${turnId}/done`,
+      type: "turn.done",
+      threadId: null,
+      createdAt: HERO_HORIZON_END,
+      state: {
+        status: "done",
+        completedAt: HERO_HORIZON_END,
+        output: null,
+        requiredActions: [],
+      },
+    });
+    const initialDone = doneEvent(initialTurnId);
+    const trueforgeClient = {
+      sessions: {
+        getTurn: async () => ({
+          data: { id: initialTurnId, state: initialDone.state },
+        }),
+        listTurnEvents: async () => asyncPage([initialDone]),
+        listTurns: async () => asyncPage([]),
+        createTurnStream: async () => {
+          continuationRequests += 1;
+          const turnId = `turn/diagnostic-continuation-${String(continuationRequests)}`;
+          return asyncPage([
+            {
+              id: `event/${turnId}/created`,
+              type: "turn.created",
+              turnId,
+              threadId: null,
+              createdAt: HERO_HORIZON_END,
+            } as unknown as TrueForgeApi.TurnStreamingEvent,
+            doneEvent(turnId),
+          ]);
+        },
+      },
+    } as unknown as TrueForge;
+
+    await assert.rejects(
+      withLiveFailureDiagnostic(
+        {
+          directory,
+          missionDatabasePath: missionPath,
+          m2DatabasePath: m2Path,
+          factoryDatabasePath: factoryPath,
+          missionId,
+          externalOwnerCallCount: () => 0,
+          usesLiveRunLock: false,
+        },
+        async () => {
+          const missionStore = new M4MissionStore({
+            path: missionPath,
+            now: () => HERO_HORIZON_END,
+          });
+          try {
+            missionStore.bindMission({
+              missionId,
+              environmentId: HERO_ENVIRONMENT_ID,
+              trueforgeAgentId: "agent/diagnostic-redaction-sentinel",
+              trueforgeSessionId: sessionId,
+              m2EnvironmentIdentity: readDatabaseInstanceIdentity(
+                m2Path,
+                "m2",
+                HERO_ENVIRONMENT_ID,
+              ),
+              factoryEnvironmentIdentity: readDatabaseInstanceIdentity(
+                factoryPath,
+                "factory",
+                HERO_ENVIRONMENT_ID,
+              ),
+            });
+            missionStore.advanceCursor(missionId, initialTurnId, 1);
+            const controller = new M4MissionController({
+              missionId,
+              environmentId: HERO_ENVIRONMENT_ID,
+              trueforgeAgentId: "agent/diagnostic-redaction-sentinel",
+              trueforgeSessionId: sessionId,
+              trueforgeClient,
+              missionStore,
+              m2DatabasePath: m2Path,
+              factoryDatabasePath: factoryPath,
+              ownerDecisionProvider: (request) =>
+                m4OwnerDecisionResponse(
+                  request,
+                  "test-owner/diagnostic-redaction-sentinel",
+                  { status: "allow" },
+                ),
+            });
+            await controller.runToCompletion();
+          } finally {
+            missionStore.close();
+          }
+        },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(
+          error.message,
+          /exceeded bounded durable-phase continuation limit/u,
+        );
+        diagnostic = liveDiagnosticFromError(error);
+        return true;
+      },
+    );
+
+    assert.ok(diagnostic);
+    assert.equal(
+      continuationRequests,
+      LIVE_DIAGNOSTIC_CONTINUATION_LIMIT,
+    );
+    assert.equal(
+      diagnostic.configuredContinuationLimit,
+      LIVE_DIAGNOSTIC_CONTINUATION_LIMIT,
+    );
+    assert.equal(diagnostic.continuationRequests, 12);
+    assert.equal(diagnostic.continuationCount, 13);
+    assert.deepEqual(diagnostic.symbolicDurablePhaseTransitions, [
+      "awaiting_initial_admission",
+    ]);
+    assert.deepEqual(diagnostic.repetition, {
+      detected: true,
+      firstRepeatedPhase: "awaiting_initial_admission",
+    });
+    assert.equal(diagnostic.failureClosed, true);
+    assert.deepEqual(diagnostic.counts, {
+      admissions: 0,
+      acceptances: 0,
+      grants: 0,
+      attempts: 0,
+      fences: 0,
+      mutations: 0,
+      receipts: 0,
+      terminalEvents: 0,
+      actualFacts: 0,
+    });
+    assert.deepEqual(diagnostic.cleanup, {
+      listeners: "clean",
+      processes: "clean",
+      liveRunLock: "not_applicable",
+      invocationFiles: "removed",
+    });
+    assert.equal(existsSync(directory), false);
+    assert.doesNotMatch(
+      canonicalSerialize(diagnostic),
+      /diagnostic-redaction-sentinel|api[_-]?key|provider manifest/iu,
+    );
+  },
+);
+
+test(
+  "Qodo diagnostic harness reports partial and duplicate durable effects without contents",
+  async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-live-diagnostic-effects-"),
+    );
+    const m2Path = join(directory, "m2.sqlite");
+    const factoryPath = join(directory, "factory.sqlite");
+    const missionPath = join(directory, "mission.sqlite");
+    const missionId = "mission/diagnostic-secret-bearing-identity";
+    const factory = new SyntheticFactoryEnvironment({
+      path: factoryPath,
+      now: () => HERO_HORIZON_END,
+    });
+    factory.close();
+    const store = createStore({
+      path: m2Path,
+      initialState: createHeroInitialState(),
+      authoritativeFactoryDatabasePath: factoryPath,
+      now: () => HERO_HORIZON_END,
+    });
+    store.close();
+    seedDiagnosticEffectCounts(m2Path, factoryPath);
+    seedDiagnosticMissionActions(missionPath, missionId);
+    let diagnostic: LiveFailureDiagnostic | undefined;
+
+    await assert.rejects(
+      withLiveFailureDiagnostic(
+        {
+          directory,
+          missionDatabasePath: missionPath,
+          m2DatabasePath: m2Path,
+          factoryDatabasePath: factoryPath,
+          missionId,
+          externalOwnerCallCount: () => 4,
+          usesLiveRunLock: true,
+        },
+        async () => {
+          throw new Error("planned diagnostic effect-count failure");
+        },
+      ),
+      (error: unknown) => {
+        diagnostic = liveDiagnosticFromError(error);
+        return true;
+      },
+    );
+
+    assert.ok(diagnostic);
+    assert.deepEqual(diagnostic.counts, {
+      admissions: 4,
+      acceptances: 2,
+      grants: 2,
+      attempts: 2,
+      fences: 2,
+      mutations: 2,
+      receipts: 2,
+      terminalEvents: 2,
+      actualFacts: 3,
+    });
+    assert.ok(
+      Object.values(diagnostic.duplicateIndicators).every(Boolean),
+    );
+    assert.equal(diagnostic.failureClosed, false);
+    assert.equal(diagnostic.externalOwnerCallCount, 4);
+    assert.deepEqual(
+      diagnostic.actions.map((action) => [
+        action.actionType,
+        action.outcome,
+        action.approvalOrigin,
+      ]),
+      [
+        ["select_portfolio_modification", "allow", "owner"],
+        ["submit_schedule_change", "deny", "mechanical_denial"],
+      ],
+    );
+    assert.equal(diagnostic.cleanup.invocationFiles, "removed");
+    assert.equal(existsSync(directory), false);
+    assert.doesNotMatch(
+      canonicalSerialize(diagnostic),
+      /diagnostic-secret-bearing-identity|raw-owner-response|api[_-]?key/iu,
+    );
   },
 );
 
@@ -1479,15 +2163,29 @@ test(
       localSandboxRootParent: join(directory, "sandboxes"),
       missionId: M4_LIVE_MISSION_ID,
     };
+    let ownerCallCount = 0;
     const options = {
       ...seedOptions,
       m0TrueForgeDatabasePath: provenM0Path,
-      ownerDecisionProvider: (request: M4OwnerApprovalRequest) =>
-        m4OwnerDecisionResponse(request, "test-owner/qodo-live-resume", {
+      validationProfile: "full_hero_evidence",
+      ownerDecisionProvider: (request: M4OwnerApprovalRequest) => {
+        ownerCallCount += 1;
+        return m4OwnerDecisionResponse(request, "test-owner/qodo-live-resume", {
           status: "allow",
-        }),
+        });
+      },
     } satisfies LiveM4MissionOptions;
-    try {
+    await withLiveFailureDiagnostic(
+      {
+        directory,
+        missionDatabasePath: options.missionDatabasePath,
+        m2DatabasePath: options.m2DatabasePath,
+        factoryDatabasePath: options.factoryDatabasePath,
+        missionId: M4_LIVE_MISSION_ID,
+        externalOwnerCallCount: () => ownerCallCount,
+        usesLiveRunLock: true,
+      },
+      async () => {
       const seed = await runDeterministicM4Mission(seedOptions);
       assert.equal(seed.mission.missionId, M4_LIVE_MISSION_ID);
       const snapshotBefore = missionSnapshot(options.missionDatabasePath);
@@ -1528,9 +2226,8 @@ test(
         sessionsBefore,
       );
       assert.equal(missionSnapshot(options.missionDatabasePath), snapshotBefore);
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
+      },
+    );
   },
 );
 
@@ -2114,40 +2811,153 @@ test(
     const policy = deterministicM4OwnerDecisions(
       "test-owner/qodo-r2-genuine-alias",
     );
-    let ownerCalls = 0;
+    const ownerCalls: Array<{
+      readonly requestDigest: string;
+      readonly responseDigest: string;
+      readonly toolName: string;
+      readonly phase: M4OwnerApprovalRequest["phase"];
+      readonly decision: "allow" | "deny";
+      readonly ownerSourceIdentity: string;
+    }> = [];
     const ownerDecisionProvider = async (request: M4OwnerApprovalRequest) => {
-      ownerCalls += 1;
-      return policy(request);
+      const response = await policy(request);
+      ownerCalls.push({
+        requestDigest: request.requestDigest,
+        responseDigest: response.requestDigest,
+        toolName: request.toolName,
+        phase: request.phase,
+        decision: response.decision.status,
+        ownerSourceIdentity: response.ownerSourceIdentity,
+      });
+      return response;
     };
-    try {
-      const physicalOptions = liveOptions(physical, {
-        m0TrueForgeDatabasePath: provenM0Path,
-        ownerDecisionProvider,
-      }) as LiveM4MissionOptions;
-      const aliasOptions = liveOptions(alias, {
-        m0TrueForgeDatabasePath: provenM0Path,
-        ownerDecisionProvider,
-      }) as LiveM4MissionOptions;
+    const physicalOptions = liveOptions(physical, {
+      m0TrueForgeDatabasePath: provenM0Path,
+      validationProfile: "operational_convergence",
+      ownerDecisionProvider,
+    }) as LiveM4MissionOptions;
+    const aliasOptions = liveOptions(alias, {
+      m0TrueForgeDatabasePath: provenM0Path,
+      validationProfile: "operational_convergence",
+      ownerDecisionProvider,
+    }) as LiveM4MissionOptions;
+    await withLiveFailureDiagnostic(
+      {
+        directory,
+        missionDatabasePath: physicalOptions.missionDatabasePath,
+        m2DatabasePath: physicalOptions.m2DatabasePath,
+        factoryDatabasePath: physicalOptions.factoryDatabasePath,
+        missionId: M4_LIVE_MISSION_ID,
+        externalOwnerCallCount: () => ownerCalls.length,
+        usesLiveRunLock: true,
+      },
+      async () => {
+      const serverHandlesBefore = new Set(activeServerHandles());
+      const childHandlesBefore = new Set(activeChildProcessHandles());
       const [first, second] = await Promise.all([
         runLiveM4Mission(physicalOptions),
         runLiveM4Mission(aliasOptions),
       ]);
+      assertOperationalLiveConvergence(first, second);
       assert.equal(first.mission.trueforgeSessionId, second.mission.trueforgeSessionId);
+      assert.equal(first.mission.missionId, second.mission.missionId);
+      assert.equal(first.mission.finalTurnId, second.mission.finalTurnId);
       assert.equal(first.mission.projectionDigest, second.mission.projectionDigest);
-      assert.equal(ownerCalls, 4);
+      assert.equal(first.mission.status, "VERIFIED_COMPLETE");
+      assert.equal(second.mission.status, "VERIFIED_COMPLETE");
+      assert.equal(ownerCalls.length, 4);
+      assert.equal(
+        new Set(ownerCalls.map((call) => call.requestDigest)).size,
+        4,
+      );
+      assert.ok(
+        ownerCalls.every(
+          (call) =>
+            call.requestDigest === call.responseDigest &&
+            call.ownerSourceIdentity === "test-owner/qodo-r2-genuine-alias",
+        ),
+      );
+      assert.deepEqual(
+        ownerCalls
+          .filter((call) => call.toolName === "select_portfolio_modification")
+          .map((call) => call.decision),
+        ["allow"],
+      );
+      assert.deepEqual(
+        ownerCalls
+          .filter((call) => call.toolName === "accept_promise")
+          .map((call) => call.decision),
+        ["allow"],
+      );
+      const consequentialOwnerCalls = ownerCalls.filter(
+        (call) => call.phase === "consequential_effect",
+      );
+      assert.equal(consequentialOwnerCalls.length, 2);
+      assert.equal(
+        consequentialOwnerCalls.filter((call) => call.decision === "deny")
+          .length,
+        1,
+      );
+      assert.equal(
+        consequentialOwnerCalls.filter((call) => call.decision === "allow")
+          .length,
+        1,
+      );
       assert.equal(first.controlledWriteCount, 1);
+      assert.equal(second.controlledWriteCount, 1);
       assert.equal(first.actualConsumptionFacts, 2);
+      assert.equal(second.actualConsumptionFacts, 2);
       assert.equal(trueForgeSessionCount(physicalOptions.trueforgeDatabasePath), 1);
+      assert.equal(sqliteRowCount(physicalOptions.missionDatabasePath, "m4_missions"), 1);
+      assert.equal(sqliteRowCount(physicalOptions.m2DatabasePath, "execution_attempts"), 1);
+      assert.equal(
+        sqliteRowCount(
+          physicalOptions.m2DatabasePath,
+          "admission_addenda",
+          "kind = 'acceptance_commit'",
+        ),
+        1,
+      );
+      assert.equal(
+        sqliteRowCount(
+          physicalOptions.m2DatabasePath,
+          "admission_addenda",
+          "kind = 'actual_consumption'",
+        ),
+        2,
+      );
+      assert.equal(
+        sqliteRowCount(physicalOptions.factoryDatabasePath, "mutation_events"),
+        1,
+      );
+      assert.equal(
+        sqliteRowCount(physicalOptions.factoryDatabasePath, "execution_results"),
+        1,
+      );
       const store = createStore({ path: physicalOptions.m2DatabasePath });
       try {
-        assert.equal(store.getReservations(true).length, 1);
+        const reservations = store.getReservations(true);
+        assert.equal(reservations.length, 1);
+        assert.equal(reservations[0]?.claimState, "terminal_verified");
         assert.equal(store.getAdmissionHistory().length, 3);
       } finally {
         store.close();
       }
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
+      await tick();
+      assert.deepEqual(
+        activeServerHandles().filter(
+          (handle) => !serverHandlesBefore.has(handle) && handle.listening,
+        ),
+        [],
+      );
+      assert.deepEqual(
+        activeChildProcessHandles().filter(
+          (handle) => !childHandlesBefore.has(handle),
+        ),
+        [],
+      );
+      },
+    );
   },
 );
 
@@ -2468,6 +3278,586 @@ function liveOptions(
     localSandboxRootParent: join(directory, "sandboxes"),
     ...overrides,
   };
+}
+
+async function withLiveFailureDiagnostic<T>(
+  input: {
+    readonly directory: string;
+    readonly missionDatabasePath: string;
+    readonly m2DatabasePath: string;
+    readonly factoryDatabasePath: string;
+    readonly missionId: string;
+    readonly externalOwnerCallCount: () => number;
+    readonly usesLiveRunLock: boolean;
+  },
+  operation: () => Promise<T>,
+): Promise<T> {
+  const serversBefore = new Set(
+    activeServerHandles().filter((server) => server.listening),
+  );
+  const childrenBefore = new Set(activeChildProcessHandles());
+  let diagnosticError: LiveDiagnosticError | undefined;
+  try {
+    return await operation();
+  } catch (error: unknown) {
+    const diagnostic = captureLiveFailureDiagnostic({
+      ...input,
+      error,
+      serversBefore,
+      childrenBefore,
+    });
+    diagnosticError = attachLiveFailureDiagnostic(error, diagnostic);
+    throw diagnosticError;
+  } finally {
+    rmSync(input.directory, { recursive: true, force: true });
+    if (diagnosticError !== undefined) {
+      diagnosticError.flakeBrakeLiveDiagnostic.cleanup.invocationFiles =
+        existsSync(input.directory) ? "present" : "removed";
+      refreshLiveDiagnosticError(diagnosticError);
+    }
+  }
+}
+
+function captureLiveFailureDiagnostic(input: {
+  readonly missionDatabasePath: string;
+  readonly m2DatabasePath: string;
+  readonly factoryDatabasePath: string;
+  readonly missionId: string;
+  readonly externalOwnerCallCount: () => number;
+  readonly usesLiveRunLock: boolean;
+  readonly error: unknown;
+  readonly serversBefore: ReadonlySet<Server>;
+  readonly childrenBefore: ReadonlySet<unknown>;
+}): LiveFailureDiagnostic {
+  const mission = readMissionDiagnostic(
+    input.missionDatabasePath,
+    input.missionId,
+  );
+  const m2 = readM2Diagnostic(input.m2DatabasePath);
+  const factory = readFactoryDiagnostic(input.factoryDatabasePath);
+  const counts: LiveDiagnosticCounts = { ...m2.counts, ...factory };
+  const transitions = symbolicDiagnosticTransitions(m2, factory);
+  const boundedFailure =
+    input.error instanceof Error &&
+    input.error.message.includes(
+      "exceeded bounded durable-phase continuation limit",
+    );
+  const continuationCount =
+    mission.continuationRequests + (boundedFailure ? 1 : 0);
+  const repetitionDetected = continuationCount > transitions.length;
+  const effectsAreAbsent =
+    counts.acceptances === 0 &&
+    counts.grants === 0 &&
+    counts.attempts === 0 &&
+    counts.fences === 0 &&
+    counts.mutations === 0 &&
+    counts.receipts === 0 &&
+    counts.terminalEvents === 0 &&
+    counts.actualFacts === 0;
+  return {
+    schemaVersion: "flakebrake-live-failure-diagnostic/v1",
+    capturedBeforeInvocationCleanup: true,
+    configuredContinuationLimit: LIVE_DIAGNOSTIC_CONTINUATION_LIMIT,
+    continuationCount,
+    continuationRequests: mission.continuationRequests,
+    symbolicDurablePhaseTransitions: transitions,
+    repetition: {
+      detected: repetitionDetected,
+      firstRepeatedPhase:
+        !repetitionDetected
+          ? null
+          : transitions.length === 1
+            ? transitions[0] ?? "unlocalized"
+            : "unlocalized",
+    },
+    actions: mission.actions,
+    externalOwnerCallCount: input.externalOwnerCallCount(),
+    identities: mission.identities,
+    missionTerminalDiscriminant:
+      counts.terminalEvents === 1 ? "terminal_verified" : "nonterminal",
+    m2TerminalDiscriminant:
+      transitions.at(-1) ?? "awaiting_initial_admission",
+    counts,
+    duplicateIndicators: {
+      admissions: counts.admissions > 3,
+      acceptances: counts.acceptances > 1,
+      grants: counts.grants > 1,
+      attempts: counts.attempts > 1,
+      fences: counts.fences > 1,
+      mutations: counts.mutations > 1,
+      receipts: counts.receipts > 1,
+      terminalEvents: counts.terminalEvents > 1,
+      actualFacts: counts.actualFacts > 2,
+    },
+    failureClosed: effectsAreAbsent,
+    cleanup: {
+      listeners: activeServerHandles().some(
+        (server) => server.listening && !input.serversBefore.has(server),
+      )
+        ? "leaked"
+        : "clean",
+      processes: activeChildProcessHandles().some(
+        (child) => !input.childrenBefore.has(child),
+      )
+        ? "leaked"
+        : "clean",
+      liveRunLock: input.usesLiveRunLock ? "released" : "not_applicable",
+      invocationFiles: "pending",
+    },
+  };
+}
+
+function readMissionDiagnostic(
+  path: string,
+  missionId: string,
+): {
+  readonly continuationRequests: number;
+  readonly actions: LiveFailureDiagnostic["actions"];
+  readonly identities: LiveFailureDiagnostic["identities"];
+} {
+  if (!existsSync(path)) {
+    return {
+      continuationRequests: 0,
+      actions: [],
+      identities: { mission: null, session: null, cursor: null },
+    };
+  }
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const binding = database
+      .prepare(
+        `SELECT mission_id, trueforge_session_id, current_turn_id
+           FROM m4_missions WHERE mission_id = ?`,
+      )
+      .get(missionId) as Record<string, unknown> | undefined;
+    const intents = database
+      .prepare(
+        `SELECT previous_turn_id, input_json
+           FROM m4_successor_intents
+          WHERE mission_id = ?`,
+      )
+      .all(missionId) as Record<string, unknown>[];
+    const continuationRequests = intents.filter((intent) => {
+      if (intent["previous_turn_id"] === "none") return false;
+      try {
+        const parsed = JSON.parse(String(intent["input_json"]));
+        return (
+          Array.isArray(parsed) &&
+          parsed.some(
+            (item) =>
+              item !== null &&
+              typeof item === "object" &&
+              !Array.isArray(item) &&
+              (item as Record<string, unknown>)["type"] === "user.message",
+          )
+        );
+      } catch {
+        return false;
+      }
+    }).length;
+    const rows = database
+      .prepare(
+        `SELECT action.tool_name, action.action_kind, outcome.result_json
+           FROM m4_bridge_actions AS action
+           LEFT JOIN m4_bridge_events AS outcome
+             ON outcome.bridge_key = action.bridge_key
+            AND outcome.status = 'approval_bound'
+          WHERE action.mission_id = ?
+          ORDER BY action.rowid`,
+      )
+      .all(missionId) as Record<string, unknown>[];
+    const actions = rows.map((row) => {
+      let outcome: LiveFailureDiagnostic["actions"][number]["outcome"] =
+        "unbound";
+      let approvalOrigin: LiveFailureDiagnostic["actions"][number]["approvalOrigin"] =
+        "none";
+      if (typeof row["result_json"] === "string") {
+        try {
+          const result = JSON.parse(row["result_json"] as string) as Record<
+            string,
+            unknown
+          >;
+          outcome =
+            result["decision"] === "allow" || result["decision"] === "deny"
+              ? result["decision"]
+              : "invalid";
+          approvalOrigin =
+            result["source"] === "owner"
+              ? "owner"
+              : result["source"] === "active_m2_denial"
+                ? "mechanical_denial"
+                : "invalid";
+        } catch {
+          outcome = "invalid";
+          approvalOrigin = "invalid";
+        }
+      }
+      return {
+        actionType: diagnosticActionType(row["tool_name"]),
+        actionKind: diagnosticActionKind(row["action_kind"]),
+        outcome,
+        approvalOrigin,
+      };
+    });
+    return {
+      continuationRequests,
+      actions,
+      identities: {
+        mission: diagnosticIdentity(binding?.["mission_id"]),
+        session: diagnosticIdentity(binding?.["trueforge_session_id"]),
+        cursor: diagnosticIdentity(binding?.["current_turn_id"]),
+      },
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function readM2Diagnostic(path: string): {
+  readonly counts: Omit<LiveDiagnosticCounts, "mutations" | "receipts">;
+  readonly replanAdmissions: number;
+  readonly admittableAdmissions: number;
+} {
+  const empty = {
+    counts: {
+      admissions: 0,
+      acceptances: 0,
+      grants: 0,
+      attempts: 0,
+      fences: 0,
+      terminalEvents: 0,
+      actualFacts: 0,
+    },
+    replanAdmissions: 0,
+    admittableAdmissions: 0,
+  };
+  if (!existsSync(path)) return empty;
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return {
+      counts: {
+        admissions: diagnosticRowCount(database, "admission_records"),
+        acceptances: diagnosticRowCount(
+          database,
+          "admission_addenda",
+          "kind = 'acceptance_commit'",
+        ),
+        grants: diagnosticRowCount(database, "grants"),
+        attempts: diagnosticRowCount(database, "execution_attempts"),
+        fences: diagnosticRowCount(database, "execution_fences"),
+        terminalEvents: diagnosticRowCount(
+          database,
+          "reservation_events",
+          "event_kind = 'terminal_verified'",
+        ),
+        actualFacts: diagnosticRowCount(
+          database,
+          "admission_addenda",
+          "kind = 'actual_consumption'",
+        ),
+      },
+      replanAdmissions: diagnosticRowCount(
+        database,
+        "admission_records",
+        "decision = 'REPLAN'",
+      ),
+      admittableAdmissions: diagnosticRowCount(
+        database,
+        "admission_records",
+        "decision = 'ADMITTABLE'",
+      ),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function readFactoryDiagnostic(
+  path: string,
+): Pick<LiveDiagnosticCounts, "mutations" | "receipts"> {
+  if (!existsSync(path)) return { mutations: 0, receipts: 0 };
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return {
+      mutations: diagnosticRowCount(database, "mutation_events"),
+      receipts: diagnosticRowCount(database, "execution_results"),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function diagnosticRowCount(
+  database: DatabaseSync,
+  table: string,
+  predicate?: string,
+): number {
+  const exists = database
+    .prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+    )
+    .get(table);
+  if (exists === undefined) return 0;
+  const where = predicate === undefined ? "" : ` WHERE ${predicate}`;
+  const row = database
+    .prepare(`SELECT COUNT(*) AS count FROM ${table}${where}`)
+    .get() as Record<string, unknown> | undefined;
+  return typeof row?.["count"] === "number" ? (row["count"] as number) : 0;
+}
+
+function symbolicDiagnosticTransitions(
+  m2: ReturnType<typeof readM2Diagnostic>,
+  factory: Pick<LiveDiagnosticCounts, "mutations" | "receipts">,
+): LiveDiagnosticPhase[] {
+  const transitions: LiveDiagnosticPhase[] = ["awaiting_initial_admission"];
+  if (m2.replanAdmissions > 0) transitions.push("awaiting_fresh_readmission");
+  if (m2.admittableAdmissions > 0) {
+    transitions.push("awaiting_promise_acceptance");
+  }
+  if (m2.counts.acceptances > 0) transitions.push("awaiting_approved_attempt");
+  if (m2.counts.attempts > 0) transitions.push("awaiting_factory_commit");
+  if (factory.receipts > 0) transitions.push("awaiting_independent_verification");
+  if (m2.counts.terminalEvents > 0) transitions.push("verified_complete");
+  return transitions;
+}
+
+function diagnosticIdentity(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function diagnosticActionType(value: unknown): string {
+  return typeof value === "string" &&
+    [
+      "select_portfolio_modification",
+      "accept_promise",
+      "create_schedule_reservation",
+      "submit_schedule_change",
+      "verify_schedule_execution",
+    ].includes(value)
+    ? value
+    : "unknown_tool";
+}
+
+function diagnosticActionKind(value: unknown): string {
+  return value === "owner_decision" ||
+    value === "consequential_effect" ||
+    value === "verification"
+    ? value
+    : "invalid";
+}
+
+function attachLiveFailureDiagnostic(
+  error: unknown,
+  diagnostic: LiveFailureDiagnostic,
+): LiveDiagnosticError {
+  const originalMessage =
+    error instanceof Error ? error.message : "Genuine live mission failed";
+  const attached = new Error(originalMessage, { cause: error }) as LiveDiagnosticError;
+  Object.defineProperties(attached, {
+    flakeBrakeLiveDiagnostic: { value: diagnostic, enumerable: true },
+    flakeBrakeOriginalMessage: { value: originalMessage },
+  });
+  refreshLiveDiagnosticError(attached);
+  return attached;
+}
+
+function refreshLiveDiagnosticError(error: LiveDiagnosticError): void {
+  error.message = `${error.flakeBrakeOriginalMessage}\n${LIVE_DIAGNOSTIC_MARKER}${canonicalSerialize(error.flakeBrakeLiveDiagnostic)}`;
+}
+
+function liveDiagnosticFromError(error: unknown): LiveFailureDiagnostic {
+  assert.ok(error instanceof Error);
+  const diagnostic = (error as Partial<LiveDiagnosticError>)
+    .flakeBrakeLiveDiagnostic;
+  assert.ok(diagnostic);
+  return diagnostic;
+}
+
+function seedDiagnosticEffectCounts(m2Path: string, factoryPath: string): void {
+  const m2 = new DatabaseSync(m2Path);
+  try {
+    for (let index = 1; index <= 4; index += 1) {
+      m2.prepare(
+        `INSERT INTO admission_records
+           (admission_record_id, created_at, decision,
+            proposal_obligation_id, body_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        `admission/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+        index === 1 ? "REPLAN" : "ADMITTABLE",
+        `obligation/diagnostic-${String(index)}`,
+        "{}",
+      );
+    }
+    for (let index = 1; index <= 2; index += 1) {
+      m2.prepare(
+        `INSERT INTO admission_addenda
+           (addendum_id, admission_record_id, created_at, kind, body_json)
+         VALUES (?, ?, ?, 'acceptance_commit', '{}')`,
+      ).run(
+        `addendum/diagnostic-acceptance-${String(index)}`,
+        "admission/diagnostic-2",
+        HERO_HORIZON_END,
+      );
+      m2.prepare(
+        `INSERT INTO grant_allowances
+           (grant_allowance_key, created_at, body_json)
+         VALUES (?, ?, '{}')`,
+      ).run(`allowance/diagnostic-${String(index)}`, HERO_HORIZON_END);
+      m2.prepare(
+        `INSERT INTO grants
+           (grant_id, grant_allowance_key, created_at, body_json)
+         VALUES (?, ?, ?, '{}')`,
+      ).run(
+        `grant/diagnostic-${String(index)}`,
+        `allowance/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+      );
+      m2.prepare(
+        `INSERT INTO execution_attempts
+           (execution_attempt_id, admission_record_id, created_at,
+            input_json, result_json)
+         VALUES (?, ?, ?, '{}', '{}')`,
+      ).run(
+        `attempt/diagnostic-${String(index)}`,
+        "admission/diagnostic-2",
+        HERO_HORIZON_END,
+      );
+      m2.prepare(
+        `INSERT INTO execution_fences
+           (fence_id, execution_attempt_id, created_at, body_json)
+         VALUES (?, ?, ?, '{}')`,
+      ).run(
+        `fence/diagnostic-${String(index)}`,
+        `attempt/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+      );
+      m2.prepare(
+        `INSERT INTO inflight_reservations
+           (reservation_id, execution_attempt_id, created_at, body_json)
+         VALUES (?, ?, ?, '{}')`,
+      ).run(
+        `reservation/diagnostic-${String(index)}`,
+        `attempt/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+      );
+      m2.prepare(
+        `INSERT INTO reservation_events
+           (reservation_event_id, reservation_id, created_at,
+            event_kind, body_json)
+         VALUES (?, ?, ?, 'terminal_verified', '{}')`,
+      ).run(
+        `reservation-event/diagnostic-${String(index)}`,
+        `reservation/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+      );
+    }
+    for (let index = 1; index <= 3; index += 1) {
+      m2.prepare(
+        `INSERT INTO admission_addenda
+           (addendum_id, admission_record_id, created_at, kind, body_json)
+         VALUES (?, ?, ?, 'actual_consumption', '{}')`,
+      ).run(
+        `addendum/diagnostic-actual-${String(index)}`,
+        "admission/diagnostic-2",
+        HERO_HORIZON_END,
+      );
+    }
+  } finally {
+    m2.close();
+  }
+
+  const factory = new DatabaseSync(factoryPath);
+  try {
+    for (let index = 1; index <= 2; index += 1) {
+      factory.prepare(
+        `INSERT INTO execution_results
+           (execution_attempt_id, fence_id, request_json,
+            result_json, receipt_id, created_at)
+         VALUES (?, ?, '{}', '{}', ?, ?)`,
+      ).run(
+        `attempt/diagnostic-${String(index)}`,
+        `fence/diagnostic-${String(index)}`,
+        `receipt/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+      );
+      factory.prepare(
+        `INSERT INTO mutation_events
+           (event_id, execution_attempt_id, created_at, body_json)
+         VALUES (?, ?, ?, '{}')`,
+      ).run(
+        `mutation/diagnostic-${String(index)}`,
+        `attempt/diagnostic-${String(index)}`,
+        HERO_HORIZON_END,
+      );
+    }
+  } finally {
+    factory.close();
+  }
+}
+
+function seedDiagnosticMissionActions(path: string, missionId: string): void {
+  const store = new M4MissionStore({ path, now: () => HERO_HORIZON_END });
+  try {
+    store.bindMission({
+      missionId,
+      environmentId: HERO_ENVIRONMENT_ID,
+      trueforgeAgentId: "agent/diagnostic-secret-bearing-identity",
+      trueforgeSessionId: "session/diagnostic-secret-bearing-identity",
+      m2EnvironmentIdentity: "m2/diagnostic-secret-bearing-identity",
+      factoryEnvironmentIdentity: "factory/diagnostic-secret-bearing-identity",
+    });
+    const owner = store.recordBridgeAction({
+      missionId,
+      trueforgeSessionId: "session/diagnostic-secret-bearing-identity",
+      trueforgeTurnId: "turn/diagnostic-owner",
+      trueforgeThreadId: "thread/diagnostic-owner",
+      trueforgeToolCallId: "call/diagnostic-owner",
+      actionKind: "owner_decision",
+      toolName: "select_portfolio_modification",
+      arguments: { opaque: "raw-owner-response-must-not-appear" },
+    });
+    store.recordBridgeOutcome(owner.bridgeKey, "approval_bound", {
+      toolName: "select_portfolio_modification",
+      toolCallId: "call/diagnostic-owner",
+      turnId: "turn/diagnostic-owner",
+      threadId: "thread/diagnostic-owner",
+      decision: "allow",
+      reason: "raw-owner-response-must-not-appear",
+      source: "owner",
+      ownerSourceIdentity: "owner/diagnostic-secret-bearing-identity",
+      bridgeKey: owner.bridgeKey,
+      denialId: null,
+      executionAttemptId: null,
+    });
+    const mechanical = store.recordBridgeAction({
+      missionId,
+      trueforgeSessionId: "session/diagnostic-secret-bearing-identity",
+      trueforgeTurnId: "turn/diagnostic-mechanical",
+      trueforgeThreadId: "thread/diagnostic-mechanical",
+      trueforgeToolCallId: "call/diagnostic-mechanical",
+      actionKind: "consequential_effect",
+      toolName: "submit_schedule_change",
+      arguments: { opaque: "raw-owner-response-must-not-appear" },
+    });
+    store.recordBridgeOutcome(mechanical.bridgeKey, "approval_bound", {
+      toolName: "submit_schedule_change",
+      toolCallId: "call/diagnostic-mechanical",
+      turnId: "turn/diagnostic-mechanical",
+      threadId: "thread/diagnostic-mechanical",
+      decision: "deny",
+      reason: "raw-owner-response-must-not-appear",
+      source: "active_m2_denial",
+      ownerSourceIdentity: null,
+      bridgeKey: mechanical.bridgeKey,
+      denialId: "denial/diagnostic-secret-bearing-identity",
+      executionAttemptId: null,
+    });
+  } finally {
+    store.close();
+  }
 }
 
 function missionSnapshot(path: string): string {
@@ -3121,6 +4511,38 @@ function activeServerHandles(): Server[] {
   return handles.filter((handle): handle is Server => handle instanceof Server);
 }
 
+function activeChildProcessHandles(): unknown[] {
+  const handles = (
+    process as unknown as { _getActiveHandles: () => readonly unknown[] }
+  )._getActiveHandles();
+  return handles.filter(
+    (handle) =>
+      typeof handle === "object" &&
+      handle !== null &&
+      (handle as { constructor?: { name?: string } }).constructor?.name ===
+        "ChildProcess",
+  );
+}
+
+function sqliteRowCount(
+  path: string,
+  table: string,
+  predicate?: string,
+): number {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const where = predicate === undefined ? "" : ` WHERE ${predicate}`;
+    const row = database
+      .prepare(`SELECT count(*) AS count FROM ${table}${where}`)
+      .get() as Record<string, unknown> | undefined;
+    assert.ok(row);
+    assert.equal(typeof row["count"], "number");
+    return row["count"] as number;
+  } finally {
+    database.close();
+  }
+}
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve());
@@ -3169,6 +4591,356 @@ function sandboxComputation(
     .find((candidate) => candidate.startsWith("{"));
   assert.ok(line, "sandbox result must contain its canonical computation");
   return JSON.parse(line) as Record<string, unknown>;
+}
+
+function liveValidationFixture(
+  result: DeterministicM4MissionResult,
+): LiveM4MissionResult {
+  return {
+    mission: result.mission,
+    model: "openai/gpt-5-4-mini",
+    sandboxProvider: "daytona",
+    connectorUrls: result.connectorUrls,
+    subagentThreads: result.subagentThreads,
+    sandboxIds: ["v1:daytona:fixture"],
+    controlledWriteCount: controlledWriteCount(result),
+    actualConsumptionFacts: result.actualConsumptionFacts,
+  };
+}
+
+function assertLiveInvariantFixture(
+  options: DeterministicM4MissionOptions,
+  fixture: LiveM4MissionResult,
+): void {
+  const store = createStore({ path: options.m2DatabasePath });
+  const factory = new SyntheticFactoryEnvironment({
+    path: options.factoryDatabasePath,
+    now: () => HERO_HORIZON_END,
+  });
+  try {
+    assertLiveApprovalInvariants(fixture, store, factory);
+  } finally {
+    factory.close();
+    store.close();
+  }
+}
+
+function assertLiveEvidenceFixture(
+  options: DeterministicM4MissionOptions,
+  fixture: LiveM4MissionResult,
+  profile?: LiveM4ValidationProfile,
+): void {
+  const store = createStore({ path: options.m2DatabasePath });
+  const factory = new SyntheticFactoryEnvironment({
+    path: options.factoryDatabasePath,
+    now: () => HERO_HORIZON_END,
+  });
+  try {
+    if (profile === undefined) {
+      assertLiveMissionEvidence(fixture, store, factory);
+    } else {
+      assertLiveMissionEvidence(fixture, store, factory, profile);
+    }
+  } finally {
+    factory.close();
+    store.close();
+  }
+}
+
+function withoutAssuranceSandboxCompletion(
+  fixture: LiveM4MissionResult,
+): LiveM4MissionResult {
+  const assurance = fixture.subagentThreads.find(
+    (thread) => thread.title === "Assurance and simulation engineer",
+  );
+  assert.ok(assurance);
+  return {
+    ...fixture,
+    mission: {
+      ...fixture.mission,
+      trueforgeEvents: fixture.mission.trueforgeEvents.filter((item) => {
+        if (item.event.threadId !== assurance.threadId) return true;
+        if (item.event.type === "thread.done") return false;
+        return !(
+          item.event.type === "model.message" &&
+          item.event.toolCalls?.some(
+            (toolCall) =>
+              toolCall.toolInfo.type === "truefoundry-system" &&
+              toolCall.toolInfo.name === "exec",
+          ) === true
+        );
+      }),
+    },
+    sandboxIds: [],
+  };
+}
+
+function safeShortcutLiveValidationFixture(
+  fixture: LiveM4MissionResult,
+): LiveM4MissionResult {
+  const ownerDenial = fixture.mission.approvals.find(
+    (approval) =>
+      approval.source === "owner" &&
+      approval.decision === "deny" &&
+      isFixtureConsequentialTool(approval.toolName),
+  );
+  const mechanical = fixture.mission.approvals.find(
+    (approval) => approval.source === "active_m2_denial",
+  );
+  assert.ok(ownerDenial?.ownerSourceIdentity);
+  assert.ok(mechanical);
+  const ownerOutcome = fixture.mission.missionSnapshot.bridgeOutcomes.find(
+    (outcome) =>
+      outcome.bridgeKey === ownerDenial.bridgeKey &&
+      outcome.status === "owner_decision_received",
+  );
+  assert.ok(ownerOutcome);
+  let shortcut = removeLiveFixtureApproval(fixture, ownerDenial.bridgeKey);
+  const shortcutDenial: M4ApprovalRecord = {
+    ...mechanical,
+    source: "owner",
+    ownerSourceIdentity: ownerDenial.ownerSourceIdentity,
+    reason: ownerDenial.reason,
+  };
+  shortcut = replaceLiveFixtureApproval(shortcut, shortcutDenial);
+  const action = shortcut.mission.missionSnapshot.bridgeActions.find(
+    (candidate) => candidate.bridgeKey === shortcutDenial.bridgeKey,
+  );
+  assert.ok(action);
+  const ownerResult = record(ownerOutcome.result, "owner outcome fixture");
+  const decision = record(ownerResult["decision"], "owner decision fixture");
+  const shortcutOwnerOutcome: M4BridgeOutcome = {
+    ...ownerOutcome,
+    bridgeEventId: `${ownerOutcome.bridgeEventId}/shortcut`,
+    bridgeKey: shortcutDenial.bridgeKey,
+    result: asFixtureJson({
+      ...ownerResult,
+      requestDigest: fixtureOwnerRequestDigest(
+        action,
+        shortcut.mission.missionSnapshot.mission,
+      ),
+      ownerSourceIdentity: shortcutDenial.ownerSourceIdentity,
+      decision: { ...decision, status: "deny" },
+    }),
+  };
+  return {
+    ...shortcut,
+    mission: {
+      ...shortcut.mission,
+      missionSnapshot: {
+        ...shortcut.mission.missionSnapshot,
+        bridgeOutcomes: [
+          ...shortcut.mission.missionSnapshot.bridgeOutcomes,
+          shortcutOwnerOutcome,
+        ],
+      },
+    },
+  };
+}
+
+function removeLiveFixtureApproval(
+  fixture: LiveM4MissionResult,
+  bridgeKey: string,
+): LiveM4MissionResult {
+  return {
+    ...fixture,
+    mission: {
+      ...fixture.mission,
+      approvals: fixture.mission.approvals.filter(
+        (approval) => approval.bridgeKey !== bridgeKey,
+      ),
+      missionSnapshot: {
+        ...fixture.mission.missionSnapshot,
+        bridgeActions: fixture.mission.missionSnapshot.bridgeActions.filter(
+          (action) => action.bridgeKey !== bridgeKey,
+        ),
+        bridgeOutcomes: fixture.mission.missionSnapshot.bridgeOutcomes.filter(
+          (outcome) => outcome.bridgeKey !== bridgeKey,
+        ),
+      },
+    },
+  };
+}
+
+function replaceLiveFixtureApproval(
+  fixture: LiveM4MissionResult,
+  replacement: M4ApprovalRecord,
+): LiveM4MissionResult {
+  const outcomes = fixture.mission.missionSnapshot.bridgeOutcomes.map(
+    (outcome): M4BridgeOutcome => {
+      if (outcome.bridgeKey !== replacement.bridgeKey) return outcome;
+      if (outcome.status === "approval_bound") {
+        return { ...outcome, result: asFixtureJson(replacement) };
+      }
+      if (outcome.status !== "owner_decision_received") return outcome;
+      const durable = record(outcome.result, "owner outcome fixture");
+      return {
+        ...outcome,
+        result: asFixtureJson({
+          ...durable,
+          decision:
+            replacement.decision === "allow"
+              ? { status: "allow" }
+              : { status: "deny", reason: replacement.reason },
+        }),
+      };
+    },
+  );
+  return {
+    ...fixture,
+    mission: {
+      ...fixture.mission,
+      approvals: fixture.mission.approvals.map((approval) =>
+        approval.bridgeKey === replacement.bridgeKey ? replacement : approval,
+      ),
+      missionSnapshot: {
+        ...fixture.mission.missionSnapshot,
+        bridgeOutcomes: outcomes,
+      },
+    },
+  };
+}
+
+function replaceOwnerOutcomeDigest(
+  fixture: LiveM4MissionResult,
+  bridgeKey: string,
+  requestDigest: string,
+): LiveM4MissionResult {
+  return {
+    ...fixture,
+    mission: {
+      ...fixture.mission,
+      missionSnapshot: {
+        ...fixture.mission.missionSnapshot,
+        bridgeOutcomes: fixture.mission.missionSnapshot.bridgeOutcomes.map(
+          (outcome): M4BridgeOutcome =>
+            outcome.bridgeKey === bridgeKey &&
+            outcome.status === "owner_decision_received"
+              ? {
+                  ...outcome,
+                  result: asFixtureJson({
+                    ...record(outcome.result, "owner outcome fixture"),
+                    requestDigest,
+                  }),
+                }
+              : outcome,
+        ),
+      },
+    },
+  };
+}
+
+function reauthorizeMechanicalDenial(
+  fixture: LiveM4MissionResult,
+  mechanical: M4ApprovalRecord,
+  ownerSourceIdentity: string,
+): LiveM4MissionResult {
+  const ownerDenial = fixture.mission.approvals.find(
+    (approval) =>
+      approval.source === "owner" && approval.decision === "deny",
+  );
+  assert.ok(ownerDenial);
+  const sourceOutcome = fixture.mission.missionSnapshot.bridgeOutcomes.find(
+    (outcome) =>
+      outcome.bridgeKey === ownerDenial.bridgeKey &&
+      outcome.status === "owner_decision_received",
+  );
+  assert.ok(sourceOutcome);
+  const replacement: M4ApprovalRecord = {
+    ...mechanical,
+    source: "owner",
+    ownerSourceIdentity,
+  };
+  const reauthorized = replaceLiveFixtureApproval(fixture, replacement);
+  const action = reauthorized.mission.missionSnapshot.bridgeActions.find(
+    (candidate) => candidate.bridgeKey === replacement.bridgeKey,
+  );
+  assert.ok(action);
+  const sourceResult = record(sourceOutcome.result, "owner outcome fixture");
+  const added: M4BridgeOutcome = {
+    ...sourceOutcome,
+    bridgeEventId: `${sourceOutcome.bridgeEventId}/reauthorized`,
+    bridgeKey: replacement.bridgeKey,
+    result: asFixtureJson({
+      ...sourceResult,
+      requestDigest: fixtureOwnerRequestDigest(
+        action,
+        reauthorized.mission.missionSnapshot.mission,
+      ),
+      ownerSourceIdentity,
+    }),
+  };
+  return {
+    ...reauthorized,
+    mission: {
+      ...reauthorized.mission,
+      missionSnapshot: {
+        ...reauthorized.mission.missionSnapshot,
+        bridgeOutcomes: [
+          ...reauthorized.mission.missionSnapshot.bridgeOutcomes,
+          added,
+        ],
+      },
+    },
+  };
+}
+
+function removeLiveFixtureOutcome(
+  fixture: LiveM4MissionResult,
+  bridgeEventId: string,
+): LiveM4MissionResult {
+  return {
+    ...fixture,
+    mission: {
+      ...fixture.mission,
+      missionSnapshot: {
+        ...fixture.mission.missionSnapshot,
+        bridgeOutcomes: fixture.mission.missionSnapshot.bridgeOutcomes.filter(
+          (outcome) => outcome.bridgeEventId !== bridgeEventId,
+        ),
+      },
+    },
+  };
+}
+
+function fixtureOwnerRequestDigest(
+  action: M4BridgeAction,
+  binding: M4MissionBinding,
+): string {
+  return fixtureDigest({
+    missionId: action.missionId,
+    trueforgeSessionId: action.trueforgeSessionId,
+    trueforgeTurnId: action.trueforgeTurnId,
+    trueforgeThreadId: action.trueforgeThreadId,
+    trueforgeToolCallId: action.trueforgeToolCallId,
+    toolName: action.toolName,
+    arguments: action.arguments,
+    m2DatabaseInstanceIdentity: binding.m2EnvironmentIdentity,
+    factoryDatabaseInstanceIdentity: binding.factoryEnvironmentIdentity,
+    phase:
+      action.toolName === "select_portfolio_modification"
+        ? "portfolio_modification"
+        : action.toolName === "accept_promise"
+          ? "promise_choice"
+          : "consequential_effect",
+  });
+}
+
+function fixtureDigest(value: unknown): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalSerialize(value))
+    .digest("hex")}`;
+}
+
+function isFixtureConsequentialTool(toolName: string): boolean {
+  return (
+    toolName === "create_schedule_reservation" ||
+    toolName === "submit_schedule_change"
+  );
+}
+
+function asFixtureJson(value: unknown): JsonValue {
+  return JSON.parse(canonicalSerialize(value)) as JsonValue;
 }
 
 function controlledWriteCount(result: DeterministicM4MissionResult): number {
