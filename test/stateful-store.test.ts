@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -508,6 +509,205 @@ function assertConcurrentCommitSurvivesInitializationFailure(
   } finally {
     peer?.close();
   }
+}
+
+const INITIALIZER_PROCESS_SOURCE = String.raw`
+  const send = (message, disconnect = false) => {
+    if (typeof process.send !== "function") {
+      throw new Error("initializer process has no IPC channel");
+    }
+    process.send(message, (error) => {
+      if (error) throw error;
+      if (disconnect) process.disconnect();
+    });
+  };
+  send({ kind: "ready" });
+  process.once("message", async (message) => {
+    if (message?.kind !== "start") return;
+    send({ kind: "attempting" });
+    let resource;
+    try {
+      if (message.storeKind === "m2") {
+        const { openSqlite } = await import(message.sqliteModuleUrl);
+        resource = openSqlite(message.path);
+        const row = resource.prepare(
+          "SELECT incarnation_id FROM database_incarnation WHERE singleton = 1",
+        ).get();
+        const identity = row.incarnation_id;
+        resource.close();
+        resource = undefined;
+        send({ kind: "complete", handleState: "closed", identity }, true);
+      } else if (message.storeKind === "factory") {
+        const { SyntheticFactoryEnvironment } = await import(message.factoryModuleUrl);
+        resource = new SyntheticFactoryEnvironment({ path: message.path });
+        const identity = resource.databaseInstanceIdentity();
+        resource.close();
+        resource = undefined;
+        send({ kind: "complete", handleState: "closed", identity }, true);
+      } else {
+        throw new Error("unsupported initializer store kind");
+      }
+    } catch (error) {
+      let cleanupError;
+      try {
+        resource?.close();
+      } catch (caught) {
+        cleanupError = caught;
+      }
+      send({
+        kind: "error",
+        cleanupFailed: cleanupError !== undefined,
+        message: String(error?.message ?? error),
+      }, true);
+    }
+  });
+`;
+
+function spawnInitializerProcess(): ChildProcess {
+  return spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", INITIALIZER_PROCESS_SOURCE],
+    {
+      env: { NODE_NO_WARNINGS: "1" },
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    },
+  );
+}
+
+function waitForChildMessage(
+  child: ChildProcess,
+  expectedKind: string,
+): Promise<Readonly<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      child.off("error", onError);
+      child.off("exit", onExit);
+      child.off("message", onMessage);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      cleanup();
+      reject(
+        new Error(
+          `initializer process exited before ${expectedKind}: ${String(code ?? signal)}`,
+        ),
+      );
+    };
+    const onMessage = (message: unknown): void => {
+      if (typeof message !== "object" || message === null) return;
+      const record = message as Readonly<Record<string, unknown>>;
+      if (record["kind"] === "error") {
+        cleanup();
+        reject(new Error(String(record["message"] ?? "initializer failed")));
+      }
+      if (record["kind"] === expectedKind) {
+        cleanup();
+        resolve(record);
+      }
+    };
+    child.on("error", onError);
+    child.on("exit", onExit);
+    child.on("message", onMessage);
+  });
+}
+
+function waitForChildExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null) {
+    return child.exitCode === 0
+      ? Promise.resolve()
+      : Promise.reject(
+          new Error(`initializer process exited with code ${child.exitCode}`),
+        );
+  }
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) resolve();
+      else {
+        reject(
+          new Error(
+            `initializer process exited unexpectedly: ${String(code ?? signal)}`,
+          ),
+        );
+      }
+    });
+  });
+}
+
+function sendChildMessage(
+  child: ChildProcess,
+  message: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!child.connected) {
+      reject(new Error("initializer process IPC channel is closed"));
+      return;
+    }
+    child.send(message, (error) => {
+      if (error === null) resolve();
+      else reject(error);
+    });
+  });
+}
+
+async function stopInitializerProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+  });
+  child.kill();
+  await exited;
+}
+
+function waitForWorkerMessage(
+  worker: Worker,
+  expectedKind: string,
+): Promise<Readonly<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+      worker.off("message", onMessage);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number): void => {
+      cleanup();
+      reject(
+        new Error(`initializer worker exited before ${expectedKind}: ${code}`),
+      );
+    };
+    const onMessage = (message: unknown): void => {
+      if (typeof message !== "object" || message === null) return;
+      const record = message as Readonly<Record<string, unknown>>;
+      if (record["kind"] === "error") {
+        cleanup();
+        reject(new Error(String(record["message"] ?? "initializer failed")));
+      }
+      if (record["kind"] === expectedKind) {
+        cleanup();
+        resolve(record);
+      }
+    };
+    worker.on("error", onError);
+    worker.on("exit", onExit);
+    worker.on("message", onMessage);
+  });
+}
+
+function waitForWorkerExit(worker: Worker): Promise<void> {
+  return new Promise((resolve, reject) => {
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`initializer worker exited with code ${code}`));
+    });
+  });
 }
 
 function demand(values: DemandValues): ResourceDemand {
@@ -3139,14 +3339,20 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       Atomics.wait(new Int32Array(workerData.barrier), 0, 0);
       import(workerData.moduleUrl).then(({ openSqlite }) => {
         const database = openSqlite(workerData.path);
+        let incarnationId;
         try {
           const row = database.prepare(
             "SELECT incarnation_id FROM database_incarnation WHERE singleton = 1",
           ).get();
-          parentPort.postMessage({ kind: "result", incarnationId: row.incarnation_id });
+          incarnationId = row.incarnation_id;
         } finally {
           database.close();
         }
+        parentPort.postMessage({
+          kind: "result",
+          handleState: "closed",
+          incarnationId,
+        });
       }).catch((error) => {
         parentPort.postMessage({ kind: "error", message: String(error?.stack ?? error) });
       });
@@ -3183,7 +3389,7 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       await Promise.all(ready);
       const resultPromises = workers.map(
           (worker) =>
-            new Promise<string>((resolve, reject) => {
+            new Promise<{ readonly handleState: string; readonly incarnationId: string }>((resolve, reject) => {
               worker.once("error", reject);
               worker.on("message", (message: unknown) => {
                 if (
@@ -3203,9 +3409,13 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
                   );
                 } else if (
                   message.kind === "result" &&
+                  "handleState" in message &&
                   "incarnationId" in message
                 ) {
-                  resolve(String(message.incarnationId));
+                  resolve({
+                    handleState: String(message.handleState),
+                    incarnationId: String(message.incarnationId),
+                  });
                 }
               });
             }),
@@ -3213,7 +3423,11 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       Atomics.store(new Int32Array(barrier), 0, 1);
       Atomics.notify(new Int32Array(barrier), 0, workers.length);
       const results = await Promise.all(resultPromises);
-      assert.equal(results[0], results[1]);
+      assert.equal(results[0]?.incarnationId, results[1]?.incarnationId);
+      assert.deepEqual(
+        results.map((result) => result.handleState),
+        ["closed", "closed"],
+      );
       const database = new DatabaseSync(path, { readOnly: true });
       try {
         assert.equal(
@@ -3290,6 +3504,348 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       assert.equal(sqliteDurableSnapshot(item.path).journalMode, "wal");
     } finally {
       rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("R7.8 SQLite worker lock lifecycle", () => {
+  test("ready long-lived M2 and factory handles permit independent reads", async () => {
+    const workerSource = String.raw`
+      const { parentPort, workerData } = require("node:worker_threads");
+      let resource;
+      parentPort.postMessage({ kind: "ready" });
+      Atomics.wait(new Int32Array(workerData.startBarrier), 0, 0);
+      (async () => {
+        if (workerData.storeKind === "m2") {
+          const { openSqlite } = await import(workerData.sqliteModuleUrl);
+          resource = openSqlite(workerData.path);
+        } else {
+          const { SyntheticFactoryEnvironment } = await import(
+            workerData.factoryModuleUrl
+          );
+          resource = new SyntheticFactoryEnvironment({ path: workerData.path });
+        }
+        parentPort.postMessage({ kind: "opened", handleState: "open" });
+        Atomics.wait(new Int32Array(workerData.closeBarrier), 0, 0);
+        resource.close();
+        resource = undefined;
+        parentPort.postMessage({ kind: "closed", handleState: "closed" });
+      })().catch((error) => {
+        try { resource?.close(); } catch {}
+        parentPort.postMessage({
+          kind: "error",
+          message: String(error?.message ?? error),
+        });
+      });
+    `;
+    const sqliteModuleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const factoryModuleUrl = new URL(
+      "../src/factory-environment.js",
+      import.meta.url,
+    ).href;
+
+    for (const storeKind of ["m2", "factory"] as const) {
+      const directory = mkdtempSync(
+        join(tmpdir(), `flakebrake-r78-open-${storeKind}-`),
+      );
+      const path = join(directory, `${storeKind}.sqlite`);
+      const startBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const closeBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const worker = new Worker(workerSource, {
+        eval: true,
+        workerData: {
+          closeBarrier,
+          factoryModuleUrl,
+          path,
+          sqliteModuleUrl,
+          startBarrier,
+          storeKind,
+        },
+      });
+      try {
+        await waitForWorkerMessage(worker, "ready");
+        const openedPromise = waitForWorkerMessage(worker, "opened");
+        Atomics.store(new Int32Array(startBarrier), 0, 1);
+        Atomics.notify(new Int32Array(startBarrier), 0, 1);
+        const opened = await openedPromise;
+        assert.equal(opened["handleState"], "open");
+
+        const reader = new DatabaseSync(path, { readOnly: true });
+        try {
+          assert.equal(
+            Number(
+              (
+                reader
+                  .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                  .get() as Record<string, unknown>
+              )["count"],
+            ),
+            1,
+          );
+          assert.equal(
+            (reader.prepare("PRAGMA quick_check").get() as Record<
+              string,
+              unknown
+            >)["quick_check"],
+            "ok",
+          );
+        } finally {
+          reader.close();
+        }
+
+        const closedPromise = waitForWorkerMessage(worker, "closed");
+        const exitPromise = waitForWorkerExit(worker);
+        Atomics.store(new Int32Array(closeBarrier), 0, 1);
+        Atomics.notify(new Int32Array(closeBarrier), 0, 1);
+        const closed = await closedPromise;
+        assert.equal(closed["handleState"], "closed");
+        await exitPromise;
+      } finally {
+        await worker.terminate();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("worker initialization failures acknowledge only after cleanup", async () => {
+    const workerSource = String.raw`
+      const { DatabaseSync } = require("node:sqlite");
+      const { parentPort, workerData } = require("node:worker_threads");
+      const originalExec = DatabaseSync.prototype.exec;
+      let injected = false;
+      DatabaseSync.prototype.exec = function (sql) {
+        originalExec.call(this, sql);
+        if (!injected && sql.includes(workerData.failureMarker)) {
+          injected = true;
+          throw new Error("planned initializer worker failure");
+        }
+      };
+      parentPort.postMessage({ kind: "ready" });
+      Atomics.wait(new Int32Array(workerData.startBarrier), 0, 0);
+      (async () => {
+        try {
+          if (workerData.storeKind === "m2") {
+            const { openSqlite } = await import(workerData.sqliteModuleUrl);
+            openSqlite(workerData.path);
+          } else {
+            const { SyntheticFactoryEnvironment } = await import(
+              workerData.factoryModuleUrl
+            );
+            new SyntheticFactoryEnvironment({ path: workerData.path });
+          }
+          throw new Error("initializer failure was not injected");
+        } catch (error) {
+          DatabaseSync.prototype.exec = originalExec;
+          parentPort.postMessage({
+            kind: "failure-cleaned",
+            handleState: "closed",
+            injected,
+            planned: String(error?.message ?? error).includes(
+              "planned initializer worker failure"
+            ),
+          });
+        }
+      })().catch((error) => {
+        DatabaseSync.prototype.exec = originalExec;
+        parentPort.postMessage({
+          kind: "error",
+          message: String(error?.message ?? error),
+        });
+      });
+    `;
+    const sqliteModuleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const factoryModuleUrl = new URL(
+      "../src/factory-environment.js",
+      import.meta.url,
+    ).href;
+
+    for (const fixture of [
+      {
+        construct: (path: string) =>
+          createStore({ path, initialState: initialState() }),
+        failureMarker: "admission_records_immutable_update",
+        storeKind: "m2",
+      },
+      {
+        construct: (path: string) => new SyntheticFactoryEnvironment({ path }),
+        failureMarker: "incoming_proposals_no_update",
+        storeKind: "factory",
+      },
+    ] as const) {
+      const directory = mkdtempSync(
+        join(tmpdir(), `flakebrake-r78-error-${fixture.storeKind}-`),
+      );
+      const path = join(directory, `${fixture.storeKind}.sqlite`);
+      const startBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const worker = new Worker(workerSource, {
+        eval: true,
+        workerData: {
+          factoryModuleUrl,
+          failureMarker: fixture.failureMarker,
+          path,
+          sqliteModuleUrl,
+          startBarrier,
+          storeKind: fixture.storeKind,
+        },
+      });
+      try {
+        await waitForWorkerMessage(worker, "ready");
+        const cleanedPromise = waitForWorkerMessage(
+          worker,
+          "failure-cleaned",
+        );
+        const exitPromise = waitForWorkerExit(worker);
+        Atomics.store(new Int32Array(startBarrier), 0, 1);
+        Atomics.notify(new Int32Array(startBarrier), 0, 1);
+        const cleaned = await cleanedPromise;
+        assert.equal(cleaned["handleState"], "closed");
+        assert.equal(cleaned["injected"], true);
+        assert.equal(cleaned["planned"], true);
+        for (const artifact of [
+          path,
+          `${path}-wal`,
+          `${path}-shm`,
+          `${path}-journal`,
+        ]) {
+          assert.equal(existsSync(artifact), false, artifact);
+        }
+
+        const restarted = fixture.construct(path);
+        restarted.close();
+        const reader = new DatabaseSync(path, { readOnly: true });
+        try {
+          assert.equal(
+            (reader.prepare("PRAGMA quick_check").get() as Record<
+              string,
+              unknown
+            >)["quick_check"],
+            "ok",
+          );
+        } finally {
+          reader.close();
+        }
+        await exitPromise;
+      } finally {
+        await worker.terminate();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("independent initializer processes close before completion under repeated contention", async () => {
+    assert.equal(/setTimeout|sleep/iu.test(INITIALIZER_PROCESS_SOURCE), false);
+    const sqliteModuleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const factoryModuleUrl = new URL(
+      "../src/factory-environment.js",
+      import.meta.url,
+    ).href;
+    const processCount = 4;
+    const rounds = 4;
+
+    for (const fixture of [
+      {
+        create: (path: string) =>
+          createStore({ path, initialState: initialState() }),
+        storeKind: "m2",
+      },
+      {
+        create: (path: string) => new SyntheticFactoryEnvironment({ path }),
+        storeKind: "factory",
+      },
+    ] as const) {
+      const directory = mkdtempSync(
+        join(tmpdir(), `flakebrake-r78-process-${fixture.storeKind}-`),
+      );
+      const path = join(directory, `${fixture.storeKind}.sqlite`);
+      const initial = fixture.create(path);
+      initial.close();
+      const before = sqliteDurableSnapshot(path);
+      const identities = new Set<string>();
+      try {
+        for (let round = 0; round < rounds; round += 1) {
+          const blocker = new DatabaseSync(path);
+          blocker.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+          const children = Array.from(
+            { length: processCount },
+            spawnInitializerProcess,
+          );
+          try {
+            await Promise.all(
+              children.map((child) => waitForChildMessage(child, "ready")),
+            );
+            const attempting = children.map((child) =>
+              waitForChildMessage(child, "attempting"),
+            );
+            const completed = children.map((child) =>
+              waitForChildMessage(child, "complete"),
+            );
+            const exited = children.map(waitForChildExit);
+            await Promise.all(
+              children.map((child) =>
+                sendChildMessage(child, {
+                  factoryModuleUrl,
+                  kind: "start",
+                  path,
+                  sqliteModuleUrl,
+                  storeKind: fixture.storeKind,
+                }),
+              ),
+            );
+            await Promise.all(attempting);
+            blocker.exec("COMMIT");
+            blocker.close();
+
+            const results = await Promise.all(completed);
+            for (const result of results) {
+              assert.equal(result["handleState"], "closed");
+              identities.add(String(result["identity"]));
+            }
+            const reader = new DatabaseSync(path, { readOnly: true });
+            try {
+              assert.equal(
+                Number(
+                  (
+                    reader
+                      .prepare(
+                        "SELECT COUNT(*) AS count FROM database_incarnation",
+                      )
+                      .get() as Record<string, unknown>
+                  )["count"],
+                ),
+                1,
+              );
+              assert.equal(
+                (reader.prepare("PRAGMA quick_check").get() as Record<
+                  string,
+                  unknown
+                >)["quick_check"],
+                "ok",
+              );
+            } finally {
+              reader.close();
+            }
+            await Promise.all(exited);
+          } finally {
+            if (blocker.isOpen) {
+              if (blocker.isTransaction) blocker.exec("ROLLBACK");
+              blocker.close();
+            }
+            await Promise.all(children.map(stopInitializerProcess));
+          }
+        }
+        assert.equal(identities.size, 1);
+        const after = sqliteDurableSnapshot(path);
+        assert.deepEqual(after.schema, before.schema);
+        assert.deepEqual(after.columns, before.columns);
+        assert.deepEqual(after.foreignKeys, before.foreignKeys);
+        assert.deepEqual(after.indexes, before.indexes);
+        assert.deepEqual(after.metadata, before.metadata);
+        assert.deepEqual(after.rows, before.rows);
+        assert.deepEqual(after.triggers, before.triggers);
+        assert.equal(after.journalMode, "wal");
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
     }
   });
 });
