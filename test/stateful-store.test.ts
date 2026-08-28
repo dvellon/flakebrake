@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -64,6 +70,141 @@ interface TempStore {
   readonly directory: string;
   readonly path: string;
   readonly store: FlakeBrakeStore;
+}
+
+interface SqliteDurableSnapshot {
+  readonly artifacts: Readonly<Record<string, string>>;
+  readonly journalMode: string | null;
+  readonly metadata: readonly Readonly<Record<string, unknown>>[];
+  readonly rows: Readonly<Record<string, readonly string[]>>;
+  readonly schema: readonly Readonly<Record<string, unknown>>[];
+  readonly tables: readonly string[];
+}
+
+function sqliteDurableSnapshot(path: string): SqliteDurableSnapshot {
+  let journalMode: string | null = null;
+  let metadata: readonly Readonly<Record<string, unknown>>[] = [];
+  let rows: Readonly<Record<string, readonly string[]>> = {};
+  let schema: readonly Readonly<Record<string, unknown>>[] = [];
+  let tables: readonly string[] = [];
+  if (existsSync(path)) {
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+      journalMode = String(
+        (
+          database.prepare("PRAGMA journal_mode").get() as
+            | Record<string, unknown>
+            | undefined
+        )?.["journal_mode"] ?? "",
+      );
+      schema = (
+        database
+          .prepare(
+            `SELECT type, name, tbl_name, sql
+               FROM sqlite_master
+              WHERE name NOT LIKE 'sqlite_%'
+              ORDER BY type, name`,
+          )
+          .all() as Record<string, unknown>[]
+      ).map(sortRecord);
+      tables = schema
+        .filter((entry) => entry["type"] === "table")
+        .map((entry) => String(entry["name"]));
+      rows = Object.fromEntries(
+        tables.map((table) => [
+          table,
+          (
+            database
+              .prepare(`SELECT * FROM "${table.replaceAll('"', '""')}"`)
+              .all() as Record<string, unknown>[]
+          )
+            .map((row) => JSON.stringify(sortRecord(row)))
+            .sort(),
+        ]),
+      );
+      metadata = ["database_incarnation", "factory_metadata", "state_versions"]
+        .filter((table) => tables.includes(table))
+        .flatMap((table) =>
+          (
+            database
+              .prepare(`SELECT * FROM "${table}"`)
+              .all() as Record<string, unknown>[]
+          ).map((row) => sortRecord({ table, ...row })),
+        );
+    } finally {
+      database.close();
+    }
+  }
+  const artifacts = Object.fromEntries(
+    [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]
+      .filter((artifactPath) => existsSync(artifactPath))
+      .map((artifactPath) => [
+        artifactPath.slice(path.length) || "main",
+        createHash("sha256").update(readFileSync(artifactPath)).digest("hex"),
+      ]),
+  );
+  return { artifacts, journalMode, metadata, rows, schema, tables };
+}
+
+function sortRecord(
+  record: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return Object.fromEntries(
+    Object.entries(record).sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function removeDatabaseIncarnation(path: string): void {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`
+      DROP TRIGGER database_incarnation_immutable_update;
+      DROP TRIGGER database_incarnation_immutable_delete;
+      DROP TABLE database_incarnation;
+    `);
+  } finally {
+    database.close();
+  }
+}
+
+function copyApplicationSchema(sourcePath: string, targetPath: string): void {
+  const source = new DatabaseSync(sourcePath, { readOnly: true });
+  const target = new DatabaseSync(targetPath);
+  try {
+    const definitions = source
+      .prepare(
+        `SELECT type, name, sql
+           FROM sqlite_master
+          WHERE sql IS NOT NULL
+            AND name NOT LIKE 'sqlite_%'
+            AND name NOT IN (
+              'database_incarnation',
+              'database_incarnation_immutable_update',
+              'database_incarnation_immutable_delete'
+            )
+          ORDER BY CASE type
+                     WHEN 'table' THEN 1
+                     WHEN 'index' THEN 2
+                     WHEN 'trigger' THEN 3
+                     ELSE 4
+                   END,
+                   name`,
+      )
+      .all() as Record<string, unknown>[];
+    target.exec("BEGIN IMMEDIATE");
+    try {
+      for (const definition of definitions) {
+        target.exec(String(definition["sql"]));
+      }
+      target.exec("COMMIT");
+    } catch (error: unknown) {
+      target.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    target.close();
+    source.close();
+  }
 }
 
 function demand(values: DemandValues): ResourceDemand {
@@ -1424,6 +1565,349 @@ describe("Qodo Round 4 SQLite memory-store compatibility", () => {
     } finally {
       DatabaseSync.prototype.exec = originalExec;
       DatabaseSync.prototype.close = originalClose;
+    }
+  });
+});
+
+describe("Qodo Round 5 failure-atomic SQLite store initialization", () => {
+  test("Qodo R5.1 rejects an M2 database opened as factory without durable contamination", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-m2-as-factory-"));
+    const path = join(directory, "m2.sqlite");
+    const store = createStore({ path, initialState: initialState() });
+    store.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => new SyntheticFactoryEnvironment({ path }),
+        /m2.*factory|factory.*m2|store kind/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.2 rejects a factory database opened as M2 without durable contamination", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-factory-as-m2-"));
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => createStore({ path }),
+        /factory.*m2|m2.*factory|store kind/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.3 reopens a current M2 store idempotently", () => {
+    const item = tempStore();
+    item.store.close();
+    try {
+      const before = sqliteDurableSnapshot(item.path);
+      const restarted = createStore({ path: item.path });
+      assert.equal(restarted.getPortfolio().acceptedObligations.length, 1);
+      restarted.close();
+      assert.deepEqual(sqliteDurableSnapshot(item.path), before);
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.4 reopens a current factory store idempotently", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-current-factory-"));
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      const restarted = new SyntheticFactoryEnvironment({ path });
+      assert.equal(restarted.getIncomingProposals().length, 1);
+      restarted.close();
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.5 creates a complete M2 schema from an empty database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-empty-m2-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    try {
+      const store = createStore({ path, initialState: initialState() });
+      store.close();
+      const snapshot = sqliteDurableSnapshot(path);
+      assert.ok(snapshot.tables.includes("state_versions"));
+      assert.deepEqual(snapshot.rows["database_incarnation"]?.length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.6 creates a complete factory schema from an empty database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-empty-factory-"));
+    const path = join(directory, "factory.sqlite");
+    new DatabaseSync(path).close();
+    try {
+      const factory = new SyntheticFactoryEnvironment({ path });
+      factory.close();
+      const snapshot = sqliteDurableSnapshot(path);
+      assert.ok(snapshot.tables.includes("factory_metadata"));
+      assert.deepEqual(snapshot.rows["database_incarnation"]?.length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.7 migrates a recognized legacy M2 schema without rewriting ledger rows", () => {
+    const item = tempStore();
+    item.store.close();
+    removeDatabaseIncarnation(item.path);
+    try {
+      const legacy = sqliteDurableSnapshot(item.path);
+      const ledgerRows = legacy.rows;
+      const restarted = createStore({ path: item.path });
+      restarted.close();
+      const migrated = sqliteDurableSnapshot(item.path);
+      assert.equal(migrated.rows["database_incarnation"]?.length, 1);
+      for (const [table, rows] of Object.entries(ledgerRows)) {
+        assert.deepEqual(migrated.rows[table], rows, table);
+      }
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.8 migrates a recognized legacy factory schema without rewriting application rows", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-legacy-factory-"));
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    removeDatabaseIncarnation(path);
+    try {
+      const legacy = sqliteDurableSnapshot(path);
+      const restarted = new SyntheticFactoryEnvironment({ path });
+      restarted.close();
+      const migrated = sqliteDurableSnapshot(path);
+      assert.equal(migrated.rows["database_incarnation"]?.length, 1);
+      for (const [table, rows] of Object.entries(legacy.rows)) {
+        assert.deepEqual(migrated.rows[table], rows, table);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.9 rejects an ambiguous mixed schema without mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-ambiguous-"));
+    const m2Path = join(directory, "mixed.sqlite");
+    const factoryPath = join(directory, "factory-source.sqlite");
+    const store = createStore({ path: m2Path, initialState: initialState() });
+    store.close();
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    copyApplicationSchema(factoryPath, m2Path);
+    try {
+      const before = sqliteDurableSnapshot(m2Path);
+      assert.throws(
+        () => {
+          const opened = createStore({ path: m2Path });
+          opened.close();
+        },
+        /ambiguous|cross-contaminated/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(m2Path), before);
+      assert.throws(
+        () => {
+          const opened = new SyntheticFactoryEnvironment({ path: m2Path });
+          opened.close();
+        },
+        /ambiguous|cross-contaminated/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(m2Path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.10 rejects a foreign SQLite database without mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-foreign-"));
+    const path = join(directory, "foreign.sqlite");
+    const database = new DatabaseSync(path);
+    database.exec("CREATE TABLE foreign_records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    database.prepare("INSERT INTO foreign_records (id, value) VALUES (1, 'foreign')").run();
+    database.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => {
+          const opened = createStore({ path, initialState: initialState() });
+          opened.close();
+        },
+        /foreign/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+      assert.throws(
+        () => {
+          const opened = new SyntheticFactoryEnvironment({ path });
+          opened.close();
+        },
+        /foreign/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.11 rejects a corrupt partial known schema without mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-partial-"));
+    const path = join(directory, "partial.sqlite");
+    const database = new DatabaseSync(path);
+    database.exec(`
+      CREATE TABLE state_versions (
+        singleton INTEGER PRIMARY KEY,
+        portfolio_version INTEGER NOT NULL,
+        capacity_model_version INTEGER NOT NULL,
+        capacity_plan_version INTEGER NOT NULL,
+        authorization_state_version INTEGER NOT NULL
+      ) STRICT
+    `);
+    database.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => {
+          const opened = createStore({ path, initialState: initialState() });
+          opened.close();
+        },
+        /corrupt|partial/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.12 rolls back partial M2 schema initialization and closes the handle", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-failed-m2-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned partial M2 schema initialization failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let closeCount = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (sql.includes("admission_records_immutable_update")) throw primary;
+    };
+    DatabaseSync.prototype.close = function (): void {
+      closeCount += 1;
+      originalClose.call(this);
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(closeCount, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.13 rolls back partial factory schema initialization and closes the handle", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-failed-factory-"));
+    const path = join(directory, "factory.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned partial factory schema initialization failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let closeCount = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (sql.includes("mutation_events_no_delete")) throw primary;
+    };
+    DatabaseSync.prototype.close = function (): void {
+      closeCount += 1;
+      originalClose.call(this);
+    };
+    try {
+      assert.throws(
+        () => new SyntheticFactoryEnvironment({ path }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(closeCount, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.14 keeps M2 and factory in-memory initialization supported", () => {
+    const store = createStore({ path: ":memory:", initialState: initialState() });
+    const factory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+    try {
+      assert.equal(store.getPortfolio().acceptedObligations.length, 1);
+      assert.equal(factory.getIncomingProposals().length, 1);
+      assert.notEqual(
+        store.databaseInstanceIdentity("factory-1"),
+        factory.databaseInstanceIdentity(),
+      );
+    } finally {
+      factory.close();
+      store.close();
+    }
+  });
+
+  test("Qodo R5.15 preserves the primary partial-initialization error when cleanup rejects", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-cleanup-error-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned primary Round 5 initialization failure");
+    const cleanup = new Error("planned Round 5 cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (sql.includes("admission_records_immutable_update")) throw primary;
+    };
+    DatabaseSync.prototype.close = function (): void {
+      originalClose.call(this);
+      throw cleanup;
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

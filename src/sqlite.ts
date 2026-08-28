@@ -8,8 +8,240 @@ import { canonicalSerialize } from "./canonical.js";
 export type SqliteDatabase = DatabaseSync;
 export type DatabaseInstanceKind = "m2" | "factory";
 
+type DatabaseClassification =
+  | "empty/new"
+  | "current m2"
+  | "current factory"
+  | "recognizable legacy m2"
+  | "recognizable legacy factory"
+  | "foreign"
+  | "ambiguous/cross-contaminated"
+  | "corrupt/partial";
+
+interface TableSignature {
+  readonly name: string;
+  readonly columns: readonly string[];
+}
+
 const SQLITE_MEMORY_PATH = ":memory:";
 const SQLITE_MEMORY_IDENTITY_PATH = "sqlite-memory/current-connection";
+
+/** Exact pre-incarnation M2 table/column signature supplied by reviewed M2. */
+const M2_LEGACY_SIGNATURE: readonly TableSignature[] = [
+  {
+    name: "state_versions",
+    columns: [
+      "singleton",
+      "portfolio_version",
+      "capacity_model_version",
+      "capacity_plan_version",
+      "authorization_state_version",
+    ],
+  },
+  {
+    name: "state_config",
+    columns: [
+      "singleton",
+      "assumptions_json",
+      "combined_decision_proofs_json",
+    ],
+  },
+  {
+    name: "portfolio_obligations",
+    columns: ["obligation_id", "body_json"],
+  },
+  {
+    name: "capacity_resources",
+    columns: ["resource_key", "model_json", "plan_json"],
+  },
+  {
+    name: "admission_records",
+    columns: [
+      "admission_record_id",
+      "created_at",
+      "decision",
+      "proposal_obligation_id",
+      "body_json",
+    ],
+  },
+  {
+    name: "admission_addenda",
+    columns: [
+      "sequence",
+      "addendum_id",
+      "admission_record_id",
+      "created_at",
+      "kind",
+      "body_json",
+    ],
+  },
+  {
+    name: "owner_decisions",
+    columns: ["owner_decision_id", "created_at", "body_json"],
+  },
+  {
+    name: "grant_allowances",
+    columns: ["grant_allowance_key", "created_at", "body_json"],
+  },
+  {
+    name: "grants",
+    columns: ["grant_id", "grant_allowance_key", "created_at", "body_json"],
+  },
+  {
+    name: "authorization_events",
+    columns: [
+      "sequence",
+      "authorization_event_id",
+      "subject_kind",
+      "subject_id",
+      "event_kind",
+      "created_at",
+      "body_json",
+    ],
+  },
+  {
+    name: "denials",
+    columns: ["denial_id", "created_at", "body_json"],
+  },
+  {
+    name: "denial_exceptions",
+    columns: [
+      "denial_exception_id",
+      "parent_denial_id",
+      "grant_allowance_key",
+      "created_at",
+      "body_json",
+    ],
+  },
+  {
+    name: "execution_attempts",
+    columns: [
+      "execution_attempt_id",
+      "admission_record_id",
+      "created_at",
+      "input_json",
+      "result_json",
+    ],
+  },
+  {
+    name: "allowance_claims",
+    columns: [
+      "grant_allowance_key",
+      "ordinal",
+      "execution_attempt_id",
+      "created_at",
+    ],
+  },
+  {
+    name: "inflight_reservations",
+    columns: [
+      "reservation_id",
+      "execution_attempt_id",
+      "created_at",
+      "body_json",
+    ],
+  },
+  {
+    name: "reservation_events",
+    columns: [
+      "sequence",
+      "reservation_event_id",
+      "reservation_id",
+      "created_at",
+      "event_kind",
+      "body_json",
+    ],
+  },
+  {
+    name: "execution_fences",
+    columns: [
+      "fence_id",
+      "execution_attempt_id",
+      "created_at",
+      "body_json",
+    ],
+  },
+  {
+    name: "execution_fence_events",
+    columns: [
+      "sequence",
+      "fence_event_id",
+      "fence_id",
+      "created_at",
+      "event_kind",
+      "body_json",
+    ],
+  },
+  {
+    name: "realized_effects",
+    columns: [
+      "realized_effect_id",
+      "execution_attempt_id",
+      "created_at",
+      "body_json",
+    ],
+  },
+  {
+    name: "realized_consumption_facts",
+    columns: [
+      "realized_consumption_id",
+      "execution_attempt_id",
+      "created_at",
+      "body_json",
+    ],
+  },
+];
+
+/** Exact pre-incarnation factory table/column signature supplied by M4. */
+const FACTORY_LEGACY_SIGNATURE: readonly TableSignature[] = [
+  {
+    name: "factory_metadata",
+    columns: ["singleton", "schema_version", "environment_id", "state_version"],
+  },
+  {
+    name: "incoming_proposals",
+    columns: ["proposal_id", "body_json"],
+  },
+  {
+    name: "schedule_reservations",
+    columns: [
+      "reservation_id",
+      "order_id",
+      "production_cell_id",
+      "start_at",
+      "end_at",
+      "quantity",
+      "status",
+      "source_execution_attempt_id",
+      "body_json",
+    ],
+  },
+  {
+    name: "execution_results",
+    columns: [
+      "execution_attempt_id",
+      "fence_id",
+      "request_json",
+      "result_json",
+      "receipt_id",
+      "created_at",
+    ],
+  },
+  {
+    name: "mutation_events",
+    columns: ["event_id", "execution_attempt_id", "created_at", "body_json"],
+  },
+];
+
+const INCARNATION_COLUMNS = [
+  "singleton",
+  "store_kind",
+  "incarnation_id",
+] as const;
+const INCARNATION_TRIGGER_NAMES = [
+  "database_incarnation_immutable_update",
+  "database_incarnation_immutable_delete",
+] as const;
 
 const IMMUTABLE_TABLES = [
   "admission_records",
@@ -33,17 +265,42 @@ const IMMUTABLE_TABLES = [
 export function openSqlite(path: string): SqliteDatabase {
   const database = new DatabaseSync(path);
   try {
-    database.exec("PRAGMA foreign_keys = ON");
-    database.exec("PRAGMA busy_timeout = 5000");
-    if (!isSqliteMemoryPath(path)) database.exec("PRAGMA journal_mode = WAL");
-    database.exec("PRAGMA synchronous = FULL");
-    initializeSchema(database);
-    ensureDatabaseIncarnation(database, "m2");
+    initializeSqliteStore(database, path, "m2", initializeSchema);
     return database;
   } catch (error: unknown) {
     closeSqliteAfterInitializationFailure(database, error);
     throw error;
   }
+}
+
+/**
+ * Classify read-only first, then initialize or migrate atomically through the
+ * same owned handle. Wrong-kind and unrecognized databases are rejected before
+ * any persistent PRAGMA or schema statement can run.
+ */
+export function initializeSqliteStore(
+  database: SqliteDatabase,
+  path: string,
+  kind: DatabaseInstanceKind,
+  initializeApplicationSchema: (database: SqliteDatabase) => void,
+): string {
+  const classification = classifySqliteDatabase(database);
+  assertCompatibleDatabaseClassification(classification, kind);
+
+  database.exec("PRAGMA foreign_keys = ON");
+  database.exec("PRAGMA busy_timeout = 5000");
+  database.exec("PRAGMA synchronous = FULL");
+
+  let incarnationId = "";
+  inImmediateTransaction(database, () => {
+    initializeApplicationSchema(database);
+    incarnationId = ensureDatabaseIncarnation(database, kind);
+  });
+
+  // journal_mode is persistent, so it is deliberately deferred until the
+  // requested kind and the entire atomic schema transaction have succeeded.
+  if (!isSqliteMemoryPath(path)) database.exec("PRAGMA journal_mode = WAL");
+  return incarnationId;
 }
 
 /** The exact SQLite transient-database spelling supported by this project. */
@@ -118,6 +375,175 @@ export function ensureDatabaseIncarnation(
     throw new Error("Database incarnation metadata is malformed");
   }
   return existing["incarnation_id"];
+}
+
+function classifySqliteDatabase(
+  database: SqliteDatabase,
+): DatabaseClassification {
+  try {
+    const schemaRows = database
+      .prepare(
+        `SELECT type, name
+           FROM sqlite_schema
+          WHERE name NOT LIKE 'sqlite_%'
+          ORDER BY type, name`,
+      )
+      .all() as Record<string, unknown>[];
+    const schemaObjects = new Set(
+      schemaRows.map((row) => String(row["name"])),
+    );
+    const tableNames = new Set(
+      schemaRows
+        .filter((row) => row["type"] === "table")
+        .map((row) => String(row["name"])),
+    );
+    const hasM2Tables = signatureHasAnyTable(tableNames, M2_LEGACY_SIGNATURE);
+    const hasFactoryTables = signatureHasAnyTable(
+      tableNames,
+      FACTORY_LEGACY_SIGNATURE,
+    );
+    const matchesM2 = signatureMatches(database, tableNames, M2_LEGACY_SIGNATURE);
+    const matchesFactory = signatureMatches(
+      database,
+      tableNames,
+      FACTORY_LEGACY_SIGNATURE,
+    );
+    const hasIncarnationTable = tableNames.has("database_incarnation");
+
+    if (hasIncarnationTable) {
+      const markerKind = readValidatedIncarnationKind(database, schemaObjects);
+      if (
+        (hasM2Tables && hasFactoryTables) ||
+        (markerKind === "m2" && hasFactoryTables) ||
+        (markerKind === "factory" && hasM2Tables)
+      ) {
+        return "ambiguous/cross-contaminated";
+      }
+      if (markerKind === "m2") {
+        return matchesM2 ? "current m2" : "corrupt/partial";
+      }
+      return matchesFactory ? "current factory" : "corrupt/partial";
+    }
+
+    if (
+      INCARNATION_TRIGGER_NAMES.some((name) => schemaObjects.has(name)) ||
+      (hasM2Tables && hasFactoryTables)
+    ) {
+      return "ambiguous/cross-contaminated";
+    }
+    if (matchesM2 && !hasFactoryTables) return "recognizable legacy m2";
+    if (matchesFactory && !hasM2Tables) {
+      return "recognizable legacy factory";
+    }
+    if (hasM2Tables || hasFactoryTables || hasStaleAutoincrementState(database)) {
+      return "corrupt/partial";
+    }
+    return schemaRows.length === 0 ? "empty/new" : "foreign";
+  } catch (error: unknown) {
+    throw new Error("SQLite database schema is corrupt or unreadable", {
+      cause: error,
+    });
+  }
+}
+
+function assertCompatibleDatabaseClassification(
+  classification: DatabaseClassification,
+  requestedKind: DatabaseInstanceKind,
+): void {
+  const compatible =
+    classification === "empty/new" ||
+    classification === `current ${requestedKind}` ||
+    classification === `recognizable legacy ${requestedKind}`;
+  if (compatible) return;
+  throw new Error(
+    `SQLite database classification ${classification} is not compatible with requested store kind ${requestedKind}`,
+  );
+}
+
+function signatureHasAnyTable(
+  tableNames: ReadonlySet<string>,
+  signature: readonly TableSignature[],
+): boolean {
+  return signature.some(({ name }) => tableNames.has(name));
+}
+
+function signatureMatches(
+  database: SqliteDatabase,
+  tableNames: ReadonlySet<string>,
+  signature: readonly TableSignature[],
+): boolean {
+  return signature.every(
+    ({ name, columns }) =>
+      tableNames.has(name) &&
+      stringArraysEqual(readTableColumns(database, name), columns),
+  );
+}
+
+function readTableColumns(
+  database: SqliteDatabase,
+  tableName: string,
+): readonly string[] {
+  const escaped = tableName.replaceAll('"', '""');
+  return (
+    database.prepare(`PRAGMA table_info("${escaped}")`).all() as Record<
+      string,
+      unknown
+    >[]
+  ).map((row) => String(row["name"]));
+}
+
+function readValidatedIncarnationKind(
+  database: SqliteDatabase,
+  schemaObjects: ReadonlySet<string>,
+): DatabaseInstanceKind {
+  if (
+    !stringArraysEqual(
+      readTableColumns(database, "database_incarnation"),
+      INCARNATION_COLUMNS,
+    ) ||
+    !INCARNATION_TRIGGER_NAMES.every((name) => schemaObjects.has(name))
+  ) {
+    throw new Error("Database incarnation metadata schema is malformed");
+  }
+  const rows = database
+    .prepare(
+      "SELECT singleton, store_kind, incarnation_id FROM database_incarnation ORDER BY singleton",
+    )
+    .all() as Record<string, unknown>[];
+  const row = rows[0];
+  if (
+    rows.length !== 1 ||
+    row?.["singleton"] !== 1 ||
+    (row["store_kind"] !== "m2" && row["store_kind"] !== "factory") ||
+    typeof row["incarnation_id"] !== "string" ||
+    !row["incarnation_id"].startsWith("database-incarnation/")
+  ) {
+    throw new Error("Database incarnation metadata is malformed");
+  }
+  return row["store_kind"];
+}
+
+function hasStaleAutoincrementState(database: SqliteDatabase): boolean {
+  const hasSequence = database
+    .prepare(
+      "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'",
+    )
+    .get() as Record<string, unknown> | undefined;
+  if (hasSequence === undefined) return false;
+  const row = database
+    .prepare("SELECT COUNT(*) AS count FROM sqlite_sequence")
+    .get() as Record<string, unknown> | undefined;
+  return typeof row?.["count"] === "number" && row["count"] > 0;
+}
+
+function stringArraysEqual(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
 }
 
 export function readDatabaseInstanceIdentity(

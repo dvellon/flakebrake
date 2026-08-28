@@ -20,7 +20,7 @@ import {
   closeSqliteAfterInitializationFailure,
   databaseIdentityPath,
   databaseInstanceIdentityFromHandle,
-  ensureDatabaseIncarnation,
+  initializeSqliteStore,
   inImmediateTransaction,
 } from "./sqlite.js";
 import type { SqliteDatabase } from "./sqlite.js";
@@ -167,14 +167,12 @@ export class SyntheticFactoryEnvironment {
     this.#databasePath = databaseIdentityPath(options.path);
     this.#database = new DatabaseSync(options.path);
     try {
-      this.#database.exec("PRAGMA foreign_keys = ON");
-      this.#database.exec("PRAGMA busy_timeout = 5000");
-      if (options.path !== ":memory:") {
-        this.#database.exec("PRAGMA journal_mode = WAL");
-      }
-      this.#database.exec("PRAGMA synchronous = FULL");
-      initializeFactorySchema(this.#database);
-      ensureDatabaseIncarnation(this.#database, "factory");
+      initializeSqliteStore(
+        this.#database,
+        options.path,
+        "factory",
+        initializeFactorySchema,
+      );
       inImmediateTransaction(this.#database, () => this.#seedIfEmpty());
     } catch (error: unknown) {
       closeSqliteAfterInitializationFailure(this.#database, error);
