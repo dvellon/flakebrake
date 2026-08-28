@@ -14,6 +14,7 @@ import {
   rational,
   readDatabaseInstanceIdentity,
   StatefulInputError,
+  SyntheticFactoryEnvironment,
 } from "../src/index.js";
 import type {
   AcceptPromiseInput,
@@ -1300,6 +1301,129 @@ describe("M2 Qodo PR #5 atomicity and database incarnation", () => {
       }
     } finally {
       dispose(inputs);
+    }
+  });
+});
+
+describe("Qodo Round 4 SQLite memory-store compatibility", () => {
+  test("constructs, operates, and idempotently closes a transient FlakeBrake store", () => {
+    const store = createStore({
+      path: ":memory:",
+      initialState: initialState(),
+      now: () => START,
+    });
+    assert.equal(store.getPortfolio().acceptedObligations.length, 1);
+    assert.equal(evaluate(store).decision, "ADMITTABLE");
+    store.close();
+    store.close();
+  });
+
+  test("constructs, operates, and idempotently closes a transient factory environment", () => {
+    const factory = new SyntheticFactoryEnvironment({
+      path: ":memory:",
+      environmentId: "factory-1",
+      now: () => START,
+    });
+    assert.equal(factory.getScheduleState().environmentId, "factory-1");
+    assert.equal(factory.getIncomingProposals().length, 1);
+    factory.close();
+    factory.close();
+  });
+
+  test("assigns separate memory databases distinct incarnation-based lock identities", () => {
+    const left = createStore({ path: ":memory:", initialState: initialState() });
+    const right = createStore({ path: ":memory:", initialState: initialState() });
+    const leftFactory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+    const rightFactory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+    try {
+      const leftIdentity = left.databaseInstanceIdentity("factory-1");
+      assert.equal(left.databaseInstanceIdentity("factory-1"), leftIdentity);
+      assert.notEqual(
+        right.databaseInstanceIdentity("factory-1"),
+        leftIdentity,
+      );
+      const leftFactoryIdentity = leftFactory.databaseInstanceIdentity();
+      assert.equal(leftFactory.databaseInstanceIdentity(), leftFactoryIdentity);
+      assert.notEqual(
+        rightFactory.databaseInstanceIdentity(),
+        leftFactoryIdentity,
+      );
+      assert.throws(
+        () => readDatabaseInstanceIdentity(":memory:", "m2", "factory-1"),
+        /no reopenable instance identity/u,
+      );
+    } finally {
+      rightFactory.close();
+      leftFactory.close();
+      right.close();
+      left.close();
+    }
+  });
+
+  test("closes M2 and factory handles after deterministic post-open initialization failures", () => {
+    for (const fixture of [
+      {
+        marker: "CREATE TABLE IF NOT EXISTS state_versions",
+        construct: () =>
+          createStore({ path: ":memory:", initialState: initialState() }),
+      },
+      {
+        marker: "CREATE TABLE IF NOT EXISTS factory_metadata",
+        construct: () => new SyntheticFactoryEnvironment({ path: ":memory:" }),
+      },
+    ]) {
+      const primary = new Error(`planned initialization failure: ${fixture.marker}`);
+      const originalExec = DatabaseSync.prototype.exec;
+      const originalClose = DatabaseSync.prototype.close;
+      let opened: DatabaseSync | undefined;
+      let closeCount = 0;
+      DatabaseSync.prototype.exec = function (sql: string): void {
+        opened = this;
+        if (sql.includes(fixture.marker)) throw primary;
+        originalExec.call(this, sql);
+      };
+      DatabaseSync.prototype.close = function (): void {
+        closeCount += 1;
+        originalClose.call(this);
+      };
+      try {
+        assert.throws(fixture.construct, (error: unknown) => error === primary);
+        assert.equal(closeCount, 1);
+        assert.throws(() => opened?.prepare("SELECT 1"), /not open|closed/u);
+      } finally {
+        DatabaseSync.prototype.exec = originalExec;
+        DatabaseSync.prototype.close = originalClose;
+        if (closeCount === 0) opened?.close();
+      }
+    }
+  });
+
+  test("preserves the initialization error when deterministic cleanup also rejects", () => {
+    const primary = new Error("planned primary initialization failure");
+    const cleanup = new Error("planned cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let closeCount = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (sql.includes("CREATE TABLE IF NOT EXISTS state_versions")) {
+        throw primary;
+      }
+      originalExec.call(this, sql);
+    };
+    DatabaseSync.prototype.close = function (): void {
+      closeCount += 1;
+      originalClose.call(this);
+      throw cleanup;
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: ":memory:", initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(closeCount, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
     }
   });
 });

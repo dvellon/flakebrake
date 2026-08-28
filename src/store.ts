@@ -45,8 +45,9 @@ import type {
   FactoryScheduleState,
 } from "./factory-environment.js";
 import {
-  canonicalDatabasePath,
   canonicalJson,
+  closeSqliteAfterInitializationFailure,
+  databaseIdentityPath,
   databaseInstanceIdentityFromHandle,
   inImmediateTransaction,
   openSqlite,
@@ -231,60 +232,67 @@ export class FlakeBrakeStore {
   readonly #databasePath: string;
   readonly #now: () => string;
   readonly #authoritativeFactoryDatabasePath: string | null;
+  #closed = false;
 
   public constructor(options: CreateStoreOptions) {
     if (typeof options.path !== "string" || options.path.length === 0) {
       throw new StatefulInputError("path", "must be a non-empty string");
     }
+    this.#databasePath = databaseIdentityPath(options.path);
     this.#database = openSqlite(options.path);
-    this.#databasePath = canonicalDatabasePath(options.path);
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#authoritativeFactoryDatabasePath =
       options.authoritativeFactoryDatabasePath ?? null;
-    if (
-      this.#authoritativeFactoryDatabasePath !== null &&
-      (this.#authoritativeFactoryDatabasePath.length === 0 ||
-        this.#authoritativeFactoryDatabasePath === ":memory:")
-    ) {
-      this.#database.close();
-      throw new StatefulInputError(
-        "authoritativeFactoryDatabasePath",
-        "must identify a durable factory SQLite database",
-      );
-    }
-    const initialized = this.#database
-      .prepare("SELECT 1 AS initialized FROM state_versions WHERE singleton = 1")
-      .get() as Record<string, unknown> | undefined;
-    if (initialized === undefined) {
-      if (options.initialState === undefined) {
-        this.#database.close();
-        throw new StatefulInputError(
-          "initialState",
-          "is required when creating a new store",
-        );
-      }
-      inImmediateTransaction(this.#database, () => {
-        this.#insertInitialState(options.initialState as StatefulInitialState);
-      });
-    } else if (options.initialState !== undefined) {
-      const current = this.getPortfolio();
-      const supplied = canonicalInitialState(options.initialState);
+    try {
       if (
-        canonicalSerialize(current.acceptedObligations) !==
-          canonicalSerialize(supplied.acceptedObligations) ||
-        canonicalSerialize(current.resources) !== canonicalSerialize(supplied.resources)
+        this.#authoritativeFactoryDatabasePath !== null &&
+        (this.#authoritativeFactoryDatabasePath.length === 0 ||
+          this.#authoritativeFactoryDatabasePath === ":memory:")
       ) {
-        this.#database.close();
         throw new StatefulInputError(
-          "initialState",
-          "cannot replace an already initialized durable store",
+          "authoritativeFactoryDatabasePath",
+          "must identify a durable factory SQLite database",
         );
       }
+      const initialized = this.#database
+        .prepare("SELECT 1 AS initialized FROM state_versions WHERE singleton = 1")
+        .get() as Record<string, unknown> | undefined;
+      if (initialized === undefined) {
+        if (options.initialState === undefined) {
+          throw new StatefulInputError(
+            "initialState",
+            "is required when creating a new store",
+          );
+        }
+        inImmediateTransaction(this.#database, () => {
+          this.#insertInitialState(options.initialState as StatefulInitialState);
+        });
+      } else if (options.initialState !== undefined) {
+        const current = this.getPortfolio();
+        const supplied = canonicalInitialState(options.initialState);
+        if (
+          canonicalSerialize(current.acceptedObligations) !==
+            canonicalSerialize(supplied.acceptedObligations) ||
+          canonicalSerialize(current.resources) !==
+            canonicalSerialize(supplied.resources)
+        ) {
+          throw new StatefulInputError(
+            "initialState",
+            "cannot replace an already initialized durable store",
+          );
+        }
+      }
+    } catch (error: unknown) {
+      closeSqliteAfterInitializationFailure(this.#database, error);
+      this.#closed = true;
+      throw error;
     }
   }
 
   public close(): void {
+    if (this.#closed) return;
     this.#database.close();
+    this.#closed = true;
   }
 
   public databaseInstanceIdentity(environmentId: string): string {

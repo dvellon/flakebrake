@@ -17,7 +17,8 @@ import {
 } from "./hero-fixture.js";
 import { stableTupleId } from "./identity.js";
 import {
-  canonicalDatabasePath,
+  closeSqliteAfterInitializationFailure,
+  databaseIdentityPath,
   databaseInstanceIdentityFromHandle,
   ensureDatabaseIncarnation,
   inImmediateTransaction,
@@ -152,6 +153,7 @@ export class SyntheticFactoryEnvironment {
   readonly #databasePath: string;
   readonly #environmentId: string;
   readonly #now: () => string;
+  #closed = false;
 
   public constructor(options: CreateFactoryEnvironmentOptions) {
     if (typeof options.path !== "string" || options.path.length === 0) {
@@ -162,21 +164,29 @@ export class SyntheticFactoryEnvironment {
       "environmentId",
     );
     this.#now = options.now ?? (() => HERO_HORIZON_END);
+    this.#databasePath = databaseIdentityPath(options.path);
     this.#database = new DatabaseSync(options.path);
-    this.#databasePath = canonicalDatabasePath(options.path);
-    this.#database.exec("PRAGMA foreign_keys = ON");
-    this.#database.exec("PRAGMA busy_timeout = 5000");
-    if (options.path !== ":memory:") {
-      this.#database.exec("PRAGMA journal_mode = WAL");
+    try {
+      this.#database.exec("PRAGMA foreign_keys = ON");
+      this.#database.exec("PRAGMA busy_timeout = 5000");
+      if (options.path !== ":memory:") {
+        this.#database.exec("PRAGMA journal_mode = WAL");
+      }
+      this.#database.exec("PRAGMA synchronous = FULL");
+      initializeFactorySchema(this.#database);
+      ensureDatabaseIncarnation(this.#database, "factory");
+      inImmediateTransaction(this.#database, () => this.#seedIfEmpty());
+    } catch (error: unknown) {
+      closeSqliteAfterInitializationFailure(this.#database, error);
+      this.#closed = true;
+      throw error;
     }
-    this.#database.exec("PRAGMA synchronous = FULL");
-    initializeFactorySchema(this.#database);
-    ensureDatabaseIncarnation(this.#database, "factory");
-    inImmediateTransaction(this.#database, () => this.#seedIfEmpty());
   }
 
   public close(): void {
+    if (this.#closed) return;
     this.#database.close();
+    this.#closed = true;
   }
 
   public databaseInstanceIdentity(): string {

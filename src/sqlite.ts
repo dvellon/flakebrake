@@ -8,6 +8,9 @@ import { canonicalSerialize } from "./canonical.js";
 export type SqliteDatabase = DatabaseSync;
 export type DatabaseInstanceKind = "m2" | "factory";
 
+const SQLITE_MEMORY_PATH = ":memory:";
+const SQLITE_MEMORY_IDENTITY_PATH = "sqlite-memory/current-connection";
+
 const IMMUTABLE_TABLES = [
   "admission_records",
   "admission_addenda",
@@ -29,13 +32,45 @@ const IMMUTABLE_TABLES = [
 
 export function openSqlite(path: string): SqliteDatabase {
   const database = new DatabaseSync(path);
-  database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA busy_timeout = 5000");
-  if (path !== ":memory:") database.exec("PRAGMA journal_mode = WAL");
-  database.exec("PRAGMA synchronous = FULL");
-  initializeSchema(database);
-  ensureDatabaseIncarnation(database, "m2");
-  return database;
+  try {
+    database.exec("PRAGMA foreign_keys = ON");
+    database.exec("PRAGMA busy_timeout = 5000");
+    if (!isSqliteMemoryPath(path)) database.exec("PRAGMA journal_mode = WAL");
+    database.exec("PRAGMA synchronous = FULL");
+    initializeSchema(database);
+    ensureDatabaseIncarnation(database, "m2");
+    return database;
+  } catch (error: unknown) {
+    closeSqliteAfterInitializationFailure(database, error);
+    throw error;
+  }
+}
+
+/** The exact SQLite transient-database spelling supported by this project. */
+export function isSqliteMemoryPath(path: string): boolean {
+  return path === SQLITE_MEMORY_PATH;
+}
+
+/**
+ * Identity basis for a database that is already or about to be opened.
+ * Transient databases never enter filesystem canonicalization; their durable
+ * incarnation row distinguishes otherwise identical `:memory:` spellings.
+ */
+export function databaseIdentityPath(path: string): string {
+  if (isSqliteMemoryPath(path)) return SQLITE_MEMORY_IDENTITY_PATH;
+  return canonicalDatabasePath(path);
+}
+
+/** Close an owned initialization handle without replacing its primary error. */
+export function closeSqliteAfterInitializationFailure(
+  database: SqliteDatabase,
+  primaryError: unknown,
+): void {
+  try {
+    database.close();
+  } catch (cleanupError: unknown) {
+    attachInitializationCleanupDiagnostic(primaryError, cleanupError);
+  }
 }
 
 export function ensureDatabaseIncarnation(
@@ -90,6 +125,11 @@ export function readDatabaseInstanceIdentity(
   kind: DatabaseInstanceKind,
   environmentId: string,
 ): string {
+  if (isSqliteMemoryPath(path)) {
+    throw new TypeError(
+      "An in-memory database has no reopenable instance identity",
+    );
+  }
   const canonicalPath = canonicalDatabasePath(path);
   const database = new DatabaseSync(canonicalPath, { readOnly: true });
   try {
@@ -123,21 +163,31 @@ export function databaseInstanceIdentityFromHandle(
   ) {
     throw new Error(`${kind} database instance identity is missing or malformed`);
   }
+  const identityBasis =
+    canonicalPath === SQLITE_MEMORY_IDENTITY_PATH
+      ? {
+          environmentId,
+          incarnationId: row["incarnation_id"],
+          kind,
+        }
+      : {
+          canonicalPath,
+          environmentId,
+          incarnationId: row["incarnation_id"],
+          kind,
+        };
   return `database-instance/sha256:${createHash("sha256")
-    .update(
-      canonicalSerialize({
-        canonicalPath,
-        environmentId,
-        incarnationId: row["incarnation_id"],
-        kind,
-      }),
-    )
+    .update(canonicalSerialize(identityBasis))
     .digest("hex")}`;
 }
 
 /** Canonical physical identity for an existing or prospective database path. */
 export function canonicalDatabasePath(path: string): string {
-  if (typeof path !== "string" || path.length === 0 || path === ":memory:") {
+  if (
+    typeof path !== "string" ||
+    path.length === 0 ||
+    isSqliteMemoryPath(path)
+  ) {
     throw new TypeError("A durable database path must be a non-empty string");
   }
   const absolute = resolve(path);
@@ -154,6 +204,28 @@ export function canonicalDatabasePath(path: string): string {
     parent = next;
   }
   return join(realpathSync(parent), ...missing);
+}
+
+function attachInitializationCleanupDiagnostic(
+  primaryError: unknown,
+  cleanupError: unknown,
+): void {
+  if (
+    (typeof primaryError !== "object" || primaryError === null) &&
+    typeof primaryError !== "function"
+  ) {
+    return;
+  }
+  try {
+    Object.defineProperty(primaryError, "cleanupErrors", {
+      configurable: true,
+      enumerable: false,
+      value: [cleanupError],
+      writable: false,
+    });
+  } catch {
+    // The primary initialization failure must remain authoritative.
+  }
 }
 
 export function inImmediateTransaction<T>(
