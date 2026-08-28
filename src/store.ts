@@ -40,9 +40,15 @@ import {
   readAuthoritativeFactoryExecution,
   readAuthoritativeFactoryState,
 } from "./factory-environment.js";
-import type { AuthoritativeFactoryExecutionEvidence } from "./factory-environment.js";
+import type {
+  AuthoritativeFactoryExecutionEvidence,
+  FactoryScheduleState,
+} from "./factory-environment.js";
 import {
   canonicalJson,
+  closeSqliteAfterInitializationFailure,
+  databaseIdentityPath,
+  databaseInstanceIdentityFromHandle,
   inImmediateTransaction,
   openSqlite,
   parseCanonicalJson,
@@ -51,6 +57,8 @@ import {
 import type { SqliteDatabase } from "./sqlite.js";
 import type {
   AcceptPromiseInput,
+  AcceptPromiseAndIssueGrantInput,
+  AcceptPromiseAndIssueGrantResult,
   AcceptPromiseResult,
   ActualConsumptionValue,
   AdmissionAddendum,
@@ -163,6 +171,57 @@ interface AdmissionBasisValues {
   readonly calibrationFrontierDigest: string;
 }
 
+function committedAcceptanceReplay(
+  admission: AdmissionReadModel,
+  input: AcceptPromiseInput,
+  body: JsonValue,
+  ownerDecision: Record<string, unknown> | null,
+): Extract<AcceptPromiseResult, { readonly status: "COMMITTED" }> {
+  const record = admission.record;
+  const mismatches = compareAdmissionBasis(input, {
+    portfolioVersion: record.portfolioVersion,
+    capacityModelVersion: record.capacityModelVersion,
+    capacityPlanVersion: record.capacityPlanVersion,
+    authorizationStateVersion: record.authorizationStateVersion,
+    calibrationFrontierDigest: record.calibrationFrontierDigest,
+  });
+  if (mismatches.length > 0 || !isJsonObject(body)) {
+    throw new StatefulInputError(
+      "acceptance",
+      "replay differs from the immutable accepted admission basis",
+    );
+  }
+  const committedPortfolioVersion = body["committedPortfolioVersion"];
+  if (typeof committedPortfolioVersion !== "string") {
+    throw new Error("Acceptance commit is missing its portfolio version");
+  }
+  const authorizationRequest = body["authorizationRequest"];
+  const expectedRequest = acceptanceAuthorizationRequest(input);
+  const comparableRequest =
+    authorizationRequest === undefined
+      ? legacyAcceptanceAuthorizationRequest(record, body, ownerDecision)
+      : authorizationRequest;
+  if (
+    canonicalSerialize(comparableRequest) !== canonicalSerialize(expectedRequest)
+  ) {
+    throw new StatefulInputError(
+      "acceptance",
+      "replay conflicts with the complete immutable authorization request",
+    );
+  }
+  return deepFreeze({
+    status: "COMMITTED",
+    admissionRecordId: input.admissionRecordId,
+    selectedPlanId: input.selectedPlanId,
+    versions: {
+      portfolioVersion: committedPortfolioVersion,
+      capacityModelVersion: record.capacityModelVersion,
+      capacityPlanVersion: record.capacityPlanVersion,
+      authorizationStateVersion: record.authorizationStateVersion,
+    },
+  });
+}
+
 type ExecutionFenceBase = Omit<
   ExecutionFenceReadModel,
   "status" | "resultBinding"
@@ -170,61 +229,84 @@ type ExecutionFenceBase = Omit<
 
 export class FlakeBrakeStore {
   readonly #database: SqliteDatabase;
+  readonly #databasePath: string;
   readonly #now: () => string;
   readonly #authoritativeFactoryDatabasePath: string | null;
+  #closed = false;
 
   public constructor(options: CreateStoreOptions) {
     if (typeof options.path !== "string" || options.path.length === 0) {
       throw new StatefulInputError("path", "must be a non-empty string");
     }
+    this.#databasePath = databaseIdentityPath(options.path);
     this.#database = openSqlite(options.path);
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#authoritativeFactoryDatabasePath =
       options.authoritativeFactoryDatabasePath ?? null;
-    if (
-      this.#authoritativeFactoryDatabasePath !== null &&
-      (this.#authoritativeFactoryDatabasePath.length === 0 ||
-        this.#authoritativeFactoryDatabasePath === ":memory:")
-    ) {
-      this.#database.close();
-      throw new StatefulInputError(
-        "authoritativeFactoryDatabasePath",
-        "must identify a durable factory SQLite database",
-      );
-    }
-    const initialized = this.#database
-      .prepare("SELECT 1 AS initialized FROM state_versions WHERE singleton = 1")
-      .get() as Record<string, unknown> | undefined;
-    if (initialized === undefined) {
-      if (options.initialState === undefined) {
-        this.#database.close();
-        throw new StatefulInputError(
-          "initialState",
-          "is required when creating a new store",
-        );
-      }
-      inImmediateTransaction(this.#database, () => {
-        this.#insertInitialState(options.initialState as StatefulInitialState);
-      });
-    } else if (options.initialState !== undefined) {
-      const current = this.getPortfolio();
-      const supplied = canonicalInitialState(options.initialState);
+    try {
       if (
-        canonicalSerialize(current.acceptedObligations) !==
-          canonicalSerialize(supplied.acceptedObligations) ||
-        canonicalSerialize(current.resources) !== canonicalSerialize(supplied.resources)
+        this.#authoritativeFactoryDatabasePath !== null &&
+        (this.#authoritativeFactoryDatabasePath.length === 0 ||
+          this.#authoritativeFactoryDatabasePath === ":memory:")
       ) {
-        this.#database.close();
         throw new StatefulInputError(
-          "initialState",
-          "cannot replace an already initialized durable store",
+          "authoritativeFactoryDatabasePath",
+          "must identify a durable factory SQLite database",
         );
       }
+      const initialized = this.#database
+        .prepare("SELECT 1 AS initialized FROM state_versions WHERE singleton = 1")
+        .get() as Record<string, unknown> | undefined;
+      if (initialized === undefined) {
+        if (options.initialState === undefined) {
+          throw new StatefulInputError(
+            "initialState",
+            "is required when creating a new store",
+          );
+        }
+        inImmediateTransaction(this.#database, () => {
+          this.#insertInitialState(options.initialState as StatefulInitialState);
+        });
+      } else if (options.initialState !== undefined) {
+        const current = this.getPortfolio();
+        const supplied = canonicalInitialState(options.initialState);
+        if (
+          canonicalSerialize(current.acceptedObligations) !==
+            canonicalSerialize(supplied.acceptedObligations) ||
+          canonicalSerialize(current.resources) !==
+            canonicalSerialize(supplied.resources)
+        ) {
+          throw new StatefulInputError(
+            "initialState",
+            "cannot replace an already initialized durable store",
+          );
+        }
+      }
+    } catch (error: unknown) {
+      closeSqliteAfterInitializationFailure(this.#database, error);
+      this.#closed = true;
+      throw error;
     }
   }
 
   public close(): void {
+    if (this.#closed) return;
     this.#database.close();
+    this.#closed = true;
+  }
+
+  public databaseInstanceIdentity(environmentId: string): string {
+    return databaseInstanceIdentityFromHandle(
+      this.#database,
+      this.#databasePath,
+      "m2",
+      environmentId,
+    );
+  }
+
+  /** Synchronous transaction scope used by bounded compound store operations. */
+  public withImmediateTransaction<T>(operation: (database: SqliteDatabase) => T): T {
+    return inImmediateTransaction(this.#database, () => operation(this.#database));
   }
 
   public getPortfolio(): PortfolioReadModel {
@@ -241,6 +323,29 @@ export class FlakeBrakeStore {
       const input = this.#buildAdmissionInput(request, null);
       const result = evaluateAdmission(input);
       return this.#insertAdmissionRecord(result);
+    });
+  }
+
+  /** Exact-basis idempotent admission recording for replayable orchestration. */
+  public evaluateAndRecordAdmissionOrReplay(
+    request: AdmissionRequest,
+  ): AdmissionRecordBody {
+    return inImmediateTransaction(this.#database, () => {
+      const input = this.#buildAdmissionInput(request, null);
+      const result = evaluateAdmission(input);
+      const matches = this.getAdmissionHistory().filter(
+        ({ record }) =>
+          canonicalSerialize(record.proposalSnapshot) ===
+            canonicalSerialize(request.proposal) &&
+          canonicalSerialize(record.m1Result) === canonicalSerialize(result),
+      );
+      if (matches.length > 1) {
+        throw new StatefulInputError(
+          "admissionBasis",
+          "the exact authoritative admission basis has duplicate records",
+        );
+      }
+      return matches[0]?.record ?? this.#insertAdmissionRecord(result);
     });
   }
 
@@ -402,6 +507,8 @@ export class FlakeBrakeStore {
         selectedPlanId: input.selectedPlanId,
         ownerDecisionId: input.ownerDecisionId,
         approverId: input.approverId,
+        ownerSourceIdentity:
+          acceptanceAuthorizationRequest(input).ownerSourceIdentity,
       } as const;
       this.#insertOwnerDecision(input.ownerDecisionId, decisionBody);
       this.#replacePortfolio(selectedPortfolio);
@@ -415,6 +522,7 @@ export class FlakeBrakeStore {
         input.admissionRecordId,
         "acceptance_commit",
         {
+          authorizationRequest: acceptanceAuthorizationRequest(input),
           ownerDecisionId: input.ownerDecisionId,
           selectedPlanId: input.selectedPlanId,
           committedPortfolioVersion: versions.portfolioVersion,
@@ -426,6 +534,56 @@ export class FlakeBrakeStore {
         admissionRecordId: input.admissionRecordId,
         selectedPlanId: input.selectedPlanId,
         versions,
+      });
+    });
+  }
+
+  public acceptPromiseAndIssueGrant(
+    input: AcceptPromiseAndIssueGrantInput,
+  ): AcceptPromiseAndIssueGrantResult {
+    return inImmediateTransaction(this.#database, () => {
+      const admission = this.getAdmissionRecord(
+        input.acceptance.admissionRecordId,
+      );
+      const acceptanceCommits = admission.addenda.filter(
+        (addendum) => addendum.kind === "acceptance_commit",
+      );
+      const exactCommit = acceptanceCommits.find((addendum) => {
+        if (!isJsonObject(addendum.body)) return false;
+        return (
+          addendum.body["ownerDecisionId"] ===
+            input.acceptance.ownerDecisionId &&
+          addendum.body["selectedPlanId"] === input.acceptance.selectedPlanId
+        );
+      });
+      if (acceptanceCommits.length > 0 && exactCommit === undefined) {
+        throw new StatefulInputError(
+          "acceptance",
+          "conflicts with the immutable accepted promise",
+        );
+      }
+      const acceptance =
+        exactCommit === undefined
+          ? this.acceptPromise(input.acceptance)
+          : committedAcceptanceReplay(
+              admission,
+              input.acceptance,
+              exactCommit.body,
+              this.#ownerDecisionBody(input.acceptance.ownerDecisionId),
+            );
+      if (acceptance.status !== "COMMITTED") {
+        return deepFreeze({ acceptance, grant: null });
+      }
+      const grant = this.issueGrant({
+        ...input.grant,
+        expectedPortfolioVersion: acceptance.versions.portfolioVersion,
+        expectedCapacityModelVersion:
+          acceptance.versions.capacityModelVersion,
+        expectedCapacityPlanVersion: acceptance.versions.capacityPlanVersion,
+      });
+      return deepFreeze({
+        acceptance,
+        grant: { ...grant, created: true },
       });
     });
   }
@@ -1296,10 +1454,14 @@ export class FlakeBrakeStore {
 
   public createExecutionFence(
     inputValue: CreateExecutionFenceInput,
+    authoritativeFactoryState?: FactoryScheduleState,
   ): ExecutionFenceReadModel {
     const input = canonicalClone<CreateExecutionFenceInput>(inputValue);
     validateCreateExecutionFenceInput(input);
-    const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
+    const factoryPath =
+      authoritativeFactoryState === undefined
+        ? this.#requireAuthoritativeFactoryDatabasePath()
+        : null;
     return inImmediateTransaction(this.#database, () => {
       const attempt = this.#executionAttempt(input.executionAttemptId);
       if (attempt === null) {
@@ -1334,7 +1496,9 @@ export class FlakeBrakeStore {
         );
       }
       const canonicalEffect = normalizeEffect(attempt.input.effect);
-      const authorityState = readAuthoritativeFactoryState(factoryPath).state;
+      const authorityState =
+        authoritativeFactoryState ??
+        readAuthoritativeFactoryState(factoryPath as string).state;
       if (
         canonicalEffect.environmentId !== input.environmentId ||
         authorityState.environmentId !== input.environmentId ||
@@ -1588,8 +1752,7 @@ export class FlakeBrakeStore {
     assertNonEmptyString(executionAttemptId, "executionAttemptId");
     const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
     return inImmediateTransaction(this.#database, () => {
-      const attempt = this.#executionAttempt(executionAttemptId);
-      if (attempt === null) {
+      if (this.#executionAttempt(executionAttemptId) === null) {
         throw new StatefulInputError(
           "executionAttemptId",
           "must reference an authoritative M2 claimed attempt",
@@ -1610,6 +1773,30 @@ export class FlakeBrakeStore {
         throw new StatefulInputError(
           "executionAttemptId",
           "has no authoritative committed factory result",
+        );
+      }
+      return this.verifyExecutionWithEvidence(executionAttemptId, evidence);
+    });
+  }
+
+  public verifyExecutionWithEvidence(
+    executionAttemptId: string,
+    evidence: AuthoritativeFactoryExecutionEvidence,
+  ): AuthoritativeExecutionVerificationResult {
+    assertNonEmptyString(executionAttemptId, "executionAttemptId");
+    return inImmediateTransaction(this.#database, () => {
+      const attempt = this.#executionAttempt(executionAttemptId);
+      if (attempt === null) {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must reference an authoritative M2 claimed attempt",
+        );
+      }
+      const fence = this.#executionFenceByAttempt(executionAttemptId);
+      if (fence === null || fence.status !== "factory_result_bound") {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must have an exact factory-result-bound execution fence",
         );
       }
       const binding = factoryEvidenceBinding(evidence);
@@ -4015,6 +4202,50 @@ function uniqueMismatches(
   ];
   const present = new Set(values);
   return order.filter((value) => present.has(value));
+}
+
+function acceptanceAuthorizationRequest(
+  input: AcceptPromiseInput,
+): AcceptPromiseInput & { readonly ownerSourceIdentity: string } {
+  return canonicalClone({
+    ...input,
+    ownerSourceIdentity:
+      input.ownerSourceIdentity ??
+      `owner-source/legacy-approver/${input.approverId}`,
+  });
+}
+
+function legacyAcceptanceAuthorizationRequest(
+  record: AdmissionRecordBody,
+  acceptanceCommit: { readonly [key: string]: JsonValue },
+  ownerDecision: Record<string, unknown> | null,
+): AcceptPromiseInput & { readonly ownerSourceIdentity: string } {
+  if (
+    ownerDecision === null ||
+    ownerDecision["kind"] !== "ACCEPT_PROMISE" ||
+    ownerDecision["admissionRecordId"] !== record.admissionRecordId ||
+    ownerDecision["ownerDecisionId"] !== acceptanceCommit["ownerDecisionId"] ||
+    ownerDecision["selectedPlanId"] !== acceptanceCommit["selectedPlanId"] ||
+    typeof ownerDecision["approverId"] !== "string" ||
+    typeof ownerDecision["ownerSourceIdentity"] !== "string"
+  ) {
+    throw new StatefulInputError(
+      "acceptanceCompatibility",
+      "legacy acceptance lacks provable immutable approver or owner-source identity",
+    );
+  }
+  return canonicalClone({
+    admissionRecordId: record.admissionRecordId,
+    selectedPlanId: ownerDecision["selectedPlanId"] as string,
+    ownerDecisionId: ownerDecision["ownerDecisionId"] as string,
+    approverId: ownerDecision["approverId"],
+    ownerSourceIdentity: ownerDecision["ownerSourceIdentity"],
+    expectedPortfolioVersion: record.portfolioVersion,
+    expectedCapacityModelVersion: record.capacityModelVersion,
+    expectedCapacityPlanVersion: record.capacityPlanVersion,
+    expectedAuthorizationStateVersion: record.authorizationStateVersion,
+    expectedCalibrationFrontierDigest: record.calibrationFrontierDigest,
+  });
 }
 
 function compareExecutionVersions(

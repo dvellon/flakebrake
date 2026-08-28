@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,7 +18,9 @@ import {
   createStore,
   ExecutionAttemptConflictError,
   rational,
+  readDatabaseInstanceIdentity,
   StatefulInputError,
+  SyntheticFactoryEnvironment,
 } from "../src/index.js";
 import type {
   AcceptPromiseInput,
@@ -62,6 +70,444 @@ interface TempStore {
   readonly directory: string;
   readonly path: string;
   readonly store: FlakeBrakeStore;
+}
+
+interface SqliteDurableSnapshot {
+  readonly artifacts: Readonly<Record<string, string>>;
+  readonly columns: Readonly<
+    Record<string, readonly Readonly<Record<string, unknown>>[]>
+  >;
+  readonly foreignKeys: Readonly<
+    Record<string, readonly Readonly<Record<string, unknown>>[]>
+  >;
+  readonly indexes: Readonly<
+    Record<string, readonly Readonly<Record<string, unknown>>[]>
+  >;
+  readonly journalMode: string | null;
+  readonly metadata: readonly Readonly<Record<string, unknown>>[];
+  readonly rows: Readonly<Record<string, readonly string[]>>;
+  readonly schema: readonly Readonly<Record<string, unknown>>[];
+  readonly tables: readonly string[];
+  readonly triggers: readonly Readonly<Record<string, unknown>>[];
+}
+
+function sqliteDurableSnapshot(path: string): SqliteDurableSnapshot {
+  let columns: Readonly<
+    Record<string, readonly Readonly<Record<string, unknown>>[]>
+  > = {};
+  let foreignKeys: Readonly<
+    Record<string, readonly Readonly<Record<string, unknown>>[]>
+  > = {};
+  let indexes: Readonly<
+    Record<string, readonly Readonly<Record<string, unknown>>[]>
+  > = {};
+  let journalMode: string | null = null;
+  let metadata: readonly Readonly<Record<string, unknown>>[] = [];
+  let rows: Readonly<Record<string, readonly string[]>> = {};
+  let schema: readonly Readonly<Record<string, unknown>>[] = [];
+  let tables: readonly string[] = [];
+  let triggers: readonly Readonly<Record<string, unknown>>[] = [];
+  if (existsSync(path)) {
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+      journalMode = String(
+        (
+          database.prepare("PRAGMA journal_mode").get() as
+            | Record<string, unknown>
+            | undefined
+        )?.["journal_mode"] ?? "",
+      );
+      schema = (
+        database
+          .prepare(
+            `SELECT type, name, tbl_name, sql
+               FROM sqlite_master
+              WHERE name NOT LIKE 'sqlite_%'
+              ORDER BY type, name`,
+          )
+          .all() as Record<string, unknown>[]
+      ).map(sortRecord);
+      tables = schema
+        .filter((entry) => entry["type"] === "table")
+        .map((entry) => String(entry["name"]));
+      columns = Object.fromEntries(
+        tables.map((table) => [
+          table,
+          (
+            database
+              .prepare(`PRAGMA table_xinfo("${table.replaceAll('"', '""')}")`)
+              .all() as Record<string, unknown>[]
+          ).map(sortRecord),
+        ]),
+      );
+      foreignKeys = Object.fromEntries(
+        tables.map((table) => [
+          table,
+          (
+            database
+              .prepare(
+                `PRAGMA foreign_key_list("${table.replaceAll('"', '""')}")`,
+              )
+              .all() as Record<string, unknown>[]
+          ).map(sortRecord),
+        ]),
+      );
+      indexes = Object.fromEntries(
+        tables.map((table) => {
+          const escapedTable = table.replaceAll('"', '""');
+          const indexRows = database
+            .prepare(`PRAGMA index_list("${escapedTable}")`)
+            .all() as Record<string, unknown>[];
+          return [
+            table,
+            indexRows.flatMap((indexRow) => {
+              const indexName = String(indexRow["name"]);
+              const escapedIndex = indexName.replaceAll('"', '""');
+              const columnsForIndex = database
+                .prepare(`PRAGMA index_xinfo("${escapedIndex}")`)
+                .all() as Record<string, unknown>[];
+              return [
+                sortRecord({ kind: "index", ...indexRow }),
+                ...columnsForIndex.map((row) =>
+                  sortRecord({ indexName, kind: "index-column", ...row }),
+                ),
+              ];
+            }),
+          ];
+        }),
+      );
+      triggers = schema.filter((entry) => entry["type"] === "trigger");
+      rows = Object.fromEntries(
+        tables.map((table) => [
+          table,
+          (
+            database
+              .prepare(`SELECT * FROM "${table.replaceAll('"', '""')}"`)
+              .all() as Record<string, unknown>[]
+          )
+            .map((row) => JSON.stringify(sortRecord(row)))
+            .sort(),
+        ]),
+      );
+      metadata = ["database_incarnation", "factory_metadata", "state_versions"]
+        .filter((table) => tables.includes(table))
+        .flatMap((table) =>
+          (
+            database
+              .prepare(`SELECT * FROM "${table}"`)
+              .all() as Record<string, unknown>[]
+          ).map((row) => sortRecord({ table, ...row })),
+        );
+    } finally {
+      database.close();
+    }
+  }
+  const artifacts = Object.fromEntries(
+    [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]
+      .filter((artifactPath) => existsSync(artifactPath))
+      .map((artifactPath) => [
+        artifactPath.slice(path.length) || "main",
+        createHash("sha256").update(readFileSync(artifactPath)).digest("hex"),
+      ]),
+  );
+  return {
+    artifacts,
+    columns,
+    foreignKeys,
+    indexes,
+    journalMode,
+    metadata,
+    rows,
+    schema,
+    tables,
+    triggers,
+  };
+}
+
+function assertLogicalAndSidecarSnapshotEqual(
+  actual: SqliteDurableSnapshot,
+  expected: SqliteDurableSnapshot,
+): void {
+  const { artifacts: actualArtifacts, ...actualLogical } = actual;
+  const { artifacts: expectedArtifacts, ...expectedLogical } = expected;
+  assert.deepEqual(actualLogical, expectedLogical);
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(actualArtifacts).filter(([name]) => name !== "main"),
+    ),
+    Object.fromEntries(
+      Object.entries(expectedArtifacts).filter(([name]) => name !== "main"),
+    ),
+  );
+  assert.equal("main" in actualArtifacts, "main" in expectedArtifacts);
+}
+
+function databaseHandleUsesPath(
+  database: DatabaseSync,
+  path: string,
+): boolean {
+  const row = (
+    database.prepare("PRAGMA database_list").all() as Record<string, unknown>[]
+  ).find((entry) => entry["name"] === "main");
+  return row?.["file"] === path;
+}
+
+function sortRecord(
+  record: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return Object.fromEntries(
+    Object.entries(record).sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function removeDatabaseIncarnation(path: string): void {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`
+      DROP TRIGGER database_incarnation_immutable_update;
+      DROP TRIGGER database_incarnation_immutable_delete;
+      DROP TABLE database_incarnation;
+    `);
+  } finally {
+    database.close();
+  }
+}
+
+interface SchemaDefinition {
+  readonly name: string;
+  readonly sql: string;
+  readonly type: string;
+}
+
+function copyApplicationSchemaWithTransform(
+  sourcePath: string,
+  targetPath: string,
+  transform: (definition: SchemaDefinition) => string | null =
+    (definition) => definition.sql,
+): void {
+  const source = new DatabaseSync(sourcePath, { readOnly: true });
+  const target = new DatabaseSync(targetPath);
+  try {
+    const definitions = source
+      .prepare(
+        `SELECT type, name, sql
+           FROM sqlite_master
+          WHERE sql IS NOT NULL
+            AND name NOT LIKE 'sqlite_%'
+            AND name NOT IN (
+              'database_incarnation',
+              'database_incarnation_immutable_update',
+              'database_incarnation_immutable_delete'
+            )
+          ORDER BY CASE type
+                     WHEN 'table' THEN 1
+                     WHEN 'index' THEN 2
+                     WHEN 'trigger' THEN 3
+                     ELSE 4
+                   END,
+                   name`,
+      )
+      .all() as Record<string, unknown>[];
+    target.exec("BEGIN IMMEDIATE");
+    try {
+      for (const definition of definitions) {
+        const transformed = transform({
+          name: String(definition["name"]),
+          sql: String(definition["sql"]),
+          type: String(definition["type"]),
+        });
+        if (transformed !== null) target.exec(transformed);
+      }
+      target.exec("COMMIT");
+    } catch (error: unknown) {
+      target.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    target.close();
+    source.close();
+  }
+}
+
+function copyApplicationSchema(sourcePath: string, targetPath: string): void {
+  copyApplicationSchemaWithTransform(sourcePath, targetPath);
+}
+
+interface LegacySchemaMutation {
+  readonly extraSql?: string;
+  readonly fragment?: readonly [from: string, to: string];
+  readonly name: string;
+  readonly objectName?: string;
+  readonly omitObject?: string;
+}
+
+function createMutatedLegacySchema(
+  sourcePath: string,
+  targetPath: string,
+  mutation: LegacySchemaMutation,
+): void {
+  let changed = false;
+  copyApplicationSchemaWithTransform(sourcePath, targetPath, (definition) => {
+    if (definition.name === mutation.omitObject) {
+      changed = true;
+      return null;
+    }
+    if (
+      definition.name === mutation.objectName &&
+      mutation.fragment !== undefined
+    ) {
+      const [from, to] = mutation.fragment;
+      assert.ok(
+        definition.sql.includes(from),
+        `${mutation.name}: expected schema fragment was absent`,
+      );
+      changed = true;
+      return definition.sql.replace(from, to);
+    }
+    return definition.sql;
+  });
+  if (mutation.extraSql !== undefined) {
+    const database = new DatabaseSync(targetPath);
+    try {
+      database.exec(mutation.extraSql);
+      changed = true;
+    } finally {
+      database.close();
+    }
+  }
+  assert.equal(changed, true, `${mutation.name}: fixture did not change schema`);
+}
+
+function setJournalMode(path: string, mode: "DELETE" | "WAL"): void {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`PRAGMA journal_mode = ${mode}`);
+  } finally {
+    database.close();
+  }
+}
+
+function assertInjectedWalFailureIsAtomic(
+  path: string,
+  construct: () => unknown,
+  expectedWalAttempts = 1,
+): void {
+  const before = sqliteDurableSnapshot(path);
+  const primary = new Error(`planned WAL activation failure for ${path}`);
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalClose = DatabaseSync.prototype.close;
+  let closeCount = 0;
+  let walAttempts = 0;
+  DatabaseSync.prototype.exec = function (sql: string): void {
+    if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) {
+      walAttempts += 1;
+      originalExec.call(this, sql);
+      throw primary;
+    }
+    originalExec.call(this, sql);
+  };
+  DatabaseSync.prototype.close = function (): void {
+    closeCount += 1;
+    originalClose.call(this);
+  };
+  try {
+    assert.throws(construct, (error: unknown) => error === primary);
+    assert.equal(walAttempts, expectedWalAttempts);
+    assert.equal(closeCount, 1);
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.close = originalClose;
+  }
+  const after = sqliteDurableSnapshot(path);
+  if ("main" in before.artifacts) {
+    assertLogicalAndSidecarSnapshotEqual(after, before);
+  } else {
+    assert.deepEqual(after, before);
+  }
+}
+
+interface ConcurrentInitializationFailureFixture {
+  readonly construct: () => unknown;
+  readonly failureMarker: string;
+  readonly path: string;
+  readonly readCommittedValue: (database: DatabaseSync) => number;
+  readonly writeSql: string;
+}
+
+function assertConcurrentCommitSurvivesInitializationFailure(
+  fixture: ConcurrentInitializationFailureFixture,
+): void {
+  const before = sqliteDurableSnapshot(fixture.path);
+  const primary = new Error(
+    `planned initialization failure before concurrent commit: ${fixture.failureMarker}`,
+  );
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalClose = DatabaseSync.prototype.close;
+  let failureInjected = false;
+  let initializationLockReleased = false;
+  let concurrentCommitted = false;
+  let committedSnapshot: SqliteDurableSnapshot | undefined;
+  let peer: DatabaseSync | undefined;
+
+  const injectedExec = function (this: DatabaseSync, sql: string): void {
+    originalExec.call(this, sql);
+    if (
+      !failureInjected &&
+      databaseHandleUsesPath(this, fixture.path) &&
+      sql.includes(fixture.failureMarker)
+    ) {
+      failureInjected = true;
+      throw primary;
+    }
+  };
+  const injectedClose = function (this: DatabaseSync): void {
+    const target = databaseHandleUsesPath(this, fixture.path);
+    originalClose.call(this);
+    if (!target || !failureInjected || concurrentCommitted) return;
+    initializationLockReleased = true;
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.close = originalClose;
+    peer = new DatabaseSync(fixture.path);
+    peer.exec("PRAGMA wal_autocheckpoint = 0");
+    peer.exec(`BEGIN IMMEDIATE; ${fixture.writeSql}; COMMIT;`);
+    concurrentCommitted = true;
+    committedSnapshot = sqliteDurableSnapshot(fixture.path);
+    DatabaseSync.prototype.exec = injectedExec;
+    DatabaseSync.prototype.close = injectedClose;
+  };
+
+  DatabaseSync.prototype.exec = injectedExec;
+  DatabaseSync.prototype.close = injectedClose;
+  try {
+    assert.throws(fixture.construct, (error: unknown) => error === primary);
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.close = originalClose;
+  }
+
+  try {
+    assert.equal(failureInjected, true);
+    assert.equal(initializationLockReleased, true);
+    assert.equal(concurrentCommitted, true);
+    assert.ok(peer !== undefined);
+    assert.equal(
+      (peer.prepare("PRAGMA quick_check").get() as Record<string, unknown>)[
+        "quick_check"
+      ],
+      "ok",
+    );
+    const reader = new DatabaseSync(fixture.path, { readOnly: true });
+    try {
+      assert.equal(fixture.readCommittedValue(reader), 2);
+    } finally {
+      reader.close();
+    }
+    const after = sqliteDurableSnapshot(fixture.path);
+    assert.deepEqual(after, committedSnapshot);
+    assert.notDeepEqual(after, before);
+  } finally {
+    peer?.close();
+  }
 }
 
 function demand(values: DemandValues): ResourceDemand {
@@ -409,6 +855,7 @@ function acceptInput(
     selectedPlanId: selectedPlanId(record),
     ownerDecisionId,
     approverId: "owner-1",
+    ownerSourceIdentity: "test-owner-source/owner-1",
     expectedPortfolioVersion: record.portfolioVersion,
     expectedCapacityModelVersion: record.capacityModelVersion,
     expectedCapacityPlanVersion: record.capacityPlanVersion,
@@ -727,6 +1174,2122 @@ describe("M2 acceptance compare-and-swap A-F", () => {
       assert.equal(item.store.getPortfolio().acceptedObligations.length, 1);
     } finally {
       dispose(item);
+    }
+  });
+});
+
+describe("M2 Qodo PR #5 atomicity and database incarnation", () => {
+  test("acceptance and its exact grant roll back and replay as one durable pair", () => {
+    const item = tempStoreFromState(initialState());
+    try {
+      const admission = evaluate(item.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        item.store.getPortfolio().versions,
+        admission,
+        "qodo-atomic-grant",
+        "qodo-atomic-grant-decision",
+        "qodo-atomic-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const before = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance,
+            grant: {
+              ...grant,
+              scope: {
+                ...grant.scope,
+                objectiveId: "objective/qodo-injected-failure",
+              },
+            },
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), before);
+
+      const committed = item.store.acceptPromiseAndIssueGrant({
+        acceptance,
+        grant,
+      });
+      assert.equal(committed.acceptance.status, "COMMITTED");
+      assert.ok(committed.grant);
+      assert.equal(
+        item.store
+          .getAdmissionRecord(admission.admissionRecordId)
+          .addenda.filter((addendum) => addendum.kind === "acceptance_commit")
+          .length,
+        1,
+      );
+      assert.deepEqual(
+        item.store.acceptPromiseAndIssueGrant({ acceptance, grant }),
+        committed,
+      );
+      const after = durableState(item.path);
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance,
+            grant: { ...grant, selectedBundleId: "qodo-conflicting-bundle" },
+          }),
+        StatefulInputError,
+      );
+      assert.deepEqual(durableState(item.path), after);
+    } finally {
+      dispose(item);
+    }
+  });
+
+  test("database incarnation migrates once, survives restart, and rejects mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-incarnation-"));
+    const path = join(directory, "m2 with spaces.sqlite");
+    const uninitialized = new DatabaseSync(path);
+    uninitialized.close();
+    const store = createStore({ path, initialState: initialState() });
+    store.close();
+    try {
+      const first = readDatabaseInstanceIdentity(path, "m2", "factory-1");
+      const restarted = createStore({ path });
+      restarted.close();
+      assert.equal(
+        readDatabaseInstanceIdentity(path, "m2", "factory-1"),
+        first,
+      );
+      const database = new DatabaseSync(path);
+      try {
+        assert.throws(
+          () =>
+            database
+              .prepare(
+                "UPDATE database_incarnation SET incarnation_id = ? WHERE singleton = 1",
+              )
+              .run("database-incarnation/forged"),
+          /database incarnation is immutable/u,
+        );
+        assert.throws(
+          () =>
+            database
+              .prepare("DELETE FROM database_incarnation WHERE singleton = 1")
+              .run(),
+          /database incarnation is immutable/u,
+        );
+      } finally {
+        database.close();
+      }
+      assert.equal(
+        readDatabaseInstanceIdentity(path, "m2", "factory-1"),
+        first,
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R2.3 acceptance replay rejects a different approver without mutation", async () => {
+    const item = tempStoreFromState(initialState());
+    try {
+      const admission = evaluate(item.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        item.store.getPortfolio().versions,
+        admission,
+        "qodo-r2-grant",
+        "qodo-r2-grant-decision",
+        "qodo-r2-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const committed = item.store.acceptPromiseAndIssueGrant({
+        acceptance,
+        grant,
+      });
+      const committedSnapshot = durableState(item.path);
+
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance: { ...acceptance, approverId: "owner-2" },
+            grant,
+          }),
+        /approver|immutable|decision data|conflicting identity/u,
+      );
+      assert.deepEqual(durableState(item.path), committedSnapshot);
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              ownerSourceIdentity: "test-owner-source/conflicting-adapter",
+            },
+            grant,
+          }),
+        /complete immutable authorization request|conflicting identity/u,
+      );
+      assert.deepEqual(durableState(item.path), committedSnapshot);
+
+      item.store.close();
+      const restarted = createStore({ path: item.path, now: () => START });
+      try {
+        assert.deepEqual(
+          restarted.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          committed,
+        );
+        assert.throws(
+          () =>
+            restarted.acceptPromiseAndIssueGrant({
+              acceptance: { ...acceptance, approverId: "owner-after-restart" },
+              grant,
+            }),
+          /approver|immutable|decision data|conflicting identity/u,
+        );
+      } finally {
+        restarted.close();
+      }
+      assert.deepEqual(durableState(item.path), committedSnapshot);
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+
+    const concurrent = tempStoreFromState(initialState());
+    try {
+      const admission = evaluate(concurrent.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        concurrent.store.getPortfolio().versions,
+        admission,
+        "qodo-r2-concurrent-grant",
+        "qodo-r2-concurrent-grant-decision",
+        "qodo-r2-concurrent-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const peer = createStore({ path: concurrent.path, now: () => START });
+      try {
+        const differentApprovers = await Promise.allSettled([
+          Promise.resolve().then(() =>
+            concurrent.store.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          ),
+          Promise.resolve().then(() =>
+            peer.acceptPromiseAndIssueGrant({
+              acceptance: { ...acceptance, approverId: "owner-2" },
+              grant,
+            }),
+          ),
+        ]);
+        assert.equal(
+          differentApprovers.filter((result) => result.status === "fulfilled")
+            .length,
+          1,
+        );
+        assert.equal(
+          differentApprovers.filter((result) => result.status === "rejected")
+            .length,
+          1,
+        );
+        const sameApprover = await Promise.all([
+          Promise.resolve().then(() =>
+            concurrent.store.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          ),
+          Promise.resolve().then(() =>
+            peer.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          ),
+        ]);
+        assert.deepEqual(sameApprover[0], sameApprover[1]);
+      } finally {
+        peer.close();
+      }
+      const finalSnapshot = durableState(concurrent.path);
+      assert.equal(finalSnapshot["owner_decisions"]?.length, 2);
+      assert.equal(finalSnapshot["grants"]?.length, 1);
+      assert.equal(
+        finalSnapshot["admission_addenda"]?.filter((row) =>
+          row.includes('"kind":"acceptance_commit"'),
+        ).length,
+        1,
+      );
+    } finally {
+      dispose(concurrent);
+    }
+  });
+
+  test("Qodo R3.4 legacy acceptance and grant replay without rewriting history", () => {
+    const item = tempStoreFromState(initialState());
+    let closed = false;
+    try {
+      const admission = evaluate(item.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        item.store.getPortfolio().versions,
+        admission,
+        "qodo-r3-legacy-grant",
+        "qodo-r3-legacy-grant-decision",
+        "qodo-r3-legacy-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const committed = item.store.acceptPromiseAndIssueGrant({
+        acceptance,
+        grant,
+      });
+      item.store.close();
+      closed = true;
+
+      const fixture = new DatabaseSync(item.path);
+      try {
+        const row = fixture
+          .prepare(
+            "SELECT sequence, body_json FROM admission_addenda WHERE kind = 'acceptance_commit'",
+          )
+          .get() as Record<string, unknown>;
+        const body = JSON.parse(String(row["body_json"])) as Record<
+          string,
+          unknown
+        >;
+        delete body["authorizationRequest"];
+        fixture.exec("DROP TRIGGER admission_addenda_immutable_update");
+        fixture
+          .prepare("UPDATE admission_addenda SET body_json = ? WHERE sequence = ?")
+          .run(JSON.stringify(body), Number(row["sequence"]));
+        fixture.exec(`
+          CREATE TRIGGER admission_addenda_immutable_update
+          BEFORE UPDATE ON admission_addenda
+          BEGIN
+            SELECT RAISE(ABORT, 'admission_addenda rows are immutable');
+          END;
+        `);
+      } finally {
+        fixture.close();
+      }
+
+      const beforeReplay = durableState(item.path);
+      const restarted = createStore({ path: item.path, now: () => START });
+      try {
+        assert.deepEqual(
+          restarted.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          committed,
+        );
+        const assertCompatibilityConflict = (operation: () => unknown): void => {
+          assert.throws(
+            operation,
+            /compatibility|conflict|immutable|not found|selected plan|basis|reused|decision data/u,
+          );
+          assert.deepEqual(durableState(item.path), beforeReplay);
+        };
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: { ...acceptance, approverId: "owner-legacy-conflict" },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              ownerSourceIdentity: "test-owner-source/legacy-conflict",
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              admissionRecordId: "admission/legacy-conflict",
+            },
+            grant: {
+              ...grant,
+              admissionRecordId: "admission/legacy-conflict",
+            },
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              ownerDecisionId: "owner-decision/legacy-conflict",
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: { ...acceptance, selectedPlanId: "plan/legacy-conflict" },
+            grant: { ...grant, selectedPlanId: "plan/legacy-conflict" },
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              expectedCapacityModelVersion: "capacity-model/v999",
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              expectedCalibrationFrontierDigest: `sha256:${"f".repeat(64)}`,
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance,
+            grant: { ...grant, selectedBundleId: "bundle/legacy-conflict" },
+          }),
+        );
+      } finally {
+        restarted.close();
+      }
+      assert.deepEqual(durableState(item.path), beforeReplay);
+    } finally {
+      if (!closed) item.store.close();
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R3.5 exact admission basis replay covers every authoritative input", async () => {
+    const exact = tempStoreFromState(initialState());
+    try {
+      const proposal = rush("basis-exact");
+      const first = exact.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+      assert.equal(
+        exact.store.evaluateAndRecordAdmissionOrReplay({ proposal })
+          .admissionRecordId,
+        first.admissionRecordId,
+      );
+      const peer = createStore({ path: exact.path, now: () => START });
+      try {
+        const concurrent = await Promise.all([
+          Promise.resolve().then(() =>
+            exact.store.evaluateAndRecordAdmissionOrReplay({ proposal }),
+          ),
+          Promise.resolve().then(() =>
+            peer.evaluateAndRecordAdmissionOrReplay({ proposal }),
+          ),
+        ]);
+        assert.equal(concurrent[0].admissionRecordId, first.admissionRecordId);
+        assert.equal(concurrent[1].admissionRecordId, first.admissionRecordId);
+      } finally {
+        peer.close();
+      }
+      exact.store.close();
+      const restarted = createStore({ path: exact.path, now: () => START });
+      try {
+        assert.equal(
+          restarted.evaluateAndRecordAdmissionOrReplay({ proposal })
+            .admissionRecordId,
+          first.admissionRecordId,
+        );
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      rmSync(exact.directory, { recursive: true, force: true });
+    }
+
+    const basisMutation = (
+      name: string,
+      mutate: (item: TempStore) => void,
+    ): void => {
+      const item = tempStoreFromState(initialState());
+      try {
+        const proposal = rush(`basis-${name}`);
+        const first = item.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+        mutate(item);
+        const fresh = item.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+        assert.notEqual(fresh.admissionRecordId, first.admissionRecordId, name);
+        assert.equal(
+          item.store.evaluateAndRecordAdmissionOrReplay({ proposal })
+            .admissionRecordId,
+          fresh.admissionRecordId,
+          `${name} exact replay`,
+        );
+      } finally {
+        dispose(item);
+      }
+    };
+    basisMutation("portfolio-version", ({ store }) => {
+      store.withImmediateTransaction((database) => {
+        database.exec(
+          "UPDATE state_versions SET portfolio_version = portfolio_version + 1 WHERE singleton = 1",
+        );
+      });
+    });
+    basisMutation("capacity-model", ({ store }) => {
+      store.replaceCapacityModel({
+        resources: store.getPortfolio().resources.map((resource) =>
+          resource.resourceKey === AGENT
+            ? { ...resource, estimatorRule: "changed-estimator/v1" }
+            : resource,
+        ),
+      });
+    });
+    basisMutation("capacity-plan-value", ({ store }) => {
+      store.replaceCapacityPlan({
+        resources: store.getPortfolio().resources.map((resource) =>
+          resource.resourceKey === AGENT
+            ? { ...resource, capacity: resource.capacity + 1 }
+            : resource,
+        ),
+        ownerDecisionId: "owner-decision/basis-capacity-plan",
+        approverId: "owner-1",
+      });
+    });
+
+    const reservation = tempStoreFromState(initialState());
+    try {
+      const authorization = acceptAndGrant(reservation.store);
+      const proposal = rush("basis-reservation");
+      const before = reservation.store.evaluateAndRecordAdmissionOrReplay({
+        proposal,
+      });
+      reservation.store.claimExecution(
+        claimInput(reservation.store, authorization, "attempt/basis-reservation"),
+      );
+      const after = reservation.store.evaluateAndRecordAdmissionOrReplay({
+        proposal,
+      });
+      assert.notEqual(after.admissionRecordId, before.admissionRecordId);
+      assert.notDeepEqual(
+        after.fixedInFlightExecutionReservations,
+        before.fixedInFlightExecutionReservations,
+      );
+    } finally {
+      dispose(reservation);
+    }
+
+    const inputs = tempStoreFromState(initialState());
+    try {
+      const proposal = rush("basis-proposal-inputs");
+      const base = inputs.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+      const variants: readonly [string, ProposedObligation][] = [
+        [
+          "effect/proposal",
+          { ...proposal, requiredEffects: ["effect:changed"] },
+        ],
+        [
+          "deterministic decision",
+          {
+            ...proposal,
+            acceptanceDecision: {
+              ...proposal.acceptanceDecision,
+              objectiveId: "objective:changed",
+            },
+          },
+        ],
+        [
+          "plan",
+          {
+            ...proposal,
+            resourceDemand: {
+              ...proposal.resourceDemand,
+              [AGENT]: (proposal.resourceDemand[AGENT] ?? 0) + 1,
+            },
+          },
+        ],
+        [
+          "bundle",
+          {
+            ...proposal,
+            pendingOwnerDecisions: [
+              {
+                decisionId: "decision:changed",
+                kind: "consequential_effect",
+                objectiveId: "objective:changed-bundle",
+                evidencePacketId: "evidence:changed-bundle",
+                approverId: "owner-1",
+                executionBoundaryId: "boundary:changed-bundle",
+              },
+            ],
+          },
+        ],
+        ["evidence", { ...proposal, evidenceRefs: ["evidence:changed"] }],
+      ];
+      for (const [name, variant] of variants) {
+        const fresh = inputs.store.evaluateAndRecordAdmissionOrReplay({
+          proposal: variant,
+        });
+        assert.notEqual(fresh.admissionRecordId, base.admissionRecordId, name);
+        assert.equal(
+          inputs.store.evaluateAndRecordAdmissionOrReplay({ proposal: variant })
+            .admissionRecordId,
+          fresh.admissionRecordId,
+          `${name} exact replay`,
+        );
+      }
+    } finally {
+      dispose(inputs);
+    }
+  });
+});
+
+describe("Qodo Round 4 SQLite memory-store compatibility", () => {
+  test("constructs, operates, and idempotently closes a transient FlakeBrake store", () => {
+    const store = createStore({
+      path: ":memory:",
+      initialState: initialState(),
+      now: () => START,
+    });
+    assert.equal(store.getPortfolio().acceptedObligations.length, 1);
+    assert.equal(evaluate(store).decision, "ADMITTABLE");
+    store.close();
+    store.close();
+  });
+
+  test("constructs, operates, and idempotently closes a transient factory environment", () => {
+    const factory = new SyntheticFactoryEnvironment({
+      path: ":memory:",
+      environmentId: "factory-1",
+      now: () => START,
+    });
+    assert.equal(factory.getScheduleState().environmentId, "factory-1");
+    assert.equal(factory.getIncomingProposals().length, 1);
+    factory.close();
+    factory.close();
+  });
+
+  test("assigns separate memory databases distinct incarnation-based lock identities", () => {
+    const left = createStore({ path: ":memory:", initialState: initialState() });
+    const right = createStore({ path: ":memory:", initialState: initialState() });
+    const leftFactory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+    const rightFactory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+    try {
+      const leftIdentity = left.databaseInstanceIdentity("factory-1");
+      assert.equal(left.databaseInstanceIdentity("factory-1"), leftIdentity);
+      assert.notEqual(
+        right.databaseInstanceIdentity("factory-1"),
+        leftIdentity,
+      );
+      const leftFactoryIdentity = leftFactory.databaseInstanceIdentity();
+      assert.equal(leftFactory.databaseInstanceIdentity(), leftFactoryIdentity);
+      assert.notEqual(
+        rightFactory.databaseInstanceIdentity(),
+        leftFactoryIdentity,
+      );
+      assert.throws(
+        () => readDatabaseInstanceIdentity(":memory:", "m2", "factory-1"),
+        /no reopenable instance identity/u,
+      );
+    } finally {
+      rightFactory.close();
+      leftFactory.close();
+      right.close();
+      left.close();
+    }
+  });
+
+  test("closes M2 and factory handles after deterministic post-open initialization failures", () => {
+    for (const fixture of [
+      {
+        marker: "CREATE TABLE IF NOT EXISTS state_versions",
+        construct: () =>
+          createStore({ path: ":memory:", initialState: initialState() }),
+      },
+      {
+        marker: "CREATE TABLE IF NOT EXISTS factory_metadata",
+        construct: () => new SyntheticFactoryEnvironment({ path: ":memory:" }),
+      },
+    ]) {
+      const primary = new Error(`planned initialization failure: ${fixture.marker}`);
+      const originalExec = DatabaseSync.prototype.exec;
+      const originalClose = DatabaseSync.prototype.close;
+      let opened: DatabaseSync | undefined;
+      let closeCount = 0;
+      DatabaseSync.prototype.exec = function (sql: string): void {
+        opened = this;
+        if (sql.includes(fixture.marker)) throw primary;
+        originalExec.call(this, sql);
+      };
+      DatabaseSync.prototype.close = function (): void {
+        closeCount += 1;
+        originalClose.call(this);
+      };
+      try {
+        assert.throws(fixture.construct, (error: unknown) => error === primary);
+        assert.equal(closeCount, 1);
+        assert.throws(() => opened?.prepare("SELECT 1"), /not open|closed/u);
+      } finally {
+        DatabaseSync.prototype.exec = originalExec;
+        DatabaseSync.prototype.close = originalClose;
+        if (closeCount === 0) opened?.close();
+      }
+    }
+  });
+
+  test("preserves the initialization error when deterministic cleanup also rejects", () => {
+    const primary = new Error("planned primary initialization failure");
+    const cleanup = new Error("planned cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let closeCount = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (sql.includes("CREATE TABLE IF NOT EXISTS state_versions")) {
+        throw primary;
+      }
+      originalExec.call(this, sql);
+    };
+    DatabaseSync.prototype.close = function (): void {
+      closeCount += 1;
+      originalClose.call(this);
+      throw cleanup;
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: ":memory:", initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(closeCount, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+  });
+});
+
+describe("Qodo Round 5 failure-atomic SQLite store initialization", () => {
+  test("Qodo R5.1 rejects an M2 database opened as factory without durable contamination", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-m2-as-factory-"));
+    const path = join(directory, "m2.sqlite");
+    const store = createStore({ path, initialState: initialState() });
+    store.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => new SyntheticFactoryEnvironment({ path }),
+        /m2.*factory|factory.*m2|store kind/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.2 rejects a factory database opened as M2 without durable contamination", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-factory-as-m2-"));
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => createStore({ path }),
+        /factory.*m2|m2.*factory|store kind/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.3 reopens a current M2 store idempotently", () => {
+    const item = tempStore();
+    item.store.close();
+    try {
+      const before = sqliteDurableSnapshot(item.path);
+      const restarted = createStore({ path: item.path });
+      assert.equal(restarted.getPortfolio().acceptedObligations.length, 1);
+      restarted.close();
+      assert.deepEqual(sqliteDurableSnapshot(item.path), before);
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.4 reopens a current factory store idempotently", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-current-factory-"));
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      const restarted = new SyntheticFactoryEnvironment({ path });
+      assert.equal(restarted.getIncomingProposals().length, 1);
+      restarted.close();
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.5 creates a complete M2 schema from an empty database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-empty-m2-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    try {
+      const store = createStore({ path, initialState: initialState() });
+      store.close();
+      const snapshot = sqliteDurableSnapshot(path);
+      assert.ok(snapshot.tables.includes("state_versions"));
+      assert.deepEqual(snapshot.rows["database_incarnation"]?.length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.6 creates a complete factory schema from an empty database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-empty-factory-"));
+    const path = join(directory, "factory.sqlite");
+    new DatabaseSync(path).close();
+    try {
+      const factory = new SyntheticFactoryEnvironment({ path });
+      factory.close();
+      const snapshot = sqliteDurableSnapshot(path);
+      assert.ok(snapshot.tables.includes("factory_metadata"));
+      assert.deepEqual(snapshot.rows["database_incarnation"]?.length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.7 migrates a recognized legacy M2 schema without rewriting ledger rows", () => {
+    const item = tempStore();
+    item.store.close();
+    removeDatabaseIncarnation(item.path);
+    try {
+      const legacy = sqliteDurableSnapshot(item.path);
+      const ledgerRows = legacy.rows;
+      const restarted = createStore({ path: item.path });
+      restarted.close();
+      const migrated = sqliteDurableSnapshot(item.path);
+      assert.equal(migrated.rows["database_incarnation"]?.length, 1);
+      for (const [table, rows] of Object.entries(ledgerRows)) {
+        assert.deepEqual(migrated.rows[table], rows, table);
+      }
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.8 migrates a recognized legacy factory schema without rewriting application rows", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-legacy-factory-"));
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    removeDatabaseIncarnation(path);
+    try {
+      const legacy = sqliteDurableSnapshot(path);
+      const restarted = new SyntheticFactoryEnvironment({ path });
+      restarted.close();
+      const migrated = sqliteDurableSnapshot(path);
+      assert.equal(migrated.rows["database_incarnation"]?.length, 1);
+      for (const [table, rows] of Object.entries(legacy.rows)) {
+        assert.deepEqual(migrated.rows[table], rows, table);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.9 rejects an ambiguous mixed schema without mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-ambiguous-"));
+    const m2Path = join(directory, "mixed.sqlite");
+    const factoryPath = join(directory, "factory-source.sqlite");
+    const store = createStore({ path: m2Path, initialState: initialState() });
+    store.close();
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    copyApplicationSchema(factoryPath, m2Path);
+    try {
+      const before = sqliteDurableSnapshot(m2Path);
+      assert.throws(
+        () => {
+          const opened = createStore({ path: m2Path });
+          opened.close();
+        },
+        /ambiguous|cross-contaminated/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(m2Path), before);
+      assert.throws(
+        () => {
+          const opened = new SyntheticFactoryEnvironment({ path: m2Path });
+          opened.close();
+        },
+        /ambiguous|cross-contaminated/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(m2Path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.10 rejects a foreign SQLite database without mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-foreign-"));
+    const path = join(directory, "foreign.sqlite");
+    const database = new DatabaseSync(path);
+    database.exec("CREATE TABLE foreign_records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    database.prepare("INSERT INTO foreign_records (id, value) VALUES (1, 'foreign')").run();
+    database.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => {
+          const opened = createStore({ path, initialState: initialState() });
+          opened.close();
+        },
+        /foreign/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+      assert.throws(
+        () => {
+          const opened = new SyntheticFactoryEnvironment({ path });
+          opened.close();
+        },
+        /foreign/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.11 rejects a corrupt partial known schema without mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-partial-"));
+    const path = join(directory, "partial.sqlite");
+    const database = new DatabaseSync(path);
+    database.exec(`
+      CREATE TABLE state_versions (
+        singleton INTEGER PRIMARY KEY,
+        portfolio_version INTEGER NOT NULL,
+        capacity_model_version INTEGER NOT NULL,
+        capacity_plan_version INTEGER NOT NULL,
+        authorization_state_version INTEGER NOT NULL
+      ) STRICT
+    `);
+    database.close();
+    try {
+      const before = sqliteDurableSnapshot(path);
+      assert.throws(
+        () => {
+          const opened = createStore({ path, initialState: initialState() });
+          opened.close();
+        },
+        /corrupt|partial/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.12 rolls back partial M2 schema initialization and closes the handle", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-failed-m2-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned partial M2 schema initialization failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let closeCount = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (sql.includes("admission_records_immutable_update")) throw primary;
+    };
+    DatabaseSync.prototype.close = function (): void {
+      closeCount += 1;
+      originalClose.call(this);
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(closeCount, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.13 rolls back partial factory schema initialization and closes the handle", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-failed-factory-"));
+    const path = join(directory, "factory.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned partial factory schema initialization failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let closeCount = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (sql.includes("mutation_events_no_delete")) throw primary;
+    };
+    DatabaseSync.prototype.close = function (): void {
+      closeCount += 1;
+      originalClose.call(this);
+    };
+    try {
+      assert.throws(
+        () => new SyntheticFactoryEnvironment({ path }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(closeCount, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R5.14 keeps M2 and factory in-memory initialization supported", () => {
+    const store = createStore({ path: ":memory:", initialState: initialState() });
+    const factory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+    try {
+      assert.equal(store.getPortfolio().acceptedObligations.length, 1);
+      assert.equal(factory.getIncomingProposals().length, 1);
+      assert.notEqual(
+        store.databaseInstanceIdentity("factory-1"),
+        factory.databaseInstanceIdentity(),
+      );
+    } finally {
+      factory.close();
+      store.close();
+    }
+  });
+
+  test("Qodo R5.15 preserves the primary partial-initialization error when cleanup rejects", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r5-cleanup-error-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned primary Round 5 initialization failure");
+    const cleanup = new Error("planned Round 5 cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (sql.includes("admission_records_immutable_update")) throw primary;
+    };
+    DatabaseSync.prototype.close = function (): void {
+      originalClose.call(this);
+      throw cleanup;
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Qodo Round 6 hardened legacy and WAL initialization", () => {
+  test("Qodo R6.1 rejects every malformed legacy M2 schema without durable mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-malformed-m2-"));
+    const sourcePath = join(directory, "valid-m2.sqlite");
+    const factorySourcePath = join(directory, "valid-factory.sqlite");
+    const source = createStore({ path: sourcePath, initialState: initialState() });
+    source.close();
+    const factorySource = new SyntheticFactoryEnvironment({
+      path: factorySourcePath,
+    });
+    factorySource.close();
+    const fixtures: readonly LegacySchemaMutation[] = [
+      {
+        name: "declared type",
+        objectName: "portfolio_obligations",
+        fragment: ["body_json TEXT NOT NULL", "body_json BLOB NOT NULL"],
+      },
+      {
+        name: "nullability",
+        objectName: "portfolio_obligations",
+        fragment: ["body_json TEXT NOT NULL", "body_json TEXT"],
+      },
+      {
+        name: "primary key",
+        objectName: "portfolio_obligations",
+        fragment: ["obligation_id TEXT PRIMARY KEY", "obligation_id TEXT"],
+      },
+      {
+        name: "unique constraint",
+        objectName: "admission_addenda",
+        fragment: ["addendum_id TEXT NOT NULL UNIQUE", "addendum_id TEXT NOT NULL"],
+      },
+      {
+        name: "foreign key",
+        objectName: "grants",
+        fragment: [
+          "grant_allowance_key TEXT NOT NULL REFERENCES grant_allowances(grant_allowance_key)",
+          "grant_allowance_key TEXT NOT NULL",
+        ],
+      },
+      {
+        name: "check constraint",
+        objectName: "admission_records",
+        fragment: [
+          "decision TEXT NOT NULL CHECK (decision IN ('ADMITTABLE', 'REPLAN', 'REJECT'))",
+          "decision TEXT NOT NULL",
+        ],
+      },
+      {
+        name: "strictness",
+        objectName: "portfolio_obligations",
+        fragment: [") STRICT", ")"],
+      },
+      {
+        name: "required trigger",
+        omitObject: "admission_records_immutable_update",
+      },
+      {
+        name: "extra incompatible object",
+        extraSql: "CREATE TABLE unexpected_m2_extension (id INTEGER PRIMARY KEY) STRICT",
+      },
+    ];
+    try {
+      for (const [index, fixture] of fixtures.entries()) {
+        const path = join(directory, `malformed-m2-${index}.sqlite`);
+        createMutatedLegacySchema(sourcePath, path, fixture);
+        const before = sqliteDurableSnapshot(path);
+        assert.throws(
+          () => {
+            const opened = createStore({ path, initialState: initialState() });
+            opened.close();
+          },
+          /corrupt|partial|foreign|schema|classification/iu,
+          fixture.name,
+        );
+        assert.deepEqual(sqliteDurableSnapshot(path), before, fixture.name);
+      }
+
+      const mixedPath = join(directory, "malformed-m2-mixed.sqlite");
+      copyApplicationSchema(sourcePath, mixedPath);
+      copyApplicationSchema(factorySourcePath, mixedPath);
+      const mixedBefore = sqliteDurableSnapshot(mixedPath);
+      assert.throws(
+        () => {
+          const opened = createStore({
+            path: mixedPath,
+            initialState: initialState(),
+          });
+          opened.close();
+        },
+        /ambiguous|cross-contaminated/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(mixedPath), mixedBefore);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.2 rejects every malformed legacy factory schema without durable mutation", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r6-malformed-factory-"),
+    );
+    const sourcePath = join(directory, "valid-factory.sqlite");
+    const m2SourcePath = join(directory, "valid-m2.sqlite");
+    const source = new SyntheticFactoryEnvironment({ path: sourcePath });
+    source.close();
+    const m2Source = createStore({
+      path: m2SourcePath,
+      initialState: initialState(),
+    });
+    m2Source.close();
+    const fixtures: readonly LegacySchemaMutation[] = [
+      {
+        name: "declared type",
+        objectName: "incoming_proposals",
+        fragment: ["body_json TEXT NOT NULL", "body_json BLOB NOT NULL"],
+      },
+      {
+        name: "nullability",
+        objectName: "incoming_proposals",
+        fragment: ["body_json TEXT NOT NULL", "body_json TEXT"],
+      },
+      {
+        name: "primary key",
+        objectName: "incoming_proposals",
+        fragment: ["proposal_id TEXT PRIMARY KEY", "proposal_id TEXT"],
+      },
+      {
+        name: "unique constraint",
+        objectName: "schedule_reservations",
+        fragment: [
+          "source_execution_attempt_id TEXT UNIQUE",
+          "source_execution_attempt_id TEXT",
+        ],
+      },
+      {
+        name: "foreign key",
+        objectName: "mutation_events",
+        fragment: [
+          "execution_attempt_id TEXT NOT NULL UNIQUE\n        REFERENCES execution_results(execution_attempt_id)",
+          "execution_attempt_id TEXT NOT NULL UNIQUE",
+        ],
+      },
+      {
+        name: "check constraint",
+        objectName: "schedule_reservations",
+        fragment: [
+          "quantity INTEGER NOT NULL CHECK (quantity > 0)",
+          "quantity INTEGER NOT NULL",
+        ],
+      },
+      {
+        name: "strictness",
+        objectName: "incoming_proposals",
+        fragment: [") STRICT", ")"],
+      },
+      {
+        name: "required trigger",
+        omitObject: "incoming_proposals_no_update",
+      },
+      {
+        name: "extra incompatible object",
+        extraSql:
+          "CREATE TABLE unexpected_factory_extension (id INTEGER PRIMARY KEY) STRICT",
+      },
+    ];
+    try {
+      for (const [index, fixture] of fixtures.entries()) {
+        const path = join(directory, `malformed-factory-${index}.sqlite`);
+        createMutatedLegacySchema(sourcePath, path, fixture);
+        const before = sqliteDurableSnapshot(path);
+        assert.throws(
+          () => {
+            const opened = new SyntheticFactoryEnvironment({ path });
+            opened.close();
+          },
+          /corrupt|partial|foreign|schema|classification/iu,
+          fixture.name,
+        );
+        assert.deepEqual(sqliteDurableSnapshot(path), before, fixture.name);
+      }
+
+      const mixedPath = join(directory, "malformed-factory-mixed.sqlite");
+      copyApplicationSchema(sourcePath, mixedPath);
+      copyApplicationSchema(m2SourcePath, mixedPath);
+      const mixedBefore = sqliteDurableSnapshot(mixedPath);
+      assert.throws(
+        () => {
+          const opened = new SyntheticFactoryEnvironment({ path: mixedPath });
+          opened.close();
+        },
+        /ambiguous|cross-contaminated/iu,
+      );
+      assert.deepEqual(sqliteDurableSnapshot(mixedPath), mixedBefore);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.3 WAL failure is atomic for a new M2 path", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-new-m2-"));
+    const path = join(directory, "m2.sqlite");
+    try {
+      assertInjectedWalFailureIsAtomic(path, () =>
+        createStore({ path, initialState: initialState() }),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.4 WAL failure is atomic for a new factory path", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r6-wal-new-factory-"),
+    );
+    const path = join(directory, "factory.sqlite");
+    try {
+      assertInjectedWalFailureIsAtomic(
+        path,
+        () => new SyntheticFactoryEnvironment({ path }),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  for (const fixture of [
+    {
+      name: "Qodo R6.5 WAL failure is atomic for a pre-existing empty M2 target",
+      prefix: "flakebrake-r6-wal-empty-m2-",
+      filename: "m2.sqlite",
+      construct: (path: string) =>
+        createStore({ path, initialState: initialState() }),
+    },
+    {
+      name: "Qodo R6.6 WAL failure is atomic for a pre-existing empty factory target",
+      prefix: "flakebrake-r6-wal-empty-factory-",
+      filename: "factory.sqlite",
+      construct: (path: string) => new SyntheticFactoryEnvironment({ path }),
+    },
+  ]) {
+    test(fixture.name, () => {
+      const directory = mkdtempSync(join(tmpdir(), fixture.prefix));
+      const path = join(directory, fixture.filename);
+      new DatabaseSync(path).close();
+      try {
+        assertInjectedWalFailureIsAtomic(path, () => fixture.construct(path));
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("Qodo R6.7 WAL failure cannot migrate a valid legacy M2 database", () => {
+    const item = tempStore();
+    item.store.close();
+    removeDatabaseIncarnation(item.path);
+    setJournalMode(item.path, "DELETE");
+    try {
+      assertInjectedWalFailureIsAtomic(item.path, () =>
+        createStore({ path: item.path }),
+      );
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.8 WAL failure cannot migrate a valid legacy factory database", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r6-wal-legacy-factory-"),
+    );
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    removeDatabaseIncarnation(path);
+    setJournalMode(path, "DELETE");
+    try {
+      assertInjectedWalFailureIsAtomic(
+        path,
+        () => new SyntheticFactoryEnvironment({ path }),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.9 WAL failure leaves a current M2 database unchanged", () => {
+    const item = tempStore();
+    item.store.close();
+    setJournalMode(item.path, "DELETE");
+    try {
+      assertInjectedWalFailureIsAtomic(item.path, () =>
+        createStore({ path: item.path }),
+      );
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.10 WAL failure leaves a current factory database unchanged", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r6-wal-current-factory-"),
+    );
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    setJournalMode(path, "DELETE");
+    try {
+      assertInjectedWalFailureIsAtomic(
+        path,
+        () => new SyntheticFactoryEnvironment({ path }),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.11 wrong-kind rejection occurs before WAL preparation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-kind-"));
+    const path = join(directory, "m2.sqlite");
+    const store = createStore({ path, initialState: initialState() });
+    store.close();
+    setJournalMode(path, "DELETE");
+    const before = sqliteDurableSnapshot(path);
+    const originalExec = DatabaseSync.prototype.exec;
+    let walAttempts = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) walAttempts += 1;
+      originalExec.call(this, sql);
+    };
+    try {
+      assert.throws(
+        () => new SyntheticFactoryEnvironment({ path }),
+        /m2.*factory|factory.*m2|store kind/iu,
+      );
+      assert.equal(walAttempts, 0);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.12 foreign rejection occurs before WAL preparation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-foreign-"));
+    const path = join(directory, "foreign.sqlite");
+    const database = new DatabaseSync(path);
+    database.exec("CREATE TABLE foreign_record (id INTEGER PRIMARY KEY) STRICT");
+    database.close();
+    const before = sqliteDurableSnapshot(path);
+    const originalExec = DatabaseSync.prototype.exec;
+    let walAttempts = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) walAttempts += 1;
+      originalExec.call(this, sql);
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        /foreign/iu,
+      );
+      assert.equal(walAttempts, 0);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.13 schema failure after WAL preparation restores the exact logical empty target", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-schema-"));
+    const path = join(directory, "m2.sqlite");
+    new DatabaseSync(path).close();
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned schema failure after WAL preparation");
+    const originalExec = DatabaseSync.prototype.exec;
+    let walAttempts = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) walAttempts += 1;
+      originalExec.call(this, sql);
+      if (sql.includes("admission_records_immutable_update")) throw primary;
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(walAttempts, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.14 migration failure after WAL preparation restores the exact logical legacy database", () => {
+    const item = tempStore();
+    item.store.close();
+    removeDatabaseIncarnation(item.path);
+    setJournalMode(item.path, "DELETE");
+    const before = sqliteDurableSnapshot(item.path);
+    const primary = new Error("planned migration failure after WAL preparation");
+    const originalExec = DatabaseSync.prototype.exec;
+    let walAttempts = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) walAttempts += 1;
+      originalExec.call(this, sql);
+      if (sql.includes("CREATE TABLE IF NOT EXISTS database_incarnation")) {
+        throw primary;
+      }
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: item.path }),
+        (error: unknown) => error === primary,
+      );
+      assert.equal(walAttempts, 1);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assertLogicalAndSidecarSnapshotEqual(
+        sqliteDurableSnapshot(item.path),
+        before,
+      );
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.15 cleanup failure preserves the primary WAL error", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-cleanup-"));
+    const path = join(directory, "m2.sqlite");
+    const before = sqliteDurableSnapshot(path);
+    const primary = new Error("planned primary WAL failure");
+    const cleanup = new Error("planned WAL cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) {
+        originalExec.call(this, sql);
+        throw primary;
+      }
+      originalExec.call(this, sql);
+    };
+    DatabaseSync.prototype.close = function (): void {
+      originalClose.call(this);
+      throw cleanup;
+    };
+    try {
+      assert.throws(
+        () => createStore({ path, initialState: initialState() }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+    }
+    try {
+      assert.deepEqual(sqliteDurableSnapshot(path), before);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.16 successful durable initialization establishes WAL for both stores", () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-success-"));
+    const m2Path = join(directory, "m2.sqlite");
+    const factoryPath = join(directory, "factory.sqlite");
+    try {
+      const store = createStore({ path: m2Path, initialState: initialState() });
+      const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+      factory.close();
+      store.close();
+      assert.equal(sqliteDurableSnapshot(m2Path).journalMode, "wal");
+      assert.equal(sqliteDurableSnapshot(factoryPath).journalMode, "wal");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R6.17 in-memory stores remain non-WAL and operational", () => {
+    const originalExec = DatabaseSync.prototype.exec;
+    let walAttempts = 0;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (/PRAGMA\s+journal_mode\s*=\s*WAL/iu.test(sql)) walAttempts += 1;
+      originalExec.call(this, sql);
+    };
+    try {
+      const store = createStore({ path: ":memory:", initialState: initialState() });
+      const factory = new SyntheticFactoryEnvironment({ path: ":memory:" });
+      assert.equal(store.getPortfolio().acceptedObligations.length, 1);
+      assert.equal(factory.getIncomingProposals().length, 1);
+      factory.close();
+      store.close();
+      assert.equal(walAttempts, 0);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+  });
+});
+
+describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
+  test("Qodo R7.1 failed M2 initialization cannot overwrite a concurrent commit", () => {
+    const item = tempStore();
+    item.store.close();
+    try {
+      assertConcurrentCommitSurvivesInitializationFailure({
+        construct: () => createStore({ path: item.path }),
+        failureMarker: "admission_records_immutable_update",
+        path: item.path,
+        readCommittedValue: (database) =>
+          Number(
+            (
+              database
+                .prepare(
+                  "SELECT portfolio_version FROM state_versions WHERE singleton = 1",
+                )
+                .get() as Record<string, unknown>
+            )["portfolio_version"],
+          ),
+        writeSql:
+          "UPDATE state_versions SET portfolio_version = 2 WHERE singleton = 1",
+      });
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.2 failed factory initialization cannot invalidate a concurrent WAL commit", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-concurrent-factory-"),
+    );
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    try {
+      assertConcurrentCommitSurvivesInitializationFailure({
+        construct: () => new SyntheticFactoryEnvironment({ path }),
+        failureMarker: "incoming_proposals_no_update",
+        path,
+        readCommittedValue: (database) =>
+          Number(
+            (
+              database
+                .prepare(
+                  "SELECT state_version FROM factory_metadata WHERE singleton = 1",
+                )
+                .get() as Record<string, unknown>
+            )["state_version"],
+          ),
+        writeSql:
+          "UPDATE factory_metadata SET state_version = 2 WHERE singleton = 1",
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.3 WAL preparation failures preserve later independent commits", () => {
+    const m2 = tempStore();
+    m2.store.close();
+    const factoryDirectory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-wal-boundary-factory-"),
+    );
+    const factoryPath = join(factoryDirectory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    setJournalMode(m2.path, "DELETE");
+    setJournalMode(factoryPath, "DELETE");
+    try {
+      for (const fixture of [
+        {
+          construct: () => createStore({ path: m2.path }),
+          path: m2.path,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT portfolio_version FROM state_versions WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["portfolio_version"],
+            ),
+          writeSql:
+            "UPDATE state_versions SET portfolio_version = 2 WHERE singleton = 1",
+        },
+        {
+          construct: () => new SyntheticFactoryEnvironment({ path: factoryPath }),
+          path: factoryPath,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT state_version FROM factory_metadata WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["state_version"],
+            ),
+          writeSql:
+            "UPDATE factory_metadata SET state_version = 2 WHERE singleton = 1",
+        },
+      ]) {
+        assertConcurrentCommitSurvivesInitializationFailure({
+          ...fixture,
+          failureMarker: "PRAGMA journal_mode = WAL",
+        });
+      }
+    } finally {
+      rmSync(factoryDirectory, { recursive: true, force: true });
+      rmSync(m2.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.4 incarnation failures preserve later independent commits", () => {
+    const m2 = tempStore();
+    m2.store.close();
+    const factoryDirectory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-incarnation-boundary-factory-"),
+    );
+    const factoryPath = join(factoryDirectory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    try {
+      for (const fixture of [
+        {
+          construct: () => createStore({ path: m2.path }),
+          path: m2.path,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT capacity_plan_version FROM state_versions WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["capacity_plan_version"],
+            ),
+          writeSql:
+            "UPDATE state_versions SET capacity_plan_version = 2 WHERE singleton = 1",
+        },
+        {
+          construct: () => new SyntheticFactoryEnvironment({ path: factoryPath }),
+          path: factoryPath,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT state_version FROM factory_metadata WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["state_version"],
+            ),
+          writeSql:
+            "UPDATE factory_metadata SET state_version = 2 WHERE singleton = 1",
+        },
+      ]) {
+        assertConcurrentCommitSurvivesInitializationFailure({
+          ...fixture,
+          failureMarker: "CREATE TABLE IF NOT EXISTS database_incarnation",
+        });
+      }
+    } finally {
+      rmSync(factoryDirectory, { recursive: true, force: true });
+      rmSync(m2.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.5 existing WAL and SHM state remains consistent through rollback", () => {
+    const item = tempStore();
+    item.store.close();
+    const identity = readDatabaseInstanceIdentity(item.path, "m2", "round7");
+    const peer = new DatabaseSync(item.path);
+    peer.exec("PRAGMA wal_autocheckpoint = 0");
+    peer.exec(
+      "BEGIN IMMEDIATE; UPDATE state_versions SET portfolio_version = 2 WHERE singleton = 1; COMMIT",
+    );
+    assert.equal(existsSync(`${item.path}-wal`), true);
+    assert.equal(existsSync(`${item.path}-shm`), true);
+    const primary = new Error("planned failure with existing WAL sidecars");
+    const originalExec = DatabaseSync.prototype.exec;
+    let injected = false;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (
+        !injected &&
+        databaseHandleUsesPath(this, item.path) &&
+        sql.includes("admission_records_immutable_update")
+      ) {
+        injected = true;
+        throw primary;
+      }
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: item.path }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assert.equal(injected, true);
+      assert.equal(
+        (peer.prepare("PRAGMA quick_check").get() as Record<string, unknown>)[
+          "quick_check"
+        ],
+        "ok",
+      );
+      assert.equal(
+        Number(
+          (
+            peer
+              .prepare(
+                "SELECT portfolio_version FROM state_versions WHERE singleton = 1",
+              )
+              .get() as Record<string, unknown>
+          )["portfolio_version"],
+        ),
+        2,
+      );
+    } finally {
+      peer.close();
+    }
+    try {
+      const restarted = createStore({ path: item.path });
+      restarted.close();
+      assert.equal(
+        readDatabaseInstanceIdentity(item.path, "m2", "round7"),
+        identity,
+      );
+      const snapshot = sqliteDurableSnapshot(item.path);
+      assert.equal(snapshot.journalMode, "wal");
+      assert.equal(
+        snapshot.rows["state_versions"]?.some((row) =>
+          row.includes('"portfolio_version":2'),
+        ),
+        true,
+      );
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.6 failed new-store initialization removes only invocation-owned files and restarts", () => {
+    for (const fixture of [
+      {
+        construct: (path: string) =>
+          createStore({ path, initialState: initialState() }),
+        filename: "m2.sqlite",
+        marker: "admission_records_immutable_update",
+        prefix: "flakebrake-r7-new-m2-",
+      },
+      {
+        construct: (path: string) => new SyntheticFactoryEnvironment({ path }),
+        filename: "factory.sqlite",
+        marker: "incoming_proposals_no_update",
+        prefix: "flakebrake-r7-new-factory-",
+      },
+    ]) {
+      const directory = mkdtempSync(join(tmpdir(), fixture.prefix));
+      const path = join(directory, fixture.filename);
+      const primary = new Error(`planned new-store failure: ${fixture.filename}`);
+      const originalExec = DatabaseSync.prototype.exec;
+      let injected = false;
+      DatabaseSync.prototype.exec = function (sql: string): void {
+        originalExec.call(this, sql);
+        if (
+          !injected &&
+          databaseHandleUsesPath(this, path) &&
+          sql.includes(fixture.marker)
+        ) {
+          injected = true;
+          throw primary;
+        }
+      };
+      try {
+        assert.throws(
+          () => fixture.construct(path),
+          (error: unknown) => error === primary,
+        );
+      } finally {
+        DatabaseSync.prototype.exec = originalExec;
+      }
+      try {
+        assert.equal(injected, true);
+        for (const artifact of [
+          path,
+          `${path}-wal`,
+          `${path}-shm`,
+          `${path}-journal`,
+        ]) {
+          assert.equal(existsSync(artifact), false, artifact);
+        }
+        const restarted = fixture.construct(path) as {
+          readonly close?: () => void;
+        };
+        restarted.close?.();
+        const database = new DatabaseSync(path, { readOnly: true });
+        try {
+          assert.equal(
+            Number(
+              (
+                database
+                  .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                  .get() as Record<string, unknown>
+              )["count"],
+            ),
+            1,
+          );
+          assert.equal(
+            (database.prepare("PRAGMA quick_check").get() as Record<
+              string,
+              unknown
+            >)["quick_check"],
+            "ok",
+          );
+        } finally {
+          database.close();
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("Qodo R7.7 failed legacy migrations remain replayable with one identity", () => {
+    const m2 = tempStore();
+    m2.store.close();
+    removeDatabaseIncarnation(m2.path);
+    setJournalMode(m2.path, "DELETE");
+    const factoryDirectory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-legacy-factory-"),
+    );
+    const factoryPath = join(factoryDirectory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    removeDatabaseIncarnation(factoryPath);
+    setJournalMode(factoryPath, "DELETE");
+    try {
+      for (const fixture of [
+        {
+          construct: () => createStore({ path: m2.path }),
+          path: m2.path,
+        },
+        {
+          construct: () => new SyntheticFactoryEnvironment({ path: factoryPath }),
+          path: factoryPath,
+        },
+      ]) {
+        const before = sqliteDurableSnapshot(fixture.path);
+        const primary = new Error(`planned legacy migration failure: ${fixture.path}`);
+        const originalExec = DatabaseSync.prototype.exec;
+        let injected = false;
+        DatabaseSync.prototype.exec = function (sql: string): void {
+          originalExec.call(this, sql);
+          if (
+            !injected &&
+            databaseHandleUsesPath(this, fixture.path) &&
+            sql.includes("CREATE TABLE IF NOT EXISTS database_incarnation")
+          ) {
+            injected = true;
+            throw primary;
+          }
+        };
+        try {
+          assert.throws(fixture.construct, (error: unknown) => error === primary);
+        } finally {
+          DatabaseSync.prototype.exec = originalExec;
+        }
+        assert.equal(injected, true);
+        assertLogicalAndSidecarSnapshotEqual(
+          sqliteDurableSnapshot(fixture.path),
+          before,
+        );
+        const restarted = fixture.construct() as { readonly close?: () => void };
+        restarted.close?.();
+        const database = new DatabaseSync(fixture.path, { readOnly: true });
+        try {
+          assert.equal(
+            Number(
+              (
+                database
+                  .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                  .get() as Record<string, unknown>
+              )["count"],
+            ),
+            1,
+          );
+        } finally {
+          database.close();
+        }
+      }
+    } finally {
+      rmSync(factoryDirectory, { recursive: true, force: true });
+      rmSync(m2.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.8 two concurrent initializers converge on one store identity", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-concurrent-initializers-"),
+    );
+    const path = join(directory, "m2.sqlite");
+    const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const moduleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const workerSource = String.raw`
+      const { parentPort, workerData } = require("node:worker_threads");
+      parentPort.postMessage({ kind: "ready" });
+      Atomics.wait(new Int32Array(workerData.barrier), 0, 0);
+      import(workerData.moduleUrl).then(({ openSqlite }) => {
+        const database = openSqlite(workerData.path);
+        try {
+          const row = database.prepare(
+            "SELECT incarnation_id FROM database_incarnation WHERE singleton = 1",
+          ).get();
+          parentPort.postMessage({ kind: "result", incarnationId: row.incarnation_id });
+        } finally {
+          database.close();
+        }
+      }).catch((error) => {
+        parentPort.postMessage({ kind: "error", message: String(error?.stack ?? error) });
+      });
+    `;
+    const workers = [
+      new Worker(workerSource, {
+        eval: true,
+        workerData: { barrier, moduleUrl, path },
+      }),
+      new Worker(workerSource, {
+        eval: true,
+        workerData: { barrier, moduleUrl, path },
+      }),
+    ];
+    const ready = workers.map(
+      (worker) =>
+        new Promise<void>((resolve, reject) => {
+          worker.once("error", reject);
+          worker.once("message", (message: unknown) => {
+            if (
+              typeof message === "object" &&
+              message !== null &&
+              "kind" in message &&
+              message.kind === "ready"
+            ) {
+              resolve();
+            } else {
+              reject(new Error("initializer worker did not reach the barrier"));
+            }
+          });
+        }),
+    );
+    try {
+      await Promise.all(ready);
+      const resultPromises = workers.map(
+          (worker) =>
+            new Promise<string>((resolve, reject) => {
+              worker.once("error", reject);
+              worker.on("message", (message: unknown) => {
+                if (
+                  typeof message !== "object" ||
+                  message === null ||
+                  !("kind" in message)
+                ) {
+                  return;
+                }
+                if (message.kind === "error") {
+                  reject(
+                    new Error(
+                      "message" in message
+                        ? String(message.message)
+                        : "initializer worker failed",
+                    ),
+                  );
+                } else if (
+                  message.kind === "result" &&
+                  "incarnationId" in message
+                ) {
+                  resolve(String(message.incarnationId));
+                }
+              });
+            }),
+      );
+      Atomics.store(new Int32Array(barrier), 0, 1);
+      Atomics.notify(new Int32Array(barrier), 0, workers.length);
+      const results = await Promise.all(resultPromises);
+      assert.equal(results[0], results[1]);
+      const database = new DatabaseSync(path, { readOnly: true });
+      try {
+        assert.equal(
+          Number(
+            (
+              database
+                .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                .get() as Record<string, unknown>
+            )["count"],
+          ),
+          1,
+        );
+        assert.equal(
+          (database.prepare("PRAGMA quick_check").get() as Record<
+            string,
+            unknown
+          >)["quick_check"],
+          "ok",
+        );
+      } finally {
+        database.close();
+      }
+    } finally {
+      await Promise.all(workers.map(async (worker) => worker.terminate()));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.9 cleanup diagnostics preserve the primary initialization error", () => {
+    const item = tempStore();
+    item.store.close();
+    setJournalMode(item.path, "DELETE");
+    const primary = new Error("planned Round 7 initialization failure");
+    const cleanup = new Error("planned Round 7 journal cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    let primaryInjected = false;
+    let cleanupInjected = false;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (
+        databaseHandleUsesPath(this, item.path) &&
+        /PRAGMA\s+journal_mode\s*=\s*DELETE/iu.test(sql)
+      ) {
+        cleanupInjected = true;
+        throw cleanup;
+      }
+      originalExec.call(this, sql);
+      if (
+        !primaryInjected &&
+        databaseHandleUsesPath(this, item.path) &&
+        sql.includes("admission_records_immutable_update")
+      ) {
+        primaryInjected = true;
+        throw primary;
+      }
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: item.path }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assert.equal(primaryInjected, true);
+      assert.equal(cleanupInjected, true);
+      assert.equal(
+        (primary as Error & { readonly cleanupErrors?: readonly unknown[] })
+          .cleanupErrors?.includes(cleanup),
+        true,
+      );
+      const restarted = createStore({ path: item.path });
+      restarted.close();
+      assert.equal(sqliteDurableSnapshot(item.path).journalMode, "wal");
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
     }
   });
 });

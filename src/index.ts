@@ -32,6 +32,10 @@ export {
   startFactoryMcpCluster,
 } from "./mcp.js";
 export {
+  startFactoryMcpHttpCluster,
+  startFactoryMcpHttpService,
+} from "./mcp-http.js";
+export {
   HERO_ENVIRONMENT_ID,
   HERO_HORIZON_END,
   HERO_HORIZON_START,
@@ -52,5 +56,49 @@ export type * from "./domain.js";
 export type * from "./stateful-domain.js";
 export type * from "./factory-environment.js";
 export type * from "./mcp.js";
+export type * from "./mcp-http.js";
+export { M4MissionStore } from "./m4-mission-store.js";
+export type * from "./m4-mission-store.js";
+export {
+  DETERMINISTIC_MODEL_NAME,
+  DETERMINISTIC_MODEL_PROVIDER_NAME,
+  FLAKEBRAKE_ROOT_AGENT_NAME,
+  TRUEFORGE_SDK_VERSION,
+  TRUEFORGE_SERVER_VERSION,
+  configureDeterministicModelProvider,
+  ensureFlakeBrakeRootAgent,
+  flakeBrakeRootAgentSpec,
+  registerFactoryMcpConnectors,
+  startTrueForgeServer,
+} from "./trueforge-runtime.js";
+export type * from "./trueforge-runtime.js";
+export {
+  claimInputFromM4MutationArguments,
+  deniedScopeForM4Effect,
+  effectFromM4MutationArguments,
+  m4AcceptanceArguments,
+  m4MutationArguments,
+  m4MutationToolArguments,
+  m4PortfolioModificationArguments,
+  startDeterministicM4Model,
+} from "./m4-deterministic-model.js";
+export type * from "./m4-deterministic-model.js";
+export {
+  M4MissionController,
+  deterministicM4OwnerDecisions,
+  m4OwnerDecisionResponse,
+} from "./m4-mission-controller.js";
+export type * from "./m4-mission-controller.js";
+export {
+  M4_HERO_MISSION_ID,
+  runDeterministicM4Mission,
+} from "./m4-runner.js";
+export type * from "./m4-runner.js";
+export {
+  M4_LIVE_MISSION_ID,
+  runLiveM4Mission,
+} from "./m4-live.js";
+export type * from "./m4-live.js";
 export { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 export { DuplicateJsonKeyError } from "./strict-json.js";
+export { readDatabaseInstanceIdentity } from "./sqlite.js";

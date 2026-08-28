@@ -113,6 +113,8 @@ export interface AcceptPromiseInput extends ExpectedAdmissionBasis {
   readonly selectedPlanId: string;
   readonly ownerDecisionId: string;
   readonly approverId: string;
+  /** Durable source boundary for the owner authorization, when available. */
+  readonly ownerSourceIdentity?: string;
 }
 
 export type AcceptPromiseResult =
@@ -259,6 +261,32 @@ export interface IssuedGrantResult {
   readonly allowance: GrantAllowanceReadModel;
   readonly versions: VersionTuple;
 }
+
+export interface AcceptPromiseAndIssueGrantInput {
+  readonly acceptance: AcceptPromiseInput;
+  readonly grant: Omit<
+    IssueGrantInput,
+    | "expectedPortfolioVersion"
+    | "expectedCapacityModelVersion"
+    | "expectedCapacityPlanVersion"
+  >;
+}
+
+export type AcceptPromiseAndIssueGrantResult =
+  | {
+      readonly acceptance: Extract<
+        AcceptPromiseResult,
+        { readonly status: "COMMITTED" }
+      >;
+      readonly grant: IssuedGrantResult;
+    }
+  | {
+      readonly acceptance: Extract<
+        AcceptPromiseResult,
+        { readonly status: "STALE_READMISSION" }
+      >;
+      readonly grant: null;
+    };
 
 export interface DeniedScopePredicate {
   readonly scopeSchemaVersion: "microfactory-denied-scope/v1";
