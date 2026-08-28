@@ -188,6 +188,17 @@ function committedAcceptanceReplay(
   if (typeof committedPortfolioVersion !== "string") {
     throw new Error("Acceptance commit is missing its portfolio version");
   }
+  const authorizationRequest = body["authorizationRequest"];
+  if (
+    authorizationRequest === undefined ||
+    canonicalSerialize(authorizationRequest) !==
+      canonicalSerialize(acceptanceAuthorizationRequest(input))
+  ) {
+    throw new StatefulInputError(
+      "acceptance",
+      "replay conflicts with the complete immutable authorization request",
+    );
+  }
   return deepFreeze({
     status: "COMMITTED",
     admissionRecordId: input.admissionRecordId,
@@ -440,6 +451,8 @@ export class FlakeBrakeStore {
         selectedPlanId: input.selectedPlanId,
         ownerDecisionId: input.ownerDecisionId,
         approverId: input.approverId,
+        ownerSourceIdentity:
+          acceptanceAuthorizationRequest(input).ownerSourceIdentity,
       } as const;
       this.#insertOwnerDecision(input.ownerDecisionId, decisionBody);
       this.#replacePortfolio(selectedPortfolio);
@@ -453,6 +466,7 @@ export class FlakeBrakeStore {
         input.admissionRecordId,
         "acceptance_commit",
         {
+          authorizationRequest: acceptanceAuthorizationRequest(input),
           ownerDecisionId: input.ownerDecisionId,
           selectedPlanId: input.selectedPlanId,
           committedPortfolioVersion: versions.portfolioVersion,
@@ -4102,6 +4116,17 @@ function uniqueMismatches(
   ];
   const present = new Set(values);
   return order.filter((value) => present.has(value));
+}
+
+function acceptanceAuthorizationRequest(
+  input: AcceptPromiseInput,
+): AcceptPromiseInput & { readonly ownerSourceIdentity: string } {
+  return canonicalClone({
+    ...input,
+    ownerSourceIdentity:
+      input.ownerSourceIdentity ??
+      `owner-source/legacy-approver/${input.approverId}`,
+  });
 }
 
 function compareExecutionVersions(

@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
@@ -108,7 +108,7 @@ export async function runLiveM4Mission(
     );
   }
   const releaseMissionRun = await acquireLiveMissionRun(
-    options.missionDatabasePath,
+    options,
   );
   try {
     let http: RunningFactoryMcpHttpCluster | undefined;
@@ -288,9 +288,20 @@ export async function runLiveM4Mission(
 }
 
 async function acquireLiveMissionRun(
-  missionDatabasePath: string,
+  options: LiveM4MissionOptions,
 ): Promise<() => void> {
-  const key = resolve(missionDatabasePath);
+  const key = canonicalSerialize({
+    factoryDatabasePath: canonicalLiveDatabasePath(
+      options.factoryDatabasePath,
+    ),
+    m2DatabasePath: canonicalLiveDatabasePath(options.m2DatabasePath),
+    missionDatabasePath: canonicalLiveDatabasePath(
+      options.missionDatabasePath,
+    ),
+    trueforgeDatabasePath: canonicalLiveDatabasePath(
+      options.trueforgeDatabasePath,
+    ),
+  });
   const predecessor = LIVE_MISSION_RUNS.get(key) ?? Promise.resolve();
   let releaseGate: (() => void) | undefined;
   const gate = new Promise<void>((resolveGate) => {
@@ -305,6 +316,27 @@ async function acquireLiveMissionRun(
       LIVE_MISSION_RUNS.delete(key);
     }
   };
+}
+
+/** Resolve caller spellings to the one physical path used for live-run ownership. */
+export function canonicalLiveDatabasePath(path: string): string {
+  if (typeof path !== "string" || path.length === 0) {
+    throw new TypeError("A live database path must be a non-empty string");
+  }
+  const absolute = resolve(path);
+  if (existsSync(absolute)) return realpathSync(absolute);
+
+  const missing: string[] = [basename(absolute)];
+  let parent = dirname(absolute);
+  while (!existsSync(parent)) {
+    const next = dirname(parent);
+    if (next === parent) {
+      throw new Error(`No existing parent exists for live database path ${path}`);
+    }
+    missing.unshift(basename(parent));
+    parent = next;
+  }
+  return join(realpathSync(parent), ...missing);
 }
 
 async function cleanupLiveResources(

@@ -19,10 +19,11 @@ import type {
   ProposedObligation,
   ReplanCandidate,
 } from "./domain.js";
-import type {
-  AdmissionRecordBody,
-  ApprovalScope,
-  OwnerDecisionInput,
+import {
+  StatefulInputError,
+  type AdmissionRecordBody,
+  type ApprovalScope,
+  type OwnerDecisionInput,
 } from "./stateful-domain.js";
 import {
   type AuthorizedScheduleMutation,
@@ -30,7 +31,11 @@ import {
   readAuthoritativeFactoryExecution,
   SyntheticFactoryEnvironment,
 } from "./factory-environment.js";
-import { HERO_HORIZON_END, createHeroProposal } from "./hero-fixture.js";
+import {
+  HERO_ENVIRONMENT_ID,
+  HERO_HORIZON_END,
+  createHeroProposal,
+} from "./hero-fixture.js";
 import {
   m4AcceptanceArguments,
   m4MutationToolArguments,
@@ -45,6 +50,7 @@ import {
   inImmediateTransaction,
   openSqlite,
   parseCanonicalJson,
+  readDatabaseInstanceIdentity,
 } from "./sqlite.js";
 import type { SqliteDatabase } from "./sqlite.js";
 import { advanceVersions, readVersions } from "./versioning.js";
@@ -361,11 +367,16 @@ export function createFactoryMcpService(
           requireFactory(factory),
         );
         break;
-      case "factory-change-control":
+      case "factory-change-control": {
+        const assertDatabaseBinding = authoritativeDatabaseBindingGuard(
+          options.m2DatabasePath,
+          options.factoryDatabasePath,
+        );
         registerChangeControlTools(
           server,
           requireM2Store(m2Store),
           requireFactory(factory),
+          assertDatabaseBinding,
         );
         if (options.enableM4Tools === true) {
           registerM4ChangeControlTools(
@@ -373,9 +384,11 @@ export function createFactoryMcpService(
             requireM2Store(m2Store),
             options.m2DatabasePath,
             options.factoryDatabasePath,
+            assertDatabaseBinding,
           );
         }
         break;
+      }
       default:
         assertNever(serviceName);
     }
@@ -877,6 +890,7 @@ function registerChangeControlTools(
   server: McpServer,
   store: FlakeBrakeStore,
   factory: SyntheticFactoryEnvironment,
+  assertDatabaseBinding: () => void,
 ): void {
   server.registerTool(
     "read_schedule_state",
@@ -904,6 +918,7 @@ function registerChangeControlTools(
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
     (input) => {
+      assertDatabaseBinding();
       const command: CanonicalScheduleCommand = {
         schemaVersion: input.schedule_command.schema_version,
         commandKind: input.schedule_command.command_kind,
@@ -918,6 +933,7 @@ function registerChangeControlTools(
         factory.executeAuthorizedScheduleMutation(
           store,
           normalizedMutation(input, command),
+          assertDatabaseBinding,
         ),
       );
     },
@@ -932,6 +948,7 @@ function registerChangeControlTools(
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
     (input) => {
+      assertDatabaseBinding();
       const command: CanonicalScheduleCommand = {
         schemaVersion: "microfactory-schedule-command/v1",
         commandKind: "create_schedule_reservation",
@@ -946,6 +963,7 @@ function registerChangeControlTools(
         factory.executeAuthorizedScheduleMutation(
           store,
           normalizedMutation(input, command),
+          assertDatabaseBinding,
         ),
       );
     },
@@ -957,6 +975,7 @@ function registerM4ChangeControlTools(
   store: FlakeBrakeStore,
   m2DatabasePath: string,
   factoryDatabasePath: string,
+  assertDatabaseBinding: () => void,
 ): void {
   server.registerTool(
     "record_current_admission",
@@ -967,10 +986,10 @@ function registerM4ChangeControlTools(
       inputSchema: noArgumentsSchema,
       annotations: LEDGER_WRITE_ANNOTATIONS,
     },
-    () =>
-      toolResult(
-        recordCurrentM4AdmissionOrReplay(store),
-      ),
+    () => {
+      assertDatabaseBinding();
+      return toolResult(recordCurrentM4AdmissionOrReplay(store));
+    },
   );
 
   server.registerTool(
@@ -982,10 +1001,12 @@ function registerM4ChangeControlTools(
       inputSchema: selectPortfolioModificationSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    (input) =>
-      toolResult(
+    (input) => {
+      assertDatabaseBinding();
+      return toolResult(
         applyM4PortfolioModification(store, m2DatabasePath, input),
-      ),
+      );
+    },
   );
 
   server.registerTool(
@@ -998,12 +1019,14 @@ function registerM4ChangeControlTools(
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
     (input) => {
+      assertDatabaseBinding();
       const result = store.acceptPromiseAndIssueGrant({
         acceptance: {
           admissionRecordId: input.admission_record_id,
           selectedPlanId: input.selected_plan_id,
           ownerDecisionId: input.owner_decision_id,
           approverId: input.approver_id,
+          ownerSourceIdentity: "owner-source/m4-native-owner-boundary",
           expectedPortfolioVersion: input.expected_portfolio_version,
           expectedCapacityModelVersion: input.expected_capacity_model_version,
           expectedCapacityPlanVersion: input.expected_capacity_plan_version,
@@ -1151,8 +1174,12 @@ function registerM4ChangeControlTools(
       inputSchema: executionStatusSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    ({ execution_attempt_id }) =>
-      toolResult(store.verifyExecutionAuthoritatively(execution_attempt_id)),
+    ({ execution_attempt_id }) => {
+      assertDatabaseBinding();
+      return toolResult(
+        store.verifyExecutionAuthoritatively(execution_attempt_id),
+      );
+    },
   );
 }
 
@@ -1701,6 +1728,44 @@ function requireDatabasePath(value: string | undefined, name: string): string {
     throw new TypeError(`${name} must be a non-empty path`);
   }
   return value;
+}
+
+function authoritativeDatabaseBindingGuard(
+  m2DatabasePath: string,
+  factoryDatabasePath: string,
+): () => void {
+  const expected = {
+    m2: readDatabaseInstanceIdentity(
+      m2DatabasePath,
+      "m2",
+      HERO_ENVIRONMENT_ID,
+    ),
+    factory: readDatabaseInstanceIdentity(
+      factoryDatabasePath,
+      "factory",
+      HERO_ENVIRONMENT_ID,
+    ),
+  };
+  return () => {
+    const current = {
+      m2: readDatabaseInstanceIdentity(
+        m2DatabasePath,
+        "m2",
+        HERO_ENVIRONMENT_ID,
+      ),
+      factory: readDatabaseInstanceIdentity(
+        factoryDatabasePath,
+        "factory",
+        HERO_ENVIRONMENT_ID,
+      ),
+    };
+    if (current.m2 !== expected.m2 || current.factory !== expected.factory) {
+      throw new StatefulInputError(
+        "databaseBinding",
+        "database instance identity conflicts with the authoritative MCP handles",
+      );
+    }
+  };
 }
 
 function requireM2Store(store: FlakeBrakeStore | null): FlakeBrakeStore {

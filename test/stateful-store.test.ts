@@ -410,6 +410,7 @@ function acceptInput(
     selectedPlanId: selectedPlanId(record),
     ownerDecisionId,
     approverId: "owner-1",
+    ownerSourceIdentity: "test-owner-source/owner-1",
     expectedPortfolioVersion: record.portfolioVersion,
     expectedCapacityModelVersion: record.capacityModelVersion,
     expectedCapacityPlanVersion: record.capacityPlanVersion,
@@ -843,6 +844,143 @@ describe("M2 Qodo PR #5 atomicity and database incarnation", () => {
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R2.3 acceptance replay rejects a different approver without mutation", async () => {
+    const item = tempStoreFromState(initialState());
+    try {
+      const admission = evaluate(item.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        item.store.getPortfolio().versions,
+        admission,
+        "qodo-r2-grant",
+        "qodo-r2-grant-decision",
+        "qodo-r2-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const committed = item.store.acceptPromiseAndIssueGrant({
+        acceptance,
+        grant,
+      });
+      const committedSnapshot = durableState(item.path);
+
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance: { ...acceptance, approverId: "owner-2" },
+            grant,
+          }),
+        /approver|immutable|decision data|conflicting identity/u,
+      );
+      assert.deepEqual(durableState(item.path), committedSnapshot);
+      assert.throws(
+        () =>
+          item.store.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              ownerSourceIdentity: "test-owner-source/conflicting-adapter",
+            },
+            grant,
+          }),
+        /complete immutable authorization request|conflicting identity/u,
+      );
+      assert.deepEqual(durableState(item.path), committedSnapshot);
+
+      item.store.close();
+      const restarted = createStore({ path: item.path, now: () => START });
+      try {
+        assert.deepEqual(
+          restarted.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          committed,
+        );
+        assert.throws(
+          () =>
+            restarted.acceptPromiseAndIssueGrant({
+              acceptance: { ...acceptance, approverId: "owner-after-restart" },
+              grant,
+            }),
+          /approver|immutable|decision data|conflicting identity/u,
+        );
+      } finally {
+        restarted.close();
+      }
+      assert.deepEqual(durableState(item.path), committedSnapshot);
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+
+    const concurrent = tempStoreFromState(initialState());
+    try {
+      const admission = evaluate(concurrent.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        concurrent.store.getPortfolio().versions,
+        admission,
+        "qodo-r2-concurrent-grant",
+        "qodo-r2-concurrent-grant-decision",
+        "qodo-r2-concurrent-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const peer = createStore({ path: concurrent.path, now: () => START });
+      try {
+        const differentApprovers = await Promise.allSettled([
+          Promise.resolve().then(() =>
+            concurrent.store.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          ),
+          Promise.resolve().then(() =>
+            peer.acceptPromiseAndIssueGrant({
+              acceptance: { ...acceptance, approverId: "owner-2" },
+              grant,
+            }),
+          ),
+        ]);
+        assert.equal(
+          differentApprovers.filter((result) => result.status === "fulfilled")
+            .length,
+          1,
+        );
+        assert.equal(
+          differentApprovers.filter((result) => result.status === "rejected")
+            .length,
+          1,
+        );
+        const sameApprover = await Promise.all([
+          Promise.resolve().then(() =>
+            concurrent.store.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          ),
+          Promise.resolve().then(() =>
+            peer.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          ),
+        ]);
+        assert.deepEqual(sameApprover[0], sameApprover[1]);
+      } finally {
+        peer.close();
+      }
+      const finalSnapshot = durableState(concurrent.path);
+      assert.equal(finalSnapshot["owner_decisions"]?.length, 2);
+      assert.equal(finalSnapshot["grants"]?.length, 1);
+      assert.equal(
+        finalSnapshot["admission_addenda"]?.filter((row) =>
+          row.includes('"kind":"acceptance_commit"'),
+        ).length,
+        1,
+      );
+    } finally {
+      dispose(concurrent);
     }
   });
 });

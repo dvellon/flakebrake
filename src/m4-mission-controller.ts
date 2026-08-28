@@ -38,6 +38,8 @@ export interface M4OwnerApprovalRequest {
   readonly trueforgeToolCallId: string;
   readonly toolName: string;
   readonly arguments: JsonValue;
+  readonly m2DatabaseInstanceIdentity: string;
+  readonly factoryDatabaseInstanceIdentity: string;
   readonly phase:
     | "portfolio_modification"
     | "promise_choice"
@@ -409,6 +411,7 @@ export class M4MissionController {
     previousTurnId: TrueForgeApi.PreviousTurnIdInput,
     input: TrueForgeApi.TurnInputItem[],
   ): Promise<TurnResult> {
+    this.#assertDatabaseBinding();
     const persisted = await this.#findExactSuccessor(previousTurnId, input);
     const ownerToken = `successor-owner/${String(process.pid)}/${randomUUID()}`;
     const claimed = this.#options.missionStore.claimSuccessorIntent({
@@ -470,6 +473,7 @@ export class M4MissionController {
         );
         return this.#consumePersistedTurn(recovered);
       }
+      this.#assertDatabaseBinding();
       const stream = await this.#options.trueforgeClient.sessions.createTurnStream(
         this.#options.trueforgeSessionId,
         { previousTurnId, input },
@@ -827,6 +831,26 @@ export class M4MissionController {
       if (recordedOwner?.decision.status === "allow") {
         return this.#recordOwnerAllowance(store, action, claim, recordedOwner);
       }
+      let priorAttemptExists = false;
+      try {
+        store.getExecutionAttempt(claim.executionAttemptId);
+        priorAttemptExists = true;
+      } catch {
+        // A missing attempt follows the normal authorization path below.
+      }
+      if (priorAttemptExists) {
+        const owner = await this.#durableOwnerDecision(action, {
+          tool,
+          phase: "consequential_effect",
+        });
+        if (owner.decision.status === "deny") {
+          return this.#recordOwnerDenial(store, action, tool, claim, effect, {
+            ...owner,
+            decision: owner.decision,
+          });
+        }
+        return this.#recordOwnerAllowance(store, action, claim, owner);
+      }
       const authorization = store.evaluateAuthorization({
         effect,
         objectiveId: createHeroProposal().objective,
@@ -879,6 +903,7 @@ export class M4MissionController {
     this.#assertDatabaseBinding();
     const recorded = this.#recordedOwnerDecision(action.bridgeKey);
     if (recorded !== null) return recorded;
+    const databaseIdentities = this.#boundDatabaseIdentities();
     const requestWithoutDigest = {
       missionId: this.#options.missionId,
       trueforgeSessionId: this.#options.trueforgeSessionId,
@@ -887,16 +912,18 @@ export class M4MissionController {
       trueforgeToolCallId: action.trueforgeToolCallId,
       toolName: input.tool.name,
       arguments: asJson(input.tool.arguments),
+      m2DatabaseInstanceIdentity: databaseIdentities.m2,
+      factoryDatabaseInstanceIdentity: databaseIdentities.factory,
       phase: input.phase,
     } as const;
     const request: M4OwnerApprovalRequest = {
       ...requestWithoutDigest,
       requestDigest: digest(requestWithoutDigest),
     };
-    const owner = validateOwnerDecisionResponse(
-      await this.#options.ownerDecisionProvider(request),
-      request,
-    );
+    const response = await this.#options.ownerDecisionProvider(request);
+    this.#assertDatabaseBinding();
+    const owner = validateOwnerDecisionResponse(response, request);
+    this.#assertDatabaseBinding();
     this.#options.missionStore.recordBridgeOutcome(
       action.bridgeKey,
       "owner_decision_received",
@@ -917,6 +944,7 @@ export class M4MissionController {
       .bridgeActions.find((candidate) => candidate.bridgeKey === bridgeKey);
     if (action === undefined) throw new Error(`Owner bridge ${bridgeKey} is missing`);
     const phase = ownerPhase(action.toolName);
+    const databaseIdentities = this.#boundDatabaseIdentities();
     const requestWithoutDigest = {
       missionId: action.missionId,
       trueforgeSessionId: action.trueforgeSessionId,
@@ -925,6 +953,8 @@ export class M4MissionController {
       trueforgeToolCallId: action.trueforgeToolCallId,
       toolName: action.toolName,
       arguments: action.arguments,
+      m2DatabaseInstanceIdentity: databaseIdentities.m2,
+      factoryDatabaseInstanceIdentity: databaseIdentities.factory,
       phase,
     } as const;
     return validateOwnerDecisionResponse(ownerDecision(outcome.result), {
@@ -1121,10 +1151,15 @@ export class M4MissionController {
           approval.decision === "allow" &&
           approval.executionAttemptId !== null,
       );
-      if (claimedApprovals.length > 1) {
+      const claimedAttemptIds = [
+        ...new Set(
+          claimedApprovals.map((approval) => approval.executionAttemptId),
+        ),
+      ];
+      if (claimedAttemptIds.length > 1) {
         throw new Error("M4 mission has multiple approved execution attempts");
       }
-      const executionAttemptId = claimedApprovals[0]?.executionAttemptId ?? null;
+      const executionAttemptId = claimedAttemptIds[0] ?? null;
       if (executionAttemptId === null) {
         return {
           complete: false,
@@ -1199,6 +1234,19 @@ export class M4MissionController {
         "factory",
         this.#options.environmentId,
       ),
+    };
+  }
+
+  #boundDatabaseIdentities(): {
+    readonly m2: string;
+    readonly factory: string;
+  } {
+    const mission = this.#options.missionStore.getSnapshot(
+      this.#options.missionId,
+    ).mission;
+    return {
+      m2: mission.m2EnvironmentIdentity,
+      factory: mission.factoryEnvironmentIdentity,
     };
   }
 

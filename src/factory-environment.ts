@@ -206,9 +206,11 @@ export class SyntheticFactoryEnvironment {
   public executeAuthorizedScheduleMutation(
     m2Store: FlakeBrakeStore,
     requestValue: AuthorizedScheduleMutation,
+    assertDatabaseBinding?: () => void,
   ): SyntheticMutationResponse {
     const request = canonicalClone<AuthorizedScheduleMutation>(requestValue);
     validateAuthorizedScheduleMutation(request);
+    assertDatabaseBinding?.();
     const canonicalRequestBytes = canonicalSerialize(request);
     const preexisting = this.#readExecutionResult(request.executionAttemptId);
     let fenceId: string;

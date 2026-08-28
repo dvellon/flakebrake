@@ -5,7 +5,9 @@ import type { JsonValue } from "./domain.js";
 import { canonicalGrantAllowanceKey } from "./effects.js";
 import {
   type CanonicalScheduleCommand,
+  claimedExecutionReference,
   factoryStateDigest,
+  readAuthoritativeFactoryExecution,
   resultingScheduleState,
   SyntheticFactoryEnvironment,
 } from "./factory-environment.js";
@@ -392,6 +394,27 @@ function rootReply(
       ],
     };
   }
+  if (
+    readAuthoritativeFactoryExecution(
+      options.factoryDatabasePath,
+      APPROVED_ATTEMPT_ID,
+    ) === null &&
+    context.includes("already claimed exact attempt")
+  ) {
+    return {
+      toolCalls: [
+        primaryMutationCall(
+          `approve-alternative-retry-${String(reservationCalls)}`,
+          "create_schedule_reservation",
+          APPROVED_ATTEMPT_ID,
+          "microfactory-effect/v1",
+          ALTERNATIVE_START,
+          ALTERNATIVE_END,
+          options,
+        ),
+      ],
+    };
+  }
   if (scheduleReads === 1) {
     return {
       toolCalls: [call("read-after-write", "read_schedule_state", {})],
@@ -502,16 +525,6 @@ export function m4MutationArguments(
   end: string,
 ): Record<string, unknown> {
   return withAuthoritativeStore(options, (store) => {
-    const accepted = selectedReadmission(store);
-    const selectedPlanId = selectedAdmissionPlan(accepted);
-    const versions = store.getPortfolio().versions;
-    const scope = heroExecutionScope(accepted.promiseBasisId);
-    const allowanceKey = canonicalGrantAllowanceKey(
-      GRANT_DECISION_ID,
-      BUNDLE_ID,
-      scope,
-      HERO_OWNER_ID,
-    );
     const effect = scheduleEffect(effectSchemaVersion, start, end);
     const command = scheduleCommand(start, end);
     const factory = new SyntheticFactoryEnvironment({
@@ -521,26 +534,41 @@ export function m4MutationArguments(
     try {
       const before = factory.getScheduleState();
       const after = resultingScheduleState(before, attemptId, command);
-      const claim = {
-        admissionRecordId: accepted.admissionRecordId,
-        promiseBasisId: accepted.promiseBasisId,
-        acceptedOwnerDecisionId: ACCEPT_DECISION_ID,
-        grantOwnerDecisionId: GRANT_DECISION_ID,
-        grantId: GRANT_ID,
-        expectedGrantVersion: GRANT_VERSION,
-        grantAllowanceKey: allowanceKey,
-        grantExecutionOrdinal: 1,
-        selectedBundleId: BUNDLE_ID,
-        selectedPlanId,
-        expectedPortfolioVersion: versions.portfolioVersion,
-        expectedCapacityModelVersion: versions.capacityModelVersion,
-        expectedCapacityPlanVersion: versions.capacityPlanVersion,
-        expectedAuthorizationStateVersion: versions.authorizationStateVersion,
-        expectedCalibrationFrontierDigest:
-          accepted.calibrationFrontierDigest,
-        effect,
-        expectedAfterState: after,
-      };
+      let claim: ReturnType<typeof claimedExecutionReference>;
+      try {
+        claim = claimedExecutionReference(store.getExecutionAttempt(attemptId));
+      } catch {
+        const accepted = selectedReadmission(store);
+        const selectedPlanId = selectedAdmissionPlan(accepted);
+        const versions = store.getPortfolio().versions;
+        const scope = heroExecutionScope(accepted.promiseBasisId);
+        const allowanceKey = canonicalGrantAllowanceKey(
+          GRANT_DECISION_ID,
+          BUNDLE_ID,
+          scope,
+          HERO_OWNER_ID,
+        );
+        claim = {
+          admissionRecordId: accepted.admissionRecordId,
+          promiseBasisId: accepted.promiseBasisId,
+          acceptedOwnerDecisionId: ACCEPT_DECISION_ID,
+          grantOwnerDecisionId: GRANT_DECISION_ID,
+          grantId: GRANT_ID,
+          expectedGrantVersion: GRANT_VERSION,
+          grantAllowanceKey: allowanceKey,
+          grantExecutionOrdinal: 1,
+          selectedBundleId: BUNDLE_ID,
+          selectedPlanId,
+          expectedPortfolioVersion: versions.portfolioVersion,
+          expectedCapacityModelVersion: versions.capacityModelVersion,
+          expectedCapacityPlanVersion: versions.capacityPlanVersion,
+          expectedAuthorizationStateVersion: versions.authorizationStateVersion,
+          expectedCalibrationFrontierDigest:
+            accepted.calibrationFrontierDigest,
+          effect,
+          expectedAfterState: JSON.parse(canonicalSerialize(after)) as JsonValue,
+        };
+      }
       return {
         execution_attempt_id: attemptId,
         claim,

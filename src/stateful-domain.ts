@@ -113,6 +113,8 @@ export interface AcceptPromiseInput extends ExpectedAdmissionBasis {
   readonly selectedPlanId: string;
   readonly ownerDecisionId: string;
   readonly approverId: string;
+  /** Durable source boundary for the owner authorization, when available. */
+  readonly ownerSourceIdentity?: string;
 }
 
 export type AcceptPromiseResult =

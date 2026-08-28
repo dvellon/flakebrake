@@ -8,11 +8,12 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
 } from "node:fs";
 import { IncomingMessage, Server } from "node:http";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 
@@ -26,6 +27,7 @@ import type {
 } from "@truefoundry/trueforge-sdk";
 
 import { canonicalSerialize } from "../src/canonical.js";
+import { canonicalLiveDatabasePath } from "../src/m4-live.js";
 import {
   FACTORY_MCP_SERVICE_NAMES,
   FLAKEBRAKE_ROOT_AGENT_NAME,
@@ -1972,6 +1974,268 @@ test("Qodo R1.8 close drains or aborts a fragmented accepted body before returni
   }
 });
 
+test(
+  "Qodo R2.1 live-run locking canonicalizes a non-existent path through a symlink parent",
+  { timeout: 30_000 },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r2-alias-"));
+    const realParent = join(directory, "physical databases");
+    const aliasParent = join(directory, "database alias");
+    mkdirSync(realParent);
+    symlinkSync(realParent, aliasParent, "dir");
+    const m0Path = join(directory, "m0.sqlite");
+    createSyntheticM0Database(m0Path);
+    const common = liveOptions(realParent, {
+      m0TrueForgeDatabasePath: m0Path,
+      ownerDecisionProvider: deterministicM4OwnerDecisions(
+        "test-owner/qodo-r2-alias",
+      ),
+    }) as LiveM4MissionOptions;
+    let markFirstEntered: (() => void) | undefined;
+    const firstEntered = new Promise<void>((resolve) => {
+      markFirstEntered = resolve;
+    });
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let secondEntered = false;
+    const first = runLiveM4Mission({
+      ...common,
+      lifecycleObserver: async (stage) => {
+        if (stage !== "environment_initialized") return;
+        markFirstEntered?.();
+        await firstGate;
+        throw new Error("planned alias-lock release");
+      },
+    });
+    void first.catch(() => undefined);
+    try {
+      await firstEntered;
+      const second = runLiveM4Mission({
+        ...common,
+        missionDatabasePath: join(aliasParent, "mission.sqlite"),
+        lifecycleObserver: (stage) => {
+          if (stage !== "environment_initialized") return;
+          secondEntered = true;
+          throw new Error("planned alias-lock second release");
+        },
+      });
+      void second.catch(() => undefined);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        secondEntered,
+        false,
+        "the symlink spelling must wait behind the physical mission path",
+      );
+      releaseFirst?.();
+      const results = await Promise.allSettled([first, second]);
+      assert.deepEqual(
+        results.map((result) => result.status),
+        ["rejected", "rejected"],
+      );
+
+      let reacquired = false;
+      await assert.rejects(
+        runLiveM4Mission({
+          ...common,
+          missionDatabasePath: join(
+            realParent,
+            ".",
+            "unused",
+            "..",
+            "mission.sqlite",
+          ),
+          lifecycleObserver: (stage) => {
+            if (stage !== "environment_initialized") return;
+            reacquired = true;
+            throw new Error("planned alias-lock reacquisition");
+          },
+        }),
+        /planned alias-lock reacquisition/u,
+      );
+      assert.equal(reacquired, true);
+    } finally {
+      releaseFirst?.();
+      await Promise.allSettled([first]);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("Qodo R2.1 lock keys normalize existing, relative, dotted, and distinct paths", () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r2-lock-keys-"));
+  const physical = join(directory, "physical");
+  const alias = join(directory, "alias");
+  const distinct = join(directory, "distinct");
+  mkdirSync(physical);
+  mkdirSync(distinct);
+  symlinkSync(physical, alias, "dir");
+  const missionPath = join(physical, "mission.sqlite");
+  const mission = new M4MissionStore({ path: missionPath });
+  mission.close();
+  const fileAlias = join(directory, "mission-file-alias.sqlite");
+  symlinkSync(missionPath, fileAlias);
+  try {
+    const physicalKey = canonicalLiveDatabasePath(missionPath);
+    assert.equal(canonicalLiveDatabasePath(fileAlias), physicalKey);
+    assert.equal(
+      canonicalLiveDatabasePath(relative(process.cwd(), missionPath)),
+      physicalKey,
+    );
+    assert.equal(
+      canonicalLiveDatabasePath(join(physical, ".", "child", "..", "future.sqlite")),
+      canonicalLiveDatabasePath(join(alias, "future.sqlite")),
+    );
+    assert.notEqual(
+      canonicalLiveDatabasePath(join(distinct, "future.sqlite")),
+      canonicalLiveDatabasePath(join(alias, "future.sqlite")),
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test(
+  "Qodo R2.1 genuine real-path and symlink live retries converge on one mission",
+  { timeout: 900_000 },
+  async (context) => {
+    const provenM0Path = process.env["FLAKEBRAKE_M0_DATABASE_PATH"];
+    if (provenM0Path === undefined) {
+      context.skip("FLAKEBRAKE_M0_DATABASE_PATH is required for genuine alias coverage");
+      return;
+    }
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r2-live-alias-"));
+    const physical = join(directory, "physical live state");
+    const alias = join(directory, "live state alias");
+    mkdirSync(physical);
+    symlinkSync(physical, alias, "dir");
+    const policy = deterministicM4OwnerDecisions(
+      "test-owner/qodo-r2-genuine-alias",
+    );
+    let ownerCalls = 0;
+    const ownerDecisionProvider = async (request: M4OwnerApprovalRequest) => {
+      ownerCalls += 1;
+      return policy(request);
+    };
+    try {
+      const physicalOptions = liveOptions(physical, {
+        m0TrueForgeDatabasePath: provenM0Path,
+        ownerDecisionProvider,
+      }) as LiveM4MissionOptions;
+      const aliasOptions = liveOptions(alias, {
+        m0TrueForgeDatabasePath: provenM0Path,
+        ownerDecisionProvider,
+      }) as LiveM4MissionOptions;
+      const [first, second] = await Promise.all([
+        runLiveM4Mission(physicalOptions),
+        runLiveM4Mission(aliasOptions),
+      ]);
+      assert.equal(first.mission.trueforgeSessionId, second.mission.trueforgeSessionId);
+      assert.equal(first.mission.projectionDigest, second.mission.projectionDigest);
+      assert.equal(ownerCalls, 4);
+      assert.equal(first.controlledWriteCount, 1);
+      assert.equal(first.actualConsumptionFacts, 2);
+      assert.equal(trueForgeSessionCount(physicalOptions.trueforgeDatabasePath), 1);
+      const store = createStore({ path: physicalOptions.m2DatabasePath });
+      try {
+        assert.equal(store.getReservations(true).length, 1);
+        assert.equal(store.getAdmissionHistory().length, 3);
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const schedule of [
+  "m2_while_awaiting_owner",
+  "factory_while_awaiting_owner",
+  "after_owner_before_continuation",
+  "factory_mutation_adapter_boundary",
+] as const) {
+  test(
+    `Qodo R2.2 ${schedule} invalidates approval with complete zero-mutation snapshots`,
+    { timeout: 180_000 },
+    async () => testDatabaseSwapSchedule(schedule),
+  );
+}
+
+test(
+  "Qodo R2.2 no-swap control reaches one terminal mutation",
+  { timeout: 180_000 },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r2-no-swap-"));
+    try {
+      const completed = await runDeterministicM4Mission({
+        ...liveOptions(directory),
+        ownerDecisionProvider: deterministicM4OwnerDecisions(
+          "test-owner/qodo-r2-no-swap",
+        ),
+      });
+      assert.equal(completed.mission.status, "VERIFIED_COMPLETE");
+      assert.equal(controlledWriteCount(completed), 1);
+      assert.equal(completed.actualConsumptionFacts, 2);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("Qodo R2.3 MCP acceptance replay rejects a changed approver", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r2-approver-"));
+  const m2Path = join(directory, "m2.sqlite");
+  const factoryPath = join(directory, "factory.sqlite");
+  initializeBoundEnvironment(m2Path, factoryPath);
+  const cluster = await startFactoryMcpHttpCluster({
+    m2DatabasePath: m2Path,
+    factoryDatabasePath: factoryPath,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+  });
+  try {
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      await client.callTool({ name: "record_current_admission", arguments: {} });
+      const modification = resultObject(
+        (await client.callTool({
+          name: "prepare_portfolio_modification",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      await client.callTool({
+        name: "select_portfolio_modification",
+        arguments: record(modification["arguments"], "modification"),
+      });
+      const prepared = resultObject(
+        (await client.callTool({
+          name: "prepare_promise_acceptance",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      const exact = record(prepared["arguments"], "acceptance");
+      const committed = resultObject(
+        (await client.callTool({ name: "accept_promise", arguments: exact })) as CallToolResult,
+      );
+      const beforeConflict = completeDatabaseSnapshot(m2Path);
+      const conflict = (await client.callTool({
+        name: "accept_promise",
+        arguments: { ...exact, approver_id: "owner/qodo-r2-conflict" },
+      })) as CallToolResult;
+      assert.equal(conflict.isError, true);
+      assert.equal(completeDatabaseSnapshot(m2Path), beforeConflict);
+      const replay = resultObject(
+        (await client.callTool({ name: "accept_promise", arguments: exact })) as CallToolResult,
+      );
+      assert.equal(canonicalSerialize(replay), canonicalSerialize(committed));
+    });
+  } finally {
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function withHttpClient<T>(
   cluster: RunningFactoryMcpHttpCluster,
   serviceName: (typeof FACTORY_MCP_SERVICE_NAMES)[number],
@@ -2039,6 +2303,182 @@ function initializeBoundEnvironment(m2Path: string, factoryPath: string): void {
     now: () => HERO_HORIZON_END,
   });
   store.close();
+}
+
+type DatabaseSwapSchedule =
+  | "m2_while_awaiting_owner"
+  | "factory_while_awaiting_owner"
+  | "after_owner_before_continuation"
+  | "factory_mutation_adapter_boundary";
+
+async function testDatabaseSwapSchedule(
+  schedule: DatabaseSwapSchedule,
+): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), `flakebrake-qodo-r2-${schedule}-`));
+  const originalM2 = join(directory, "original-m2.sqlite");
+  const replacementM2 = join(directory, "replacement-m2.sqlite");
+  const originalFactory = join(directory, "original-factory.sqlite");
+  const replacementFactory = join(directory, "replacement-factory.sqlite");
+  const activeM2 = join(directory, "active-m2.sqlite");
+  const activeFactory = join(directory, "active-factory.sqlite");
+  initializeBoundEnvironment(originalM2, originalFactory);
+  initializeBoundEnvironment(replacementM2, replacementFactory);
+  symlinkSync(originalM2, activeM2);
+  symlinkSync(originalFactory, activeFactory);
+  const options: DeterministicM4MissionOptions = {
+    m2DatabasePath: activeM2,
+    factoryDatabasePath: activeFactory,
+    missionDatabasePath: join(directory, "mission.sqlite"),
+    trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
+    localSandboxRootParent: join(directory, "sandboxes"),
+    missionId: `mission/qodo-r2-${schedule}`,
+  };
+  const policy = deterministicM4OwnerDecisions(
+    `test-owner/qodo-r2-${schedule}`,
+  );
+  let snapshots:
+    | {
+        readonly originalM2: string;
+        readonly replacementM2: string;
+        readonly originalFactory: string;
+        readonly replacementFactory: string;
+      }
+    | undefined;
+  let swapped = false;
+  const captureAndSwap = (kind: "m2" | "factory"): void => {
+    assert.equal(swapped, false, `${schedule} may swap only once`);
+    snapshots = {
+      originalM2: completeDatabaseSnapshot(originalM2),
+      replacementM2: completeDatabaseSnapshot(replacementM2),
+      originalFactory: completeDatabaseSnapshot(originalFactory),
+      replacementFactory: completeDatabaseSnapshot(replacementFactory),
+    };
+    repointSymlink(
+      kind === "m2" ? activeM2 : activeFactory,
+      kind === "m2" ? replacementM2 : replacementFactory,
+    );
+    swapped = true;
+  };
+  const originalMutation =
+    SyntheticFactoryEnvironment.prototype.executeAuthorizedScheduleMutation;
+  if (schedule === "factory_mutation_adapter_boundary") {
+    SyntheticFactoryEnvironment.prototype.executeAuthorizedScheduleMutation =
+      function (store, request, assertDatabaseBinding) {
+        if (
+          !swapped &&
+          request.executionAttemptId === "attempt/m4-approved-alternative"
+        ) {
+          captureAndSwap("factory");
+        }
+        return originalMutation.call(
+          this,
+          store,
+          request,
+          assertDatabaseBinding,
+        );
+      };
+  }
+  try {
+    await assert.rejects(
+      runDeterministicM4Mission({
+        ...options,
+        ownerDecisionProvider: async (request) => {
+          if (
+            !swapped &&
+            request.phase === "portfolio_modification" &&
+            schedule === "m2_while_awaiting_owner"
+          ) {
+            captureAndSwap("m2");
+          } else if (
+            !swapped &&
+            request.phase === "portfolio_modification" &&
+            schedule === "factory_while_awaiting_owner"
+          ) {
+            captureAndSwap("factory");
+          }
+          return policy(request);
+        },
+        checkpointObserver: (checkpoint) => {
+          if (
+            !swapped &&
+            schedule === "after_owner_before_continuation" &&
+            checkpoint.phase === "approval_bridge_bound" &&
+            checkpoint.approval.toolName === "select_portfolio_modification"
+          ) {
+            captureAndSwap("m2");
+          }
+        },
+      }),
+      /database instance identity.*conflicts/u,
+    );
+    assert.equal(swapped, true);
+    assert.ok(snapshots);
+    assert.equal(completeDatabaseSnapshot(originalM2), snapshots.originalM2);
+    assert.equal(completeDatabaseSnapshot(replacementM2), snapshots.replacementM2);
+    assert.equal(
+      completeDatabaseSnapshot(originalFactory),
+      snapshots.originalFactory,
+    );
+    assert.equal(
+      completeDatabaseSnapshot(replacementFactory),
+      snapshots.replacementFactory,
+    );
+
+    repointSymlink(activeM2, originalM2);
+    repointSymlink(activeFactory, originalFactory);
+    const resumed = await runDeterministicM4Mission({
+      ...options,
+      ownerDecisionProvider: policy,
+    });
+    assert.equal(resumed.mission.status, "VERIFIED_COMPLETE");
+    assert.equal(controlledWriteCount(resumed), 1);
+    assert.equal(resumed.actualConsumptionFacts, 2);
+  } finally {
+    SyntheticFactoryEnvironment.prototype.executeAuthorizedScheduleMutation =
+      originalMutation;
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function repointSymlink(path: string, target: string): void {
+  const replacement = `${path}.replacement`;
+  symlinkSync(target, replacement);
+  renameSync(replacement, path);
+}
+
+function completeDatabaseSnapshot(path: string): string {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const schema = database
+      .prepare(
+        `SELECT type, name, tbl_name, sql
+           FROM sqlite_master
+          WHERE name NOT LIKE 'sqlite_%'
+          ORDER BY type, name`,
+      )
+      .all() as Record<string, unknown>[];
+    const tables = schema
+      .filter((entry) => entry["type"] === "table")
+      .map((entry) => String(entry["name"]));
+    return canonicalSerialize({
+      schema,
+      rows: Object.fromEntries(
+        tables.map((table) => {
+          const rows = database
+            .prepare(`SELECT * FROM "${table.replaceAll('"', '""')}"`)
+            .all() as Record<string, unknown>[];
+          return [
+            table,
+            rows
+              .map((row) => canonicalSerialize(row))
+              .sort((left, right) => left.localeCompare(right)),
+          ];
+        }),
+      ),
+    });
+  } finally {
+    database.close();
+  }
 }
 
 function spawnM4Cli(
