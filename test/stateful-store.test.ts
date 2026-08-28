@@ -224,6 +224,34 @@ function sqliteDurableSnapshot(path: string): SqliteDurableSnapshot {
   };
 }
 
+function assertLogicalAndSidecarSnapshotEqual(
+  actual: SqliteDurableSnapshot,
+  expected: SqliteDurableSnapshot,
+): void {
+  const { artifacts: actualArtifacts, ...actualLogical } = actual;
+  const { artifacts: expectedArtifacts, ...expectedLogical } = expected;
+  assert.deepEqual(actualLogical, expectedLogical);
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(actualArtifacts).filter(([name]) => name !== "main"),
+    ),
+    Object.fromEntries(
+      Object.entries(expectedArtifacts).filter(([name]) => name !== "main"),
+    ),
+  );
+  assert.equal("main" in actualArtifacts, "main" in expectedArtifacts);
+}
+
+function databaseHandleUsesPath(
+  database: DatabaseSync,
+  path: string,
+): boolean {
+  const row = (
+    database.prepare("PRAGMA database_list").all() as Record<string, unknown>[]
+  ).find((entry) => entry["name"] === "main");
+  return row?.["file"] === path;
+}
+
 function sortRecord(
   record: Readonly<Record<string, unknown>>,
 ): Readonly<Record<string, unknown>> {
@@ -390,7 +418,96 @@ function assertInjectedWalFailureIsAtomic(
     DatabaseSync.prototype.exec = originalExec;
     DatabaseSync.prototype.close = originalClose;
   }
-  assert.deepEqual(sqliteDurableSnapshot(path), before);
+  const after = sqliteDurableSnapshot(path);
+  if ("main" in before.artifacts) {
+    assertLogicalAndSidecarSnapshotEqual(after, before);
+  } else {
+    assert.deepEqual(after, before);
+  }
+}
+
+interface ConcurrentInitializationFailureFixture {
+  readonly construct: () => unknown;
+  readonly failureMarker: string;
+  readonly path: string;
+  readonly readCommittedValue: (database: DatabaseSync) => number;
+  readonly writeSql: string;
+}
+
+function assertConcurrentCommitSurvivesInitializationFailure(
+  fixture: ConcurrentInitializationFailureFixture,
+): void {
+  const before = sqliteDurableSnapshot(fixture.path);
+  const primary = new Error(
+    `planned initialization failure before concurrent commit: ${fixture.failureMarker}`,
+  );
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalClose = DatabaseSync.prototype.close;
+  let failureInjected = false;
+  let initializationLockReleased = false;
+  let concurrentCommitted = false;
+  let committedSnapshot: SqliteDurableSnapshot | undefined;
+  let peer: DatabaseSync | undefined;
+
+  const injectedExec = function (this: DatabaseSync, sql: string): void {
+    originalExec.call(this, sql);
+    if (
+      !failureInjected &&
+      databaseHandleUsesPath(this, fixture.path) &&
+      sql.includes(fixture.failureMarker)
+    ) {
+      failureInjected = true;
+      throw primary;
+    }
+  };
+  const injectedClose = function (this: DatabaseSync): void {
+    const target = databaseHandleUsesPath(this, fixture.path);
+    originalClose.call(this);
+    if (!target || !failureInjected || concurrentCommitted) return;
+    initializationLockReleased = true;
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.close = originalClose;
+    peer = new DatabaseSync(fixture.path);
+    peer.exec("PRAGMA wal_autocheckpoint = 0");
+    peer.exec(`BEGIN IMMEDIATE; ${fixture.writeSql}; COMMIT;`);
+    concurrentCommitted = true;
+    committedSnapshot = sqliteDurableSnapshot(fixture.path);
+    DatabaseSync.prototype.exec = injectedExec;
+    DatabaseSync.prototype.close = injectedClose;
+  };
+
+  DatabaseSync.prototype.exec = injectedExec;
+  DatabaseSync.prototype.close = injectedClose;
+  try {
+    assert.throws(fixture.construct, (error: unknown) => error === primary);
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.close = originalClose;
+  }
+
+  try {
+    assert.equal(failureInjected, true);
+    assert.equal(initializationLockReleased, true);
+    assert.equal(concurrentCommitted, true);
+    assert.ok(peer !== undefined);
+    assert.equal(
+      (peer.prepare("PRAGMA quick_check").get() as Record<string, unknown>)[
+        "quick_check"
+      ],
+      "ok",
+    );
+    const reader = new DatabaseSync(fixture.path, { readOnly: true });
+    try {
+      assert.equal(fixture.readCommittedValue(reader), 2);
+    } finally {
+      reader.close();
+    }
+    const after = sqliteDurableSnapshot(fixture.path);
+    assert.deepEqual(after, committedSnapshot);
+    assert.notDeepEqual(after, before);
+  } finally {
+    peer?.close();
+  }
 }
 
 function demand(values: DemandValues): ResourceDemand {
@@ -2008,7 +2125,7 @@ describe("Qodo Round 5 failure-atomic SQLite store initialization", () => {
       DatabaseSync.prototype.close = originalClose;
     }
     try {
-      assert.deepEqual(sqliteDurableSnapshot(path), before);
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2042,7 +2159,7 @@ describe("Qodo Round 5 failure-atomic SQLite store initialization", () => {
       DatabaseSync.prototype.close = originalClose;
     }
     try {
-      assert.deepEqual(sqliteDurableSnapshot(path), before);
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2091,7 +2208,7 @@ describe("Qodo Round 5 failure-atomic SQLite store initialization", () => {
       DatabaseSync.prototype.close = originalClose;
     }
     try {
-      assert.deepEqual(sqliteDurableSnapshot(path), before);
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2473,7 +2590,7 @@ describe("Qodo Round 6 hardened legacy and WAL initialization", () => {
     }
   });
 
-  test("Qodo R6.13 schema failure after WAL preparation restores the exact empty target", () => {
+  test("Qodo R6.13 schema failure after WAL preparation restores the exact logical empty target", () => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-r6-wal-schema-"));
     const path = join(directory, "m2.sqlite");
     new DatabaseSync(path).close();
@@ -2496,13 +2613,13 @@ describe("Qodo Round 6 hardened legacy and WAL initialization", () => {
       DatabaseSync.prototype.exec = originalExec;
     }
     try {
-      assert.deepEqual(sqliteDurableSnapshot(path), before);
+      assertLogicalAndSidecarSnapshotEqual(sqliteDurableSnapshot(path), before);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  test("Qodo R6.14 migration failure after WAL preparation restores the exact legacy database", () => {
+  test("Qodo R6.14 migration failure after WAL preparation restores the exact logical legacy database", () => {
     const item = tempStore();
     item.store.close();
     removeDatabaseIncarnation(item.path);
@@ -2528,7 +2645,10 @@ describe("Qodo Round 6 hardened legacy and WAL initialization", () => {
       DatabaseSync.prototype.exec = originalExec;
     }
     try {
-      assert.deepEqual(sqliteDurableSnapshot(item.path), before);
+      assertLogicalAndSidecarSnapshotEqual(
+        sqliteDurableSnapshot(item.path),
+        before,
+      );
     } finally {
       rmSync(item.directory, { recursive: true, force: true });
     }
@@ -2602,6 +2722,574 @@ describe("Qodo Round 6 hardened legacy and WAL initialization", () => {
       assert.equal(walAttempts, 0);
     } finally {
       DatabaseSync.prototype.exec = originalExec;
+    }
+  });
+});
+
+describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
+  test("Qodo R7.1 failed M2 initialization cannot overwrite a concurrent commit", () => {
+    const item = tempStore();
+    item.store.close();
+    try {
+      assertConcurrentCommitSurvivesInitializationFailure({
+        construct: () => createStore({ path: item.path }),
+        failureMarker: "admission_records_immutable_update",
+        path: item.path,
+        readCommittedValue: (database) =>
+          Number(
+            (
+              database
+                .prepare(
+                  "SELECT portfolio_version FROM state_versions WHERE singleton = 1",
+                )
+                .get() as Record<string, unknown>
+            )["portfolio_version"],
+          ),
+        writeSql:
+          "UPDATE state_versions SET portfolio_version = 2 WHERE singleton = 1",
+      });
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.2 failed factory initialization cannot invalidate a concurrent WAL commit", () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-concurrent-factory-"),
+    );
+    const path = join(directory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path });
+    factory.close();
+    try {
+      assertConcurrentCommitSurvivesInitializationFailure({
+        construct: () => new SyntheticFactoryEnvironment({ path }),
+        failureMarker: "incoming_proposals_no_update",
+        path,
+        readCommittedValue: (database) =>
+          Number(
+            (
+              database
+                .prepare(
+                  "SELECT state_version FROM factory_metadata WHERE singleton = 1",
+                )
+                .get() as Record<string, unknown>
+            )["state_version"],
+          ),
+        writeSql:
+          "UPDATE factory_metadata SET state_version = 2 WHERE singleton = 1",
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.3 WAL preparation failures preserve later independent commits", () => {
+    const m2 = tempStore();
+    m2.store.close();
+    const factoryDirectory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-wal-boundary-factory-"),
+    );
+    const factoryPath = join(factoryDirectory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    setJournalMode(m2.path, "DELETE");
+    setJournalMode(factoryPath, "DELETE");
+    try {
+      for (const fixture of [
+        {
+          construct: () => createStore({ path: m2.path }),
+          path: m2.path,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT portfolio_version FROM state_versions WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["portfolio_version"],
+            ),
+          writeSql:
+            "UPDATE state_versions SET portfolio_version = 2 WHERE singleton = 1",
+        },
+        {
+          construct: () => new SyntheticFactoryEnvironment({ path: factoryPath }),
+          path: factoryPath,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT state_version FROM factory_metadata WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["state_version"],
+            ),
+          writeSql:
+            "UPDATE factory_metadata SET state_version = 2 WHERE singleton = 1",
+        },
+      ]) {
+        assertConcurrentCommitSurvivesInitializationFailure({
+          ...fixture,
+          failureMarker: "PRAGMA journal_mode = WAL",
+        });
+      }
+    } finally {
+      rmSync(factoryDirectory, { recursive: true, force: true });
+      rmSync(m2.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.4 incarnation failures preserve later independent commits", () => {
+    const m2 = tempStore();
+    m2.store.close();
+    const factoryDirectory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-incarnation-boundary-factory-"),
+    );
+    const factoryPath = join(factoryDirectory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    try {
+      for (const fixture of [
+        {
+          construct: () => createStore({ path: m2.path }),
+          path: m2.path,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT capacity_plan_version FROM state_versions WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["capacity_plan_version"],
+            ),
+          writeSql:
+            "UPDATE state_versions SET capacity_plan_version = 2 WHERE singleton = 1",
+        },
+        {
+          construct: () => new SyntheticFactoryEnvironment({ path: factoryPath }),
+          path: factoryPath,
+          readCommittedValue: (database: DatabaseSync) =>
+            Number(
+              (
+                database
+                  .prepare(
+                    "SELECT state_version FROM factory_metadata WHERE singleton = 1",
+                  )
+                  .get() as Record<string, unknown>
+              )["state_version"],
+            ),
+          writeSql:
+            "UPDATE factory_metadata SET state_version = 2 WHERE singleton = 1",
+        },
+      ]) {
+        assertConcurrentCommitSurvivesInitializationFailure({
+          ...fixture,
+          failureMarker: "CREATE TABLE IF NOT EXISTS database_incarnation",
+        });
+      }
+    } finally {
+      rmSync(factoryDirectory, { recursive: true, force: true });
+      rmSync(m2.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.5 existing WAL and SHM state remains consistent through rollback", () => {
+    const item = tempStore();
+    item.store.close();
+    const identity = readDatabaseInstanceIdentity(item.path, "m2", "round7");
+    const peer = new DatabaseSync(item.path);
+    peer.exec("PRAGMA wal_autocheckpoint = 0");
+    peer.exec(
+      "BEGIN IMMEDIATE; UPDATE state_versions SET portfolio_version = 2 WHERE singleton = 1; COMMIT",
+    );
+    assert.equal(existsSync(`${item.path}-wal`), true);
+    assert.equal(existsSync(`${item.path}-shm`), true);
+    const primary = new Error("planned failure with existing WAL sidecars");
+    const originalExec = DatabaseSync.prototype.exec;
+    let injected = false;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      originalExec.call(this, sql);
+      if (
+        !injected &&
+        databaseHandleUsesPath(this, item.path) &&
+        sql.includes("admission_records_immutable_update")
+      ) {
+        injected = true;
+        throw primary;
+      }
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: item.path }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assert.equal(injected, true);
+      assert.equal(
+        (peer.prepare("PRAGMA quick_check").get() as Record<string, unknown>)[
+          "quick_check"
+        ],
+        "ok",
+      );
+      assert.equal(
+        Number(
+          (
+            peer
+              .prepare(
+                "SELECT portfolio_version FROM state_versions WHERE singleton = 1",
+              )
+              .get() as Record<string, unknown>
+          )["portfolio_version"],
+        ),
+        2,
+      );
+    } finally {
+      peer.close();
+    }
+    try {
+      const restarted = createStore({ path: item.path });
+      restarted.close();
+      assert.equal(
+        readDatabaseInstanceIdentity(item.path, "m2", "round7"),
+        identity,
+      );
+      const snapshot = sqliteDurableSnapshot(item.path);
+      assert.equal(snapshot.journalMode, "wal");
+      assert.equal(
+        snapshot.rows["state_versions"]?.some((row) =>
+          row.includes('"portfolio_version":2'),
+        ),
+        true,
+      );
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.6 failed new-store initialization removes only invocation-owned files and restarts", () => {
+    for (const fixture of [
+      {
+        construct: (path: string) =>
+          createStore({ path, initialState: initialState() }),
+        filename: "m2.sqlite",
+        marker: "admission_records_immutable_update",
+        prefix: "flakebrake-r7-new-m2-",
+      },
+      {
+        construct: (path: string) => new SyntheticFactoryEnvironment({ path }),
+        filename: "factory.sqlite",
+        marker: "incoming_proposals_no_update",
+        prefix: "flakebrake-r7-new-factory-",
+      },
+    ]) {
+      const directory = mkdtempSync(join(tmpdir(), fixture.prefix));
+      const path = join(directory, fixture.filename);
+      const primary = new Error(`planned new-store failure: ${fixture.filename}`);
+      const originalExec = DatabaseSync.prototype.exec;
+      let injected = false;
+      DatabaseSync.prototype.exec = function (sql: string): void {
+        originalExec.call(this, sql);
+        if (
+          !injected &&
+          databaseHandleUsesPath(this, path) &&
+          sql.includes(fixture.marker)
+        ) {
+          injected = true;
+          throw primary;
+        }
+      };
+      try {
+        assert.throws(
+          () => fixture.construct(path),
+          (error: unknown) => error === primary,
+        );
+      } finally {
+        DatabaseSync.prototype.exec = originalExec;
+      }
+      try {
+        assert.equal(injected, true);
+        for (const artifact of [
+          path,
+          `${path}-wal`,
+          `${path}-shm`,
+          `${path}-journal`,
+        ]) {
+          assert.equal(existsSync(artifact), false, artifact);
+        }
+        const restarted = fixture.construct(path) as {
+          readonly close?: () => void;
+        };
+        restarted.close?.();
+        const database = new DatabaseSync(path, { readOnly: true });
+        try {
+          assert.equal(
+            Number(
+              (
+                database
+                  .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                  .get() as Record<string, unknown>
+              )["count"],
+            ),
+            1,
+          );
+          assert.equal(
+            (database.prepare("PRAGMA quick_check").get() as Record<
+              string,
+              unknown
+            >)["quick_check"],
+            "ok",
+          );
+        } finally {
+          database.close();
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("Qodo R7.7 failed legacy migrations remain replayable with one identity", () => {
+    const m2 = tempStore();
+    m2.store.close();
+    removeDatabaseIncarnation(m2.path);
+    setJournalMode(m2.path, "DELETE");
+    const factoryDirectory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-legacy-factory-"),
+    );
+    const factoryPath = join(factoryDirectory, "factory.sqlite");
+    const factory = new SyntheticFactoryEnvironment({ path: factoryPath });
+    factory.close();
+    removeDatabaseIncarnation(factoryPath);
+    setJournalMode(factoryPath, "DELETE");
+    try {
+      for (const fixture of [
+        {
+          construct: () => createStore({ path: m2.path }),
+          path: m2.path,
+        },
+        {
+          construct: () => new SyntheticFactoryEnvironment({ path: factoryPath }),
+          path: factoryPath,
+        },
+      ]) {
+        const before = sqliteDurableSnapshot(fixture.path);
+        const primary = new Error(`planned legacy migration failure: ${fixture.path}`);
+        const originalExec = DatabaseSync.prototype.exec;
+        let injected = false;
+        DatabaseSync.prototype.exec = function (sql: string): void {
+          originalExec.call(this, sql);
+          if (
+            !injected &&
+            databaseHandleUsesPath(this, fixture.path) &&
+            sql.includes("CREATE TABLE IF NOT EXISTS database_incarnation")
+          ) {
+            injected = true;
+            throw primary;
+          }
+        };
+        try {
+          assert.throws(fixture.construct, (error: unknown) => error === primary);
+        } finally {
+          DatabaseSync.prototype.exec = originalExec;
+        }
+        assert.equal(injected, true);
+        assertLogicalAndSidecarSnapshotEqual(
+          sqliteDurableSnapshot(fixture.path),
+          before,
+        );
+        const restarted = fixture.construct() as { readonly close?: () => void };
+        restarted.close?.();
+        const database = new DatabaseSync(fixture.path, { readOnly: true });
+        try {
+          assert.equal(
+            Number(
+              (
+                database
+                  .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                  .get() as Record<string, unknown>
+              )["count"],
+            ),
+            1,
+          );
+        } finally {
+          database.close();
+        }
+      }
+    } finally {
+      rmSync(factoryDirectory, { recursive: true, force: true });
+      rmSync(m2.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.8 two concurrent initializers converge on one store identity", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "flakebrake-r7-concurrent-initializers-"),
+    );
+    const path = join(directory, "m2.sqlite");
+    const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const moduleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const workerSource = String.raw`
+      const { parentPort, workerData } = require("node:worker_threads");
+      parentPort.postMessage({ kind: "ready" });
+      Atomics.wait(new Int32Array(workerData.barrier), 0, 0);
+      import(workerData.moduleUrl).then(({ openSqlite }) => {
+        const database = openSqlite(workerData.path);
+        try {
+          const row = database.prepare(
+            "SELECT incarnation_id FROM database_incarnation WHERE singleton = 1",
+          ).get();
+          parentPort.postMessage({ kind: "result", incarnationId: row.incarnation_id });
+        } finally {
+          database.close();
+        }
+      }).catch((error) => {
+        parentPort.postMessage({ kind: "error", message: String(error?.stack ?? error) });
+      });
+    `;
+    const workers = [
+      new Worker(workerSource, {
+        eval: true,
+        workerData: { barrier, moduleUrl, path },
+      }),
+      new Worker(workerSource, {
+        eval: true,
+        workerData: { barrier, moduleUrl, path },
+      }),
+    ];
+    const ready = workers.map(
+      (worker) =>
+        new Promise<void>((resolve, reject) => {
+          worker.once("error", reject);
+          worker.once("message", (message: unknown) => {
+            if (
+              typeof message === "object" &&
+              message !== null &&
+              "kind" in message &&
+              message.kind === "ready"
+            ) {
+              resolve();
+            } else {
+              reject(new Error("initializer worker did not reach the barrier"));
+            }
+          });
+        }),
+    );
+    try {
+      await Promise.all(ready);
+      const resultPromises = workers.map(
+          (worker) =>
+            new Promise<string>((resolve, reject) => {
+              worker.once("error", reject);
+              worker.on("message", (message: unknown) => {
+                if (
+                  typeof message !== "object" ||
+                  message === null ||
+                  !("kind" in message)
+                ) {
+                  return;
+                }
+                if (message.kind === "error") {
+                  reject(
+                    new Error(
+                      "message" in message
+                        ? String(message.message)
+                        : "initializer worker failed",
+                    ),
+                  );
+                } else if (
+                  message.kind === "result" &&
+                  "incarnationId" in message
+                ) {
+                  resolve(String(message.incarnationId));
+                }
+              });
+            }),
+      );
+      Atomics.store(new Int32Array(barrier), 0, 1);
+      Atomics.notify(new Int32Array(barrier), 0, workers.length);
+      const results = await Promise.all(resultPromises);
+      assert.equal(results[0], results[1]);
+      const database = new DatabaseSync(path, { readOnly: true });
+      try {
+        assert.equal(
+          Number(
+            (
+              database
+                .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                .get() as Record<string, unknown>
+            )["count"],
+          ),
+          1,
+        );
+        assert.equal(
+          (database.prepare("PRAGMA quick_check").get() as Record<
+            string,
+            unknown
+          >)["quick_check"],
+          "ok",
+        );
+      } finally {
+        database.close();
+      }
+    } finally {
+      await Promise.all(workers.map(async (worker) => worker.terminate()));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R7.9 cleanup diagnostics preserve the primary initialization error", () => {
+    const item = tempStore();
+    item.store.close();
+    setJournalMode(item.path, "DELETE");
+    const primary = new Error("planned Round 7 initialization failure");
+    const cleanup = new Error("planned Round 7 journal cleanup failure");
+    const originalExec = DatabaseSync.prototype.exec;
+    let primaryInjected = false;
+    let cleanupInjected = false;
+    DatabaseSync.prototype.exec = function (sql: string): void {
+      if (
+        databaseHandleUsesPath(this, item.path) &&
+        /PRAGMA\s+journal_mode\s*=\s*DELETE/iu.test(sql)
+      ) {
+        cleanupInjected = true;
+        throw cleanup;
+      }
+      originalExec.call(this, sql);
+      if (
+        !primaryInjected &&
+        databaseHandleUsesPath(this, item.path) &&
+        sql.includes("admission_records_immutable_update")
+      ) {
+        primaryInjected = true;
+        throw primary;
+      }
+    };
+    try {
+      assert.throws(
+        () => createStore({ path: item.path }),
+        (error: unknown) => error === primary,
+      );
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    try {
+      assert.equal(primaryInjected, true);
+      assert.equal(cleanupInjected, true);
+      assert.equal(
+        (primary as Error & { readonly cleanupErrors?: readonly unknown[] })
+          .cleanupErrors?.includes(cleanup),
+        true,
+      );
+      const restarted = createStore({ path: item.path });
+      restarted.close();
+      assert.equal(sqliteDurableSnapshot(item.path).journalMode, "wal");
+    } finally {
+      rmSync(item.directory, { recursive: true, force: true });
     }
   });
 });

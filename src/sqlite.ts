@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   existsSync,
-  readFileSync,
+  fstatSync,
+  openSync,
   realpathSync,
   rmSync,
-  writeFileSync,
+  statSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -31,6 +33,11 @@ interface TableSignature {
 
 const SQLITE_MEMORY_PATH = ":memory:";
 const SQLITE_MEMORY_IDENTITY_PATH = "sqlite-memory/current-connection";
+const SQLITE_INITIALIZATION_BUSY_ATTEMPTS = 100;
+const SQLITE_INITIALIZATION_BUSY_WAIT_MS = 10;
+const SQLITE_INITIALIZATION_BUSY_WAIT = new Int32Array(
+  new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+);
 const DATABASE_INCARNATION_OBJECTS = new Set([
   "database_incarnation",
   "database_incarnation_immutable_update",
@@ -297,36 +304,59 @@ export function openSqlite(path: string): SqliteDatabase {
   return openInitializedSqlite(path, "m2", initializeSchema);
 }
 
+interface InvocationOwnedDatabase {
+  readonly canonicalPath: string;
+  readonly device: number;
+  readonly inode: number;
+}
+
+interface SqliteInitializationLifecycle {
+  classification: DatabaseClassification | null;
+  exclusiveLockHeld: boolean;
+  originalJournalMode: string | null;
+}
+
 /** Open, initialize, and retain one SQLite handle with failure-atomic ownership. */
 export function openInitializedSqlite(
   path: string,
   kind: DatabaseInstanceKind,
   initializeApplicationSchema: (database: SqliteDatabase) => void,
 ): SqliteDatabase {
-  const artifactSnapshot = isSqliteMemoryPath(path)
+  let ownedDatabase = isSqliteMemoryPath(path)
     ? null
-    : captureSqliteArtifactSnapshot(path);
-  const database = new DatabaseSync(path);
-  let persistentInitializationStarted = false;
+    : reserveNewDatabasePath(path);
+  let database: SqliteDatabase;
+  try {
+    database = new DatabaseSync(path);
+  } catch (error: unknown) {
+    if (ownedDatabase !== null) {
+      cleanupUnopenedDatabaseReservation(ownedDatabase, error);
+    }
+    throw error;
+  }
+  const lifecycle: SqliteInitializationLifecycle = {
+    classification: null,
+    exclusiveLockHeld: false,
+    originalJournalMode: null,
+  };
   try {
     initializeSqliteStore(database, path, kind, initializeApplicationSchema, {
-      beforePersistentInitialization: () => {
-        persistentInitializationStarted = true;
+      lifecycle,
+      onClassification: (classification) => {
+        if (classification !== "empty/new") ownedDatabase = null;
       },
     });
     return database;
   } catch (error: unknown) {
-    closeSqliteAfterInitializationFailure(database, error);
-    if (
-      artifactSnapshot !== null &&
-      (persistentInitializationStarted || !artifactSnapshot.mainExisted)
-    ) {
-      try {
-        restoreSqliteArtifactSnapshot(artifactSnapshot);
-      } catch (cleanupError: unknown) {
-        attachInitializationCleanupDiagnostic(error, cleanupError);
+    if (ownedDatabase !== null) {
+      if (!lifecycle.exclusiveLockHeld) {
+        tryAcquireOwnedDatabaseCleanupLock(database, lifecycle, error);
+      }
+      if (lifecycle.exclusiveLockHeld) {
+        cleanupInvocationOwnedDatabaseWhileLocked(ownedDatabase, error);
       }
     }
+    closeSqliteAfterInitializationFailure(database, error);
     throw error;
   }
 }
@@ -343,32 +373,57 @@ export function initializeSqliteStore(
   initializeApplicationSchema: (database: SqliteDatabase) => void,
   hooks: {
     readonly beforePersistentInitialization?: () => void;
+    readonly lifecycle?: SqliteInitializationLifecycle;
+    readonly onClassification?: (
+      classification: DatabaseClassification,
+    ) => void;
   } = {},
 ): string {
-  const classification = classifySqliteDatabase(database);
-  assertCompatibleDatabaseClassification(classification, kind);
+  const lifecycle = hooks.lifecycle ?? {
+    classification: null,
+    exclusiveLockHeld: false,
+    originalJournalMode: null,
+  };
+  const durable = !isSqliteMemoryPath(path);
+  try {
+    database.exec("PRAGMA busy_timeout = 5000");
+    if (durable) {
+      database.exec("BEGIN");
+    }
 
-  database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA busy_timeout = 5000");
-  database.exec("PRAGMA synchronous = FULL");
+    const classification = classifySqliteDatabase(database);
+    lifecycle.classification = classification;
+    hooks.onClassification?.(classification);
+    assertCompatibleDatabaseClassification(classification, kind);
+    if (durable) database.exec("COMMIT");
 
-  hooks.beforePersistentInitialization?.();
-  if (!isSqliteMemoryPath(path)) {
-    const currentJournalMode = readJournalMode(database);
-    if (currentJournalMode !== "wal") {
-      database.exec("PRAGMA journal_mode = WAL");
-      if (readJournalMode(database) !== "wal") {
-        throw new Error("SQLite WAL journal mode could not be established");
+    database.exec("PRAGMA foreign_keys = ON");
+    database.exec("PRAGMA synchronous = FULL");
+
+    hooks.beforePersistentInitialization?.();
+    if (durable) {
+      lifecycle.originalJournalMode = readJournalMode(database);
+      if (lifecycle.originalJournalMode !== "wal") {
+        establishWalJournalMode(database);
       }
     }
-  }
 
-  let incarnationId = "";
-  inImmediateTransaction(database, () => {
-    initializeApplicationSchema(database);
-    incarnationId = ensureDatabaseIncarnation(database, kind);
-  });
-  return incarnationId;
+    let incarnationId = "";
+    inImmediateTransaction(database, () => {
+      if (durable) {
+        const lockedClassification = classifySqliteDatabase(database);
+        lifecycle.classification = lockedClassification;
+        hooks.onClassification?.(lockedClassification);
+        assertCompatibleDatabaseClassification(lockedClassification, kind);
+      }
+      initializeApplicationSchema(database);
+      incarnationId = ensureDatabaseIncarnation(database, kind);
+    });
+    return incarnationId;
+  } catch (error: unknown) {
+    rollbackInitializationThroughSqlite(database, lifecycle, error);
+    throw error;
+  }
 }
 
 /** The exact SQLite transient-database spelling supported by this project. */
@@ -398,39 +453,209 @@ export function closeSqliteAfterInitializationFailure(
   }
 }
 
-interface SqliteArtifactSnapshot {
-  readonly artifacts: readonly {
-    readonly bytes: Uint8Array | null;
-    readonly path: string;
-  }[];
-  readonly mainExisted: boolean;
-}
-
-function captureSqliteArtifactSnapshot(path: string): SqliteArtifactSnapshot {
+function reserveNewDatabasePath(path: string): InvocationOwnedDatabase | null {
   const canonicalPath = canonicalDatabasePath(path);
-  const artifactPaths = [
-    canonicalPath,
-    `${canonicalPath}-wal`,
-    `${canonicalPath}-shm`,
-    `${canonicalPath}-journal`,
-  ];
-  return {
-    artifacts: artifactPaths.map((artifactPath) => ({
-      bytes: existsSync(artifactPath) ? readFileSync(artifactPath) : null,
-      path: artifactPath,
-    })),
-    mainExisted: existsSync(canonicalPath),
-  };
+  let descriptor: number;
+  try {
+    descriptor = openSync(canonicalPath, "wx", 0o600);
+  } catch (error: unknown) {
+    if (isNodeErrorWithCode(error, "EEXIST")) return null;
+    throw error;
+  }
+  try {
+    const metadata = fstatSync(descriptor);
+    return {
+      canonicalPath,
+      device: metadata.dev,
+      inode: metadata.ino,
+    };
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
-function restoreSqliteArtifactSnapshot(snapshot: SqliteArtifactSnapshot): void {
-  for (const artifact of snapshot.artifacts) {
-    if (artifact.bytes === null) {
-      rmSync(artifact.path, { force: true });
-    } else {
-      writeFileSync(artifact.path, artifact.bytes);
+function cleanupUnopenedDatabaseReservation(
+  ownership: InvocationOwnedDatabase,
+  primaryError: unknown,
+): void {
+  try {
+    const metadata = statSync(ownership.canonicalPath);
+    if (
+      metadata.dev !== ownership.device ||
+      metadata.ino !== ownership.inode ||
+      metadata.size !== 0
+    ) {
+      throw new Error(
+        "Invocation-owned SQLite reservation changed before open failure cleanup",
+      );
+    }
+    rmSync(ownership.canonicalPath);
+  } catch (cleanupError: unknown) {
+    if (!isNodeErrorWithCode(cleanupError, "ENOENT")) {
+      attachInitializationCleanupDiagnostic(primaryError, cleanupError);
     }
   }
+}
+
+function tryAcquireOwnedDatabaseCleanupLock(
+  database: SqliteDatabase,
+  lifecycle: SqliteInitializationLifecycle,
+  primaryError: unknown,
+): void {
+  try {
+    setLockingMode(database, "exclusive");
+    database.exec("BEGIN EXCLUSIVE");
+    lifecycle.exclusiveLockHeld = true;
+    const classification = classifySqliteDatabase(database);
+    if (classification !== "empty/new") {
+      throw new Error(
+        `Invocation-owned SQLite reservation became ${classification} before cleanup`,
+      );
+    }
+    database.exec("COMMIT");
+  } catch (cleanupError: unknown) {
+    if (database.isTransaction) {
+      try {
+        database.exec("ROLLBACK");
+      } catch (rollbackError: unknown) {
+        attachInitializationCleanupDiagnostic(primaryError, rollbackError);
+      }
+    }
+    lifecycle.exclusiveLockHeld = false;
+    attachInitializationCleanupDiagnostic(primaryError, cleanupError);
+  }
+}
+
+function cleanupInvocationOwnedDatabaseWhileLocked(
+  ownership: InvocationOwnedDatabase,
+  primaryError: unknown,
+): void {
+  let metadata;
+  try {
+    metadata = statSync(ownership.canonicalPath);
+  } catch (cleanupError: unknown) {
+    if (!isNodeErrorWithCode(cleanupError, "ENOENT")) {
+      attachInitializationCleanupDiagnostic(primaryError, cleanupError);
+    }
+    return;
+  }
+  if (
+    metadata.dev !== ownership.device ||
+    metadata.ino !== ownership.inode
+  ) {
+    attachInitializationCleanupDiagnostic(
+      primaryError,
+      new Error(
+        "Invocation-owned SQLite path was replaced before locked cleanup",
+      ),
+    );
+    return;
+  }
+  for (const artifactPath of [
+    `${ownership.canonicalPath}-wal`,
+    `${ownership.canonicalPath}-shm`,
+    `${ownership.canonicalPath}-journal`,
+    ownership.canonicalPath,
+  ]) {
+    try {
+      rmSync(artifactPath, { force: true });
+    } catch (cleanupError: unknown) {
+      attachInitializationCleanupDiagnostic(primaryError, cleanupError);
+    }
+  }
+}
+
+function rollbackInitializationThroughSqlite(
+  database: SqliteDatabase,
+  lifecycle: SqliteInitializationLifecycle,
+  primaryError: unknown,
+): void {
+  if (database.isTransaction) {
+    try {
+      database.exec("ROLLBACK");
+    } catch (cleanupError: unknown) {
+      attachInitializationCleanupDiagnostic(primaryError, cleanupError);
+    }
+  }
+  if (
+    lifecycle.originalJournalMode === null
+  ) {
+    return;
+  }
+  try {
+    const currentJournalMode = readJournalMode(database);
+    if (currentJournalMode !== lifecycle.originalJournalMode) {
+      setLockingMode(database, "exclusive");
+      database.exec("BEGIN EXCLUSIVE");
+      database.exec("COMMIT");
+      lifecycle.exclusiveLockHeld = true;
+      setJournalMode(database, lifecycle.originalJournalMode);
+    }
+  } catch (cleanupError: unknown) {
+    attachInitializationCleanupDiagnostic(primaryError, cleanupError);
+  }
+}
+
+function setLockingMode(
+  database: SqliteDatabase,
+  mode: "exclusive" | "normal",
+): void {
+  const row = database
+    .prepare(`PRAGMA locking_mode = ${mode.toUpperCase()}`)
+    .get() as Record<string, unknown> | undefined;
+  if (row?.["locking_mode"] !== mode) {
+    throw new Error(`SQLite ${mode} locking mode could not be established`);
+  }
+}
+
+function setJournalMode(database: SqliteDatabase, mode: string): void {
+  if (!new Set(["delete", "persist", "truncate", "wal"]).has(mode)) {
+    throw new Error(`Unsupported SQLite journal mode ${mode}`);
+  }
+  database.exec(`PRAGMA journal_mode = ${mode.toUpperCase()}`);
+  if (readJournalMode(database) !== mode) {
+    throw new Error(`SQLite ${mode} journal mode could not be restored`);
+  }
+}
+
+function establishWalJournalMode(database: SqliteDatabase): void {
+  for (let attempt = 1; attempt <= SQLITE_INITIALIZATION_BUSY_ATTEMPTS; attempt += 1) {
+    try {
+      database.exec("PRAGMA journal_mode = WAL");
+      if (readJournalMode(database) !== "wal") {
+        throw new Error("SQLite WAL journal mode could not be established");
+      }
+      return;
+    } catch (error: unknown) {
+      if (!isSqliteBusyError(error) || attempt === SQLITE_INITIALIZATION_BUSY_ATTEMPTS) {
+        throw error;
+      }
+      Atomics.wait(
+        SQLITE_INITIALIZATION_BUSY_WAIT,
+        0,
+        0,
+        SQLITE_INITIALIZATION_BUSY_WAIT_MS,
+      );
+      if (readJournalMode(database) === "wal") return;
+    }
+  }
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (("errcode" in error &&
+      (error as Error & { readonly errcode?: unknown }).errcode === 5) ||
+      /database is (?:locked|busy)/iu.test(error.message))
+  );
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as Error & { readonly code?: unknown }).code === code
+  );
 }
 
 function readJournalMode(database: SqliteDatabase): string {
@@ -862,10 +1087,14 @@ function attachInitializationCleanupDiagnostic(
     return;
   }
   try {
+    const prior = Reflect.get(primaryError, "cleanupErrors");
+    const cleanupErrors = Array.isArray(prior)
+      ? [...prior, cleanupError]
+      : [cleanupError];
     Object.defineProperty(primaryError, "cleanupErrors", {
       configurable: true,
       enumerable: false,
-      value: [cleanupError],
+      value: cleanupErrors,
       writable: false,
     });
   } catch {
