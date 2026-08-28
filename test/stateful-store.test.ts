@@ -983,6 +983,325 @@ describe("M2 Qodo PR #5 atomicity and database incarnation", () => {
       dispose(concurrent);
     }
   });
+
+  test("Qodo R3.4 legacy acceptance and grant replay without rewriting history", () => {
+    const item = tempStoreFromState(initialState());
+    let closed = false;
+    try {
+      const admission = evaluate(item.store);
+      const acceptance = acceptInput(admission);
+      const fullGrant = issueInput(
+        item.store.getPortfolio().versions,
+        admission,
+        "qodo-r3-legacy-grant",
+        "qodo-r3-legacy-grant-decision",
+        "qodo-r3-legacy-bundle",
+        scope(admission.promiseBasisId),
+      );
+      const {
+        expectedPortfolioVersion: _expectedPortfolioVersion,
+        expectedCapacityModelVersion: _expectedCapacityModelVersion,
+        expectedCapacityPlanVersion: _expectedCapacityPlanVersion,
+        ...grant
+      } = fullGrant;
+      const committed = item.store.acceptPromiseAndIssueGrant({
+        acceptance,
+        grant,
+      });
+      item.store.close();
+      closed = true;
+
+      const fixture = new DatabaseSync(item.path);
+      try {
+        const row = fixture
+          .prepare(
+            "SELECT sequence, body_json FROM admission_addenda WHERE kind = 'acceptance_commit'",
+          )
+          .get() as Record<string, unknown>;
+        const body = JSON.parse(String(row["body_json"])) as Record<
+          string,
+          unknown
+        >;
+        delete body["authorizationRequest"];
+        fixture.exec("DROP TRIGGER admission_addenda_immutable_update");
+        fixture
+          .prepare("UPDATE admission_addenda SET body_json = ? WHERE sequence = ?")
+          .run(JSON.stringify(body), Number(row["sequence"]));
+        fixture.exec(`
+          CREATE TRIGGER admission_addenda_immutable_update
+          BEFORE UPDATE ON admission_addenda
+          BEGIN
+            SELECT RAISE(ABORT, 'admission_addenda rows are immutable');
+          END;
+        `);
+      } finally {
+        fixture.close();
+      }
+
+      const beforeReplay = durableState(item.path);
+      const restarted = createStore({ path: item.path, now: () => START });
+      try {
+        assert.deepEqual(
+          restarted.acceptPromiseAndIssueGrant({ acceptance, grant }),
+          committed,
+        );
+        const assertCompatibilityConflict = (operation: () => unknown): void => {
+          assert.throws(
+            operation,
+            /compatibility|conflict|immutable|not found|selected plan|basis|reused|decision data/u,
+          );
+          assert.deepEqual(durableState(item.path), beforeReplay);
+        };
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: { ...acceptance, approverId: "owner-legacy-conflict" },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              ownerSourceIdentity: "test-owner-source/legacy-conflict",
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              admissionRecordId: "admission/legacy-conflict",
+            },
+            grant: {
+              ...grant,
+              admissionRecordId: "admission/legacy-conflict",
+            },
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              ownerDecisionId: "owner-decision/legacy-conflict",
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: { ...acceptance, selectedPlanId: "plan/legacy-conflict" },
+            grant: { ...grant, selectedPlanId: "plan/legacy-conflict" },
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              expectedCapacityModelVersion: "capacity-model/v999",
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance: {
+              ...acceptance,
+              expectedCalibrationFrontierDigest: `sha256:${"f".repeat(64)}`,
+            },
+            grant,
+          }),
+        );
+        assertCompatibilityConflict(() =>
+          restarted.acceptPromiseAndIssueGrant({
+            acceptance,
+            grant: { ...grant, selectedBundleId: "bundle/legacy-conflict" },
+          }),
+        );
+      } finally {
+        restarted.close();
+      }
+      assert.deepEqual(durableState(item.path), beforeReplay);
+    } finally {
+      if (!closed) item.store.close();
+      rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Qodo R3.5 exact admission basis replay covers every authoritative input", async () => {
+    const exact = tempStoreFromState(initialState());
+    try {
+      const proposal = rush("basis-exact");
+      const first = exact.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+      assert.equal(
+        exact.store.evaluateAndRecordAdmissionOrReplay({ proposal })
+          .admissionRecordId,
+        first.admissionRecordId,
+      );
+      const peer = createStore({ path: exact.path, now: () => START });
+      try {
+        const concurrent = await Promise.all([
+          Promise.resolve().then(() =>
+            exact.store.evaluateAndRecordAdmissionOrReplay({ proposal }),
+          ),
+          Promise.resolve().then(() =>
+            peer.evaluateAndRecordAdmissionOrReplay({ proposal }),
+          ),
+        ]);
+        assert.equal(concurrent[0].admissionRecordId, first.admissionRecordId);
+        assert.equal(concurrent[1].admissionRecordId, first.admissionRecordId);
+      } finally {
+        peer.close();
+      }
+      exact.store.close();
+      const restarted = createStore({ path: exact.path, now: () => START });
+      try {
+        assert.equal(
+          restarted.evaluateAndRecordAdmissionOrReplay({ proposal })
+            .admissionRecordId,
+          first.admissionRecordId,
+        );
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      rmSync(exact.directory, { recursive: true, force: true });
+    }
+
+    const basisMutation = (
+      name: string,
+      mutate: (item: TempStore) => void,
+    ): void => {
+      const item = tempStoreFromState(initialState());
+      try {
+        const proposal = rush(`basis-${name}`);
+        const first = item.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+        mutate(item);
+        const fresh = item.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+        assert.notEqual(fresh.admissionRecordId, first.admissionRecordId, name);
+        assert.equal(
+          item.store.evaluateAndRecordAdmissionOrReplay({ proposal })
+            .admissionRecordId,
+          fresh.admissionRecordId,
+          `${name} exact replay`,
+        );
+      } finally {
+        dispose(item);
+      }
+    };
+    basisMutation("portfolio-version", ({ store }) => {
+      store.withImmediateTransaction((database) => {
+        database.exec(
+          "UPDATE state_versions SET portfolio_version = portfolio_version + 1 WHERE singleton = 1",
+        );
+      });
+    });
+    basisMutation("capacity-model", ({ store }) => {
+      store.replaceCapacityModel({
+        resources: store.getPortfolio().resources.map((resource) =>
+          resource.resourceKey === AGENT
+            ? { ...resource, estimatorRule: "changed-estimator/v1" }
+            : resource,
+        ),
+      });
+    });
+    basisMutation("capacity-plan-value", ({ store }) => {
+      store.replaceCapacityPlan({
+        resources: store.getPortfolio().resources.map((resource) =>
+          resource.resourceKey === AGENT
+            ? { ...resource, capacity: resource.capacity + 1 }
+            : resource,
+        ),
+        ownerDecisionId: "owner-decision/basis-capacity-plan",
+        approverId: "owner-1",
+      });
+    });
+
+    const reservation = tempStoreFromState(initialState());
+    try {
+      const authorization = acceptAndGrant(reservation.store);
+      const proposal = rush("basis-reservation");
+      const before = reservation.store.evaluateAndRecordAdmissionOrReplay({
+        proposal,
+      });
+      reservation.store.claimExecution(
+        claimInput(reservation.store, authorization, "attempt/basis-reservation"),
+      );
+      const after = reservation.store.evaluateAndRecordAdmissionOrReplay({
+        proposal,
+      });
+      assert.notEqual(after.admissionRecordId, before.admissionRecordId);
+      assert.notDeepEqual(
+        after.fixedInFlightExecutionReservations,
+        before.fixedInFlightExecutionReservations,
+      );
+    } finally {
+      dispose(reservation);
+    }
+
+    const inputs = tempStoreFromState(initialState());
+    try {
+      const proposal = rush("basis-proposal-inputs");
+      const base = inputs.store.evaluateAndRecordAdmissionOrReplay({ proposal });
+      const variants: readonly [string, ProposedObligation][] = [
+        [
+          "effect/proposal",
+          { ...proposal, requiredEffects: ["effect:changed"] },
+        ],
+        [
+          "deterministic decision",
+          {
+            ...proposal,
+            acceptanceDecision: {
+              ...proposal.acceptanceDecision,
+              objectiveId: "objective:changed",
+            },
+          },
+        ],
+        [
+          "plan",
+          {
+            ...proposal,
+            resourceDemand: {
+              ...proposal.resourceDemand,
+              [AGENT]: (proposal.resourceDemand[AGENT] ?? 0) + 1,
+            },
+          },
+        ],
+        [
+          "bundle",
+          {
+            ...proposal,
+            pendingOwnerDecisions: [
+              {
+                decisionId: "decision:changed",
+                kind: "consequential_effect",
+                objectiveId: "objective:changed-bundle",
+                evidencePacketId: "evidence:changed-bundle",
+                approverId: "owner-1",
+                executionBoundaryId: "boundary:changed-bundle",
+              },
+            ],
+          },
+        ],
+        ["evidence", { ...proposal, evidenceRefs: ["evidence:changed"] }],
+      ];
+      for (const [name, variant] of variants) {
+        const fresh = inputs.store.evaluateAndRecordAdmissionOrReplay({
+          proposal: variant,
+        });
+        assert.notEqual(fresh.admissionRecordId, base.admissionRecordId, name);
+        assert.equal(
+          inputs.store.evaluateAndRecordAdmissionOrReplay({ proposal: variant })
+            .admissionRecordId,
+          fresh.admissionRecordId,
+          `${name} exact replay`,
+        );
+      }
+    } finally {
+      dispose(inputs);
+    }
+  });
 });
 
 describe("M2 authorization, claims, and reservations G-O", () => {

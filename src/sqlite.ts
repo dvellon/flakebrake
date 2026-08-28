@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { canonicalSerialize } from "./canonical.js";
@@ -90,35 +90,70 @@ export function readDatabaseInstanceIdentity(
   kind: DatabaseInstanceKind,
   environmentId: string,
 ): string {
-  const canonicalPath = realpathSync(resolve(path));
+  const canonicalPath = canonicalDatabasePath(path);
   const database = new DatabaseSync(canonicalPath, { readOnly: true });
   try {
-    const row = database
-      .prepare(
-        "SELECT store_kind, incarnation_id FROM database_incarnation WHERE singleton = 1",
-      )
-      .get() as Record<string, unknown> | undefined;
-    if (
-      row === undefined ||
-      row["store_kind"] !== kind ||
-      typeof row["incarnation_id"] !== "string" ||
-      !row["incarnation_id"].startsWith("database-incarnation/")
-    ) {
-      throw new Error(`${kind} database instance identity is missing or malformed`);
-    }
-    return `database-instance/sha256:${createHash("sha256")
-      .update(
-        canonicalSerialize({
-          canonicalPath,
-          environmentId,
-          incarnationId: row["incarnation_id"],
-          kind,
-        }),
-      )
-      .digest("hex")}`;
+    return databaseInstanceIdentityFromHandle(
+      database,
+      canonicalPath,
+      kind,
+      environmentId,
+    );
   } finally {
     database.close();
   }
+}
+
+export function databaseInstanceIdentityFromHandle(
+  database: SqliteDatabase,
+  canonicalPath: string,
+  kind: DatabaseInstanceKind,
+  environmentId: string,
+): string {
+  const row = database
+    .prepare(
+      "SELECT store_kind, incarnation_id FROM database_incarnation WHERE singleton = 1",
+    )
+    .get() as Record<string, unknown> | undefined;
+  if (
+    row === undefined ||
+    row["store_kind"] !== kind ||
+    typeof row["incarnation_id"] !== "string" ||
+    !row["incarnation_id"].startsWith("database-incarnation/")
+  ) {
+    throw new Error(`${kind} database instance identity is missing or malformed`);
+  }
+  return `database-instance/sha256:${createHash("sha256")
+    .update(
+      canonicalSerialize({
+        canonicalPath,
+        environmentId,
+        incarnationId: row["incarnation_id"],
+        kind,
+      }),
+    )
+    .digest("hex")}`;
+}
+
+/** Canonical physical identity for an existing or prospective database path. */
+export function canonicalDatabasePath(path: string): string {
+  if (typeof path !== "string" || path.length === 0 || path === ":memory:") {
+    throw new TypeError("A durable database path must be a non-empty string");
+  }
+  const absolute = resolve(path);
+  if (existsSync(absolute)) return realpathSync(absolute);
+
+  const missing: string[] = [basename(absolute)];
+  let parent = dirname(absolute);
+  while (!existsSync(parent)) {
+    const next = dirname(parent);
+    if (next === parent) {
+      throw new Error(`No existing parent exists for database path ${path}`);
+    }
+    missing.unshift(basename(parent));
+    parent = next;
+  }
+  return join(realpathSync(parent), ...missing);
 }
 
 export function inImmediateTransaction<T>(

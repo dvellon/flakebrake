@@ -491,8 +491,39 @@ export function m4MutationToolArguments(
   start: string,
   end: string,
 ): Record<string, unknown> {
-  const arguments_ = m4MutationArguments(
-    options,
+  return withAuthoritativeStore(options, (store) => {
+    const factory = new SyntheticFactoryEnvironment({
+      path: options.factoryDatabasePath,
+      now: () => HERO_HORIZON_END,
+    });
+    try {
+      return m4MutationToolArgumentsFromHandles(
+        toolName,
+        store,
+        factory,
+        attemptId,
+        effectSchemaVersion,
+        start,
+        end,
+      );
+    } finally {
+      factory.close();
+    }
+  });
+}
+
+export function m4MutationToolArgumentsFromHandles(
+  toolName: "create_schedule_reservation" | "submit_schedule_change",
+  store: FlakeBrakeStore,
+  factory: SyntheticFactoryEnvironment,
+  attemptId: string,
+  effectSchemaVersion: EffectFingerprint["effectSchemaVersion"],
+  start: string,
+  end: string,
+): Record<string, unknown> {
+  const arguments_ = m4MutationArgumentsFromHandles(
+    store,
+    factory,
     attemptId,
     effectSchemaVersion,
     start,
@@ -525,70 +556,87 @@ export function m4MutationArguments(
   end: string,
 ): Record<string, unknown> {
   return withAuthoritativeStore(options, (store) => {
-    const effect = scheduleEffect(effectSchemaVersion, start, end);
-    const command = scheduleCommand(start, end);
     const factory = new SyntheticFactoryEnvironment({
       path: options.factoryDatabasePath,
       now: () => HERO_HORIZON_END,
     });
     try {
-      const before = factory.getScheduleState();
-      const after = resultingScheduleState(before, attemptId, command);
-      let claim: ReturnType<typeof claimedExecutionReference>;
-      try {
-        claim = claimedExecutionReference(store.getExecutionAttempt(attemptId));
-      } catch {
-        const accepted = selectedReadmission(store);
-        const selectedPlanId = selectedAdmissionPlan(accepted);
-        const versions = store.getPortfolio().versions;
-        const scope = heroExecutionScope(accepted.promiseBasisId);
-        const allowanceKey = canonicalGrantAllowanceKey(
-          GRANT_DECISION_ID,
-          BUNDLE_ID,
-          scope,
-          HERO_OWNER_ID,
-        );
-        claim = {
-          admissionRecordId: accepted.admissionRecordId,
-          promiseBasisId: accepted.promiseBasisId,
-          acceptedOwnerDecisionId: ACCEPT_DECISION_ID,
-          grantOwnerDecisionId: GRANT_DECISION_ID,
-          grantId: GRANT_ID,
-          expectedGrantVersion: GRANT_VERSION,
-          grantAllowanceKey: allowanceKey,
-          grantExecutionOrdinal: 1,
-          selectedBundleId: BUNDLE_ID,
-          selectedPlanId,
-          expectedPortfolioVersion: versions.portfolioVersion,
-          expectedCapacityModelVersion: versions.capacityModelVersion,
-          expectedCapacityPlanVersion: versions.capacityPlanVersion,
-          expectedAuthorizationStateVersion: versions.authorizationStateVersion,
-          expectedCalibrationFrontierDigest:
-            accepted.calibrationFrontierDigest,
-          effect,
-          expectedAfterState: JSON.parse(canonicalSerialize(after)) as JsonValue,
-        };
-      }
-      return {
-        execution_attempt_id: attemptId,
-        claim,
-        expected_before_state_version: before.stateVersion,
-        expected_before_state_digest: factoryStateDigest(before),
-        schedule_command: {
-          schema_version: command.schemaVersion,
-          command_kind: command.commandKind,
-          environment_id: command.environmentId,
-          order_id: command.orderId,
-          production_cell_id: command.productionCellId,
-          quantity: command.quantity,
-          start: command.start,
-          end: command.end,
-        },
-      };
+      return m4MutationArgumentsFromHandles(
+        store,
+        factory,
+        attemptId,
+        effectSchemaVersion,
+        start,
+        end,
+      );
     } finally {
       factory.close();
     }
   });
+}
+
+function m4MutationArgumentsFromHandles(
+  store: FlakeBrakeStore,
+  factory: SyntheticFactoryEnvironment,
+  attemptId: string,
+  effectSchemaVersion: EffectFingerprint["effectSchemaVersion"],
+  start: string,
+  end: string,
+): Record<string, unknown> {
+  const effect = scheduleEffect(effectSchemaVersion, start, end);
+  const command = scheduleCommand(start, end);
+  const before = factory.getScheduleState();
+  const after = resultingScheduleState(before, attemptId, command);
+  let claim: ReturnType<typeof claimedExecutionReference>;
+  try {
+    claim = claimedExecutionReference(store.getExecutionAttempt(attemptId));
+  } catch {
+    const accepted = selectedReadmission(store);
+    const selectedPlanId = selectedAdmissionPlan(accepted);
+    const versions = store.getPortfolio().versions;
+    const scope = heroExecutionScope(accepted.promiseBasisId);
+    const allowanceKey = canonicalGrantAllowanceKey(
+      GRANT_DECISION_ID,
+      BUNDLE_ID,
+      scope,
+      HERO_OWNER_ID,
+    );
+    claim = {
+      admissionRecordId: accepted.admissionRecordId,
+      promiseBasisId: accepted.promiseBasisId,
+      acceptedOwnerDecisionId: ACCEPT_DECISION_ID,
+      grantOwnerDecisionId: GRANT_DECISION_ID,
+      grantId: GRANT_ID,
+      expectedGrantVersion: GRANT_VERSION,
+      grantAllowanceKey: allowanceKey,
+      grantExecutionOrdinal: 1,
+      selectedBundleId: BUNDLE_ID,
+      selectedPlanId,
+      expectedPortfolioVersion: versions.portfolioVersion,
+      expectedCapacityModelVersion: versions.capacityModelVersion,
+      expectedCapacityPlanVersion: versions.capacityPlanVersion,
+      expectedAuthorizationStateVersion: versions.authorizationStateVersion,
+      expectedCalibrationFrontierDigest: accepted.calibrationFrontierDigest,
+      effect,
+      expectedAfterState: JSON.parse(canonicalSerialize(after)) as JsonValue,
+    };
+  }
+  return {
+    execution_attempt_id: attemptId,
+    claim,
+    expected_before_state_version: before.stateVersion,
+    expected_before_state_digest: factoryStateDigest(before),
+    schedule_command: {
+      schema_version: command.schemaVersion,
+      command_kind: command.commandKind,
+      environment_id: command.environmentId,
+      order_id: command.orderId,
+      production_cell_id: command.productionCellId,
+      quantity: command.quantity,
+      start: command.start,
+      end: command.end,
+    },
+  };
 }
 
 export function m4AcceptanceArguments(
@@ -597,10 +645,15 @@ export function m4AcceptanceArguments(
     "m2DatabasePath" | "factoryDatabasePath"
   >,
 ): Record<string, unknown> {
-  return withAuthoritativeStore(options, (store) => {
-    const accepted = selectedReadmission(store);
-    const selectedPlanId = selectedAdmissionPlan(accepted);
-    return {
+  return withAuthoritativeStore(options, m4AcceptanceArgumentsFromStore);
+}
+
+export function m4AcceptanceArgumentsFromStore(
+  store: FlakeBrakeStore,
+): Record<string, unknown> {
+  const accepted = selectedReadmission(store);
+  const selectedPlanId = selectedAdmissionPlan(accepted);
+  return {
       admission_record_id: accepted.admissionRecordId,
       selected_plan_id: selectedPlanId,
       owner_decision_id: ACCEPT_DECISION_ID,
@@ -619,8 +672,7 @@ export function m4AcceptanceArguments(
         selected_bundle_id: BUNDLE_ID,
         scope: heroExecutionScope(accepted.promiseBasisId),
       },
-    };
-  });
+  };
 }
 
 export function m4PortfolioModificationArguments(
@@ -629,15 +681,19 @@ export function m4PortfolioModificationArguments(
     "m2DatabasePath" | "factoryDatabasePath"
   >,
 ): Record<string, unknown> {
-  return withAuthoritativeStore(options, (store) => {
-    const admission = latestAdmission(store, "REPLAN");
-    return {
+  return withAuthoritativeStore(options, m4PortfolioModificationArgumentsFromStore);
+}
+
+export function m4PortfolioModificationArgumentsFromStore(
+  store: FlakeBrakeStore,
+): Record<string, unknown> {
+  const admission = latestAdmission(store, "REPLAN");
+  return {
       admission_record_id: admission.admissionRecordId,
       selected_plan_id: selectedHeroPlan(admission),
       owner_decision_id: MODIFY_DECISION_ID,
       approver_id: HERO_OWNER_ID,
-    };
-  });
+  };
 }
 
 export function claimInputFromM4MutationArguments(

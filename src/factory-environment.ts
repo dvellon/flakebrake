@@ -17,6 +17,8 @@ import {
 } from "./hero-fixture.js";
 import { stableTupleId } from "./identity.js";
 import {
+  canonicalDatabasePath,
+  databaseInstanceIdentityFromHandle,
   ensureDatabaseIncarnation,
   inImmediateTransaction,
 } from "./sqlite.js";
@@ -147,6 +149,7 @@ export interface CreateFactoryEnvironmentOptions {
 
 export class SyntheticFactoryEnvironment {
   readonly #database: SqliteDatabase;
+  readonly #databasePath: string;
   readonly #environmentId: string;
   readonly #now: () => string;
 
@@ -160,6 +163,7 @@ export class SyntheticFactoryEnvironment {
     );
     this.#now = options.now ?? (() => HERO_HORIZON_END);
     this.#database = new DatabaseSync(options.path);
+    this.#databasePath = canonicalDatabasePath(options.path);
     this.#database.exec("PRAGMA foreign_keys = ON");
     this.#database.exec("PRAGMA busy_timeout = 5000");
     if (options.path !== ":memory:") {
@@ -173,6 +177,24 @@ export class SyntheticFactoryEnvironment {
 
   public close(): void {
     this.#database.close();
+  }
+
+  public databaseInstanceIdentity(): string {
+    return databaseInstanceIdentityFromHandle(
+      this.#database,
+      this.#databasePath,
+      "factory",
+      this.#environmentId,
+    );
+  }
+
+  public readAuthoritativeExecution(
+    executionAttemptId: string,
+  ): AuthoritativeFactoryExecutionEvidence | null {
+    return readAuthoritativeFactoryExecutionFromDatabase(
+      this.#database,
+      executionAttemptId,
+    );
   }
 
   public getScheduleState(): FactoryScheduleState {
@@ -248,7 +270,7 @@ export class SyntheticFactoryEnvironment {
           expectedCommandDigest: digest(request.command),
           executorAuthority: "factory-change-control/v1",
           environmentId: request.command.environmentId,
-        });
+        }, preflightState);
         fenceId = fence.fenceId;
       } catch (error: unknown) {
         // A concurrent identical executor may commit between the first result
@@ -1000,6 +1022,82 @@ export function readAuthoritativeFactoryExecution(
   } finally {
     database.close();
   }
+}
+
+function readAuthoritativeFactoryExecutionFromDatabase(
+  database: SqliteDatabase,
+  executionAttemptId: string,
+): AuthoritativeFactoryExecutionEvidence | null {
+  requireString(executionAttemptId, "executionAttemptId");
+  const row = database
+    .prepare(
+      `SELECT fence_id, request_json, result_json, receipt_id
+         FROM execution_results WHERE execution_attempt_id = ?`,
+    )
+    .get(executionAttemptId) as Record<string, unknown> | undefined;
+  if (row === undefined) return null;
+  const request = parseCanonicalStoredValue<AuthorizedScheduleMutation>(
+    row["request_json"],
+    "factory execution request",
+  );
+  const result = parseCanonicalStoredValue<SyntheticMutationResult>(
+    row["result_json"],
+    "factory execution result",
+  );
+  const eventRow = database
+    .prepare(
+      `SELECT body_json FROM mutation_events WHERE execution_attempt_id = ?`,
+    )
+    .get(executionAttemptId) as Record<string, unknown> | undefined;
+  if (eventRow === undefined) {
+    throw new StatefulInputError(
+      "mutationEvent",
+      "authoritative execution result has no durable mutation event",
+    );
+  }
+  const mutationEvent = parseCanonicalStoredValue<JsonValue>(
+    eventRow["body_json"],
+    "factory mutation event",
+  );
+  const fenceId = requireString(row["fence_id"], "fence_id");
+  const receiptId = requireString(row["receipt_id"], "receipt_id");
+  validateStoredFactoryExecution(
+    executionAttemptId,
+    fenceId,
+    receiptId,
+    request,
+    result,
+    mutationEvent,
+  );
+  const currentState = readScheduleStateFromDatabase(database);
+  const expectedReservation = result.resultingState.reservations.find(
+    (reservation) =>
+      reservation.sourceExecutionAttemptId === executionAttemptId,
+  );
+  const currentReservation = currentState.reservations.find(
+    (reservation) =>
+      reservation.sourceExecutionAttemptId === executionAttemptId,
+  );
+  if (
+    expectedReservation === undefined ||
+    currentReservation === undefined ||
+    canonicalSerialize(expectedReservation) !==
+      canonicalSerialize(currentReservation)
+  ) {
+    throw new StatefulInputError(
+      "currentState",
+      "does not preserve the immutable attempt-specific reservation",
+    );
+  }
+  return deepFreeze({
+    environmentId: currentState.environmentId,
+    currentState,
+    currentStateDigest: stateDigest(currentState),
+    request,
+    result,
+    mutationEvent,
+    resultDigest: digest(result),
+  });
 }
 
 function validateStoredFactoryExecution(

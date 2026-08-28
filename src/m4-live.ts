@@ -1,5 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
@@ -19,7 +18,10 @@ import {
 } from "./hero-fixture.js";
 import { SyntheticFactoryEnvironment } from "./factory-environment.js";
 import { createStore, type FlakeBrakeStore } from "./store.js";
-import { readDatabaseInstanceIdentity } from "./sqlite.js";
+import {
+  canonicalDatabasePath,
+  readDatabaseInstanceIdentity,
+} from "./sqlite.js";
 import type { RunningFactoryMcpHttpCluster } from "./mcp-http.js";
 import {
   ensureFlakeBrakeRootAgent,
@@ -54,6 +56,11 @@ export interface LiveM4MissionOptions {
   readonly lifecycleObserver?: (
     stage: LiveM4AcquisitionStage,
   ) => Promise<void> | void;
+  /** Deterministic acquisition barrier used by lock-concurrency verification. */
+  readonly liveRunLockObserver?: (event: {
+    readonly stage: "queued" | "acquired";
+    readonly key: string;
+  }) => Promise<void> | void;
 }
 
 export interface LiveM4MissionResult {
@@ -290,18 +297,35 @@ export async function runLiveM4Mission(
 async function acquireLiveMissionRun(
   options: LiveM4MissionOptions,
 ): Promise<() => void> {
-  const key = canonicalSerialize({
-    factoryDatabasePath: canonicalLiveDatabasePath(
-      options.factoryDatabasePath,
-    ),
-    m2DatabasePath: canonicalLiveDatabasePath(options.m2DatabasePath),
-    missionDatabasePath: canonicalLiveDatabasePath(
-      options.missionDatabasePath,
-    ),
-    trueforgeDatabasePath: canonicalLiveDatabasePath(
-      options.trueforgeDatabasePath,
-    ),
-  });
+  const keys = [
+    options.factoryDatabasePath,
+    options.m2DatabasePath,
+    options.missionDatabasePath,
+    options.trueforgeDatabasePath,
+  ]
+    .map((path) => `database:${canonicalLiveDatabasePath(path)}`)
+    .filter((key, index, values) => values.indexOf(key) === index)
+    .sort((left, right) => left.localeCompare(right));
+  const releases: Array<() => void> = [];
+  try {
+    for (const key of keys) {
+      releases.push(
+        await acquireLiveResource(key, options.liveRunLockObserver),
+      );
+    }
+  } catch (error: unknown) {
+    for (const release of releases.reverse()) release();
+    throw error;
+  }
+  return () => {
+    for (const release of releases.reverse()) release();
+  };
+}
+
+async function acquireLiveResource(
+  key: string,
+  observer: LiveM4MissionOptions["liveRunLockObserver"],
+): Promise<() => void> {
   const predecessor = LIVE_MISSION_RUNS.get(key) ?? Promise.resolve();
   let releaseGate: (() => void) | undefined;
   const gate = new Promise<void>((resolveGate) => {
@@ -309,34 +333,26 @@ async function acquireLiveMissionRun(
   });
   const tail = predecessor.then(() => gate);
   LIVE_MISSION_RUNS.set(key, tail);
-  await predecessor;
-  return () => {
+  const release = (): void => {
     releaseGate?.();
     if (LIVE_MISSION_RUNS.get(key) === tail) {
       LIVE_MISSION_RUNS.delete(key);
     }
   };
+  try {
+    await observer?.({ stage: "queued", key });
+    await predecessor;
+    await observer?.({ stage: "acquired", key });
+    return release;
+  } catch (error: unknown) {
+    release();
+    throw error;
+  }
 }
 
 /** Resolve caller spellings to the one physical path used for live-run ownership. */
 export function canonicalLiveDatabasePath(path: string): string {
-  if (typeof path !== "string" || path.length === 0) {
-    throw new TypeError("A live database path must be a non-empty string");
-  }
-  const absolute = resolve(path);
-  if (existsSync(absolute)) return realpathSync(absolute);
-
-  const missing: string[] = [basename(absolute)];
-  let parent = dirname(absolute);
-  while (!existsSync(parent)) {
-    const next = dirname(parent);
-    if (next === parent) {
-      throw new Error(`No existing parent exists for live database path ${path}`);
-    }
-    missing.unshift(basename(parent));
-    parent = next;
-  }
-  return join(realpathSync(parent), ...missing);
+  return canonicalDatabasePath(path);
 }
 
 async function cleanupLiveResources(

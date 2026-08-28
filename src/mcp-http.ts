@@ -6,9 +6,12 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   FACTORY_MCP_SERVICE_NAMES,
   createFactoryMcpService,
+  type FactoryMcpDatabaseBinding,
   type FactoryMcpServiceName,
   type FactoryMcpServiceOptions,
 } from "./mcp.js";
+import { HERO_ENVIRONMENT_ID } from "./hero-fixture.js";
+import { readDatabaseInstanceIdentity } from "./sqlite.js";
 import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -59,6 +62,18 @@ export async function startFactoryMcpHttpService(
   const port = options.port ?? 0;
   assertLoopback(host);
   assertPort(port);
+  const durableBinding: FactoryMcpDatabaseBinding = {
+    factoryIdentity: readDatabaseInstanceIdentity(
+      options.factoryDatabasePath,
+      "factory",
+      HERO_ENVIRONMENT_ID,
+    ),
+    m2Identity: readDatabaseInstanceIdentity(
+      options.m2DatabasePath,
+      "m2",
+      HERO_ENVIRONMENT_ID,
+    ),
+  };
   const accepted = new Set<AcceptedRequest>();
   let closing = false;
   const httpServer = createServer((request, response) => {
@@ -76,6 +91,7 @@ export async function startFactoryMcpHttpService(
     void handleHttpRequest(
       serviceName,
       options,
+      durableBinding,
       request,
       response,
     ).catch(() => {
@@ -133,6 +149,7 @@ export async function startFactoryMcpHttpService(
   async function handleHttpRequest(
     name: FactoryMcpServiceName,
     serviceOptions: FactoryMcpServiceOptions,
+    binding: FactoryMcpDatabaseBinding,
     request: IncomingMessage,
     response: import("node:http").ServerResponse,
   ): Promise<void> {
@@ -164,7 +181,7 @@ export async function startFactoryMcpHttpService(
       return;
     }
 
-    const service = createFactoryMcpService(name, serviceOptions);
+    const service = createFactoryMcpService(name, serviceOptions, binding);
     // Omitted sessionIdGenerator is the SDK's documented stateless mode. The
     // cast only bridges the SDK declaration's exact-optional mismatch; it does
     // not alter the runtime transport or wrap it in an in-process substitute.

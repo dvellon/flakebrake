@@ -40,9 +40,14 @@ import {
   readAuthoritativeFactoryExecution,
   readAuthoritativeFactoryState,
 } from "./factory-environment.js";
-import type { AuthoritativeFactoryExecutionEvidence } from "./factory-environment.js";
+import type {
+  AuthoritativeFactoryExecutionEvidence,
+  FactoryScheduleState,
+} from "./factory-environment.js";
 import {
+  canonicalDatabasePath,
   canonicalJson,
+  databaseInstanceIdentityFromHandle,
   inImmediateTransaction,
   openSqlite,
   parseCanonicalJson,
@@ -169,6 +174,7 @@ function committedAcceptanceReplay(
   admission: AdmissionReadModel,
   input: AcceptPromiseInput,
   body: JsonValue,
+  ownerDecision: Record<string, unknown> | null,
 ): Extract<AcceptPromiseResult, { readonly status: "COMMITTED" }> {
   const record = admission.record;
   const mismatches = compareAdmissionBasis(input, {
@@ -189,10 +195,13 @@ function committedAcceptanceReplay(
     throw new Error("Acceptance commit is missing its portfolio version");
   }
   const authorizationRequest = body["authorizationRequest"];
+  const expectedRequest = acceptanceAuthorizationRequest(input);
+  const comparableRequest =
+    authorizationRequest === undefined
+      ? legacyAcceptanceAuthorizationRequest(record, body, ownerDecision)
+      : authorizationRequest;
   if (
-    authorizationRequest === undefined ||
-    canonicalSerialize(authorizationRequest) !==
-      canonicalSerialize(acceptanceAuthorizationRequest(input))
+    canonicalSerialize(comparableRequest) !== canonicalSerialize(expectedRequest)
   ) {
     throw new StatefulInputError(
       "acceptance",
@@ -219,6 +228,7 @@ type ExecutionFenceBase = Omit<
 
 export class FlakeBrakeStore {
   readonly #database: SqliteDatabase;
+  readonly #databasePath: string;
   readonly #now: () => string;
   readonly #authoritativeFactoryDatabasePath: string | null;
 
@@ -227,6 +237,7 @@ export class FlakeBrakeStore {
       throw new StatefulInputError("path", "must be a non-empty string");
     }
     this.#database = openSqlite(options.path);
+    this.#databasePath = canonicalDatabasePath(options.path);
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#authoritativeFactoryDatabasePath =
       options.authoritativeFactoryDatabasePath ?? null;
@@ -276,6 +287,20 @@ export class FlakeBrakeStore {
     this.#database.close();
   }
 
+  public databaseInstanceIdentity(environmentId: string): string {
+    return databaseInstanceIdentityFromHandle(
+      this.#database,
+      this.#databasePath,
+      "m2",
+      environmentId,
+    );
+  }
+
+  /** Synchronous transaction scope used by bounded compound store operations. */
+  public withImmediateTransaction<T>(operation: (database: SqliteDatabase) => T): T {
+    return inImmediateTransaction(this.#database, () => operation(this.#database));
+  }
+
   public getPortfolio(): PortfolioReadModel {
     return deepFreeze({
       versions: readVersions(this.#database),
@@ -290,6 +315,29 @@ export class FlakeBrakeStore {
       const input = this.#buildAdmissionInput(request, null);
       const result = evaluateAdmission(input);
       return this.#insertAdmissionRecord(result);
+    });
+  }
+
+  /** Exact-basis idempotent admission recording for replayable orchestration. */
+  public evaluateAndRecordAdmissionOrReplay(
+    request: AdmissionRequest,
+  ): AdmissionRecordBody {
+    return inImmediateTransaction(this.#database, () => {
+      const input = this.#buildAdmissionInput(request, null);
+      const result = evaluateAdmission(input);
+      const matches = this.getAdmissionHistory().filter(
+        ({ record }) =>
+          canonicalSerialize(record.proposalSnapshot) ===
+            canonicalSerialize(request.proposal) &&
+          canonicalSerialize(record.m1Result) === canonicalSerialize(result),
+      );
+      if (matches.length > 1) {
+        throw new StatefulInputError(
+          "admissionBasis",
+          "the exact authoritative admission basis has duplicate records",
+        );
+      }
+      return matches[0]?.record ?? this.#insertAdmissionRecord(result);
     });
   }
 
@@ -513,6 +561,7 @@ export class FlakeBrakeStore {
               admission,
               input.acceptance,
               exactCommit.body,
+              this.#ownerDecisionBody(input.acceptance.ownerDecisionId),
             );
       if (acceptance.status !== "COMMITTED") {
         return deepFreeze({ acceptance, grant: null });
@@ -1397,10 +1446,14 @@ export class FlakeBrakeStore {
 
   public createExecutionFence(
     inputValue: CreateExecutionFenceInput,
+    authoritativeFactoryState?: FactoryScheduleState,
   ): ExecutionFenceReadModel {
     const input = canonicalClone<CreateExecutionFenceInput>(inputValue);
     validateCreateExecutionFenceInput(input);
-    const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
+    const factoryPath =
+      authoritativeFactoryState === undefined
+        ? this.#requireAuthoritativeFactoryDatabasePath()
+        : null;
     return inImmediateTransaction(this.#database, () => {
       const attempt = this.#executionAttempt(input.executionAttemptId);
       if (attempt === null) {
@@ -1435,7 +1488,9 @@ export class FlakeBrakeStore {
         );
       }
       const canonicalEffect = normalizeEffect(attempt.input.effect);
-      const authorityState = readAuthoritativeFactoryState(factoryPath).state;
+      const authorityState =
+        authoritativeFactoryState ??
+        readAuthoritativeFactoryState(factoryPath as string).state;
       if (
         canonicalEffect.environmentId !== input.environmentId ||
         authorityState.environmentId !== input.environmentId ||
@@ -1689,8 +1744,7 @@ export class FlakeBrakeStore {
     assertNonEmptyString(executionAttemptId, "executionAttemptId");
     const factoryPath = this.#requireAuthoritativeFactoryDatabasePath();
     return inImmediateTransaction(this.#database, () => {
-      const attempt = this.#executionAttempt(executionAttemptId);
-      if (attempt === null) {
+      if (this.#executionAttempt(executionAttemptId) === null) {
         throw new StatefulInputError(
           "executionAttemptId",
           "must reference an authoritative M2 claimed attempt",
@@ -1711,6 +1765,30 @@ export class FlakeBrakeStore {
         throw new StatefulInputError(
           "executionAttemptId",
           "has no authoritative committed factory result",
+        );
+      }
+      return this.verifyExecutionWithEvidence(executionAttemptId, evidence);
+    });
+  }
+
+  public verifyExecutionWithEvidence(
+    executionAttemptId: string,
+    evidence: AuthoritativeFactoryExecutionEvidence,
+  ): AuthoritativeExecutionVerificationResult {
+    assertNonEmptyString(executionAttemptId, "executionAttemptId");
+    return inImmediateTransaction(this.#database, () => {
+      const attempt = this.#executionAttempt(executionAttemptId);
+      if (attempt === null) {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must reference an authoritative M2 claimed attempt",
+        );
+      }
+      const fence = this.#executionFenceByAttempt(executionAttemptId);
+      if (fence === null || fence.status !== "factory_result_bound") {
+        throw new StatefulInputError(
+          "executionAttemptId",
+          "must have an exact factory-result-bound execution fence",
         );
       }
       const binding = factoryEvidenceBinding(evidence);
@@ -4126,6 +4204,39 @@ function acceptanceAuthorizationRequest(
     ownerSourceIdentity:
       input.ownerSourceIdentity ??
       `owner-source/legacy-approver/${input.approverId}`,
+  });
+}
+
+function legacyAcceptanceAuthorizationRequest(
+  record: AdmissionRecordBody,
+  acceptanceCommit: { readonly [key: string]: JsonValue },
+  ownerDecision: Record<string, unknown> | null,
+): AcceptPromiseInput & { readonly ownerSourceIdentity: string } {
+  if (
+    ownerDecision === null ||
+    ownerDecision["kind"] !== "ACCEPT_PROMISE" ||
+    ownerDecision["admissionRecordId"] !== record.admissionRecordId ||
+    ownerDecision["ownerDecisionId"] !== acceptanceCommit["ownerDecisionId"] ||
+    ownerDecision["selectedPlanId"] !== acceptanceCommit["selectedPlanId"] ||
+    typeof ownerDecision["approverId"] !== "string" ||
+    typeof ownerDecision["ownerSourceIdentity"] !== "string"
+  ) {
+    throw new StatefulInputError(
+      "acceptanceCompatibility",
+      "legacy acceptance lacks provable immutable approver or owner-source identity",
+    );
+  }
+  return canonicalClone({
+    admissionRecordId: record.admissionRecordId,
+    selectedPlanId: ownerDecision["selectedPlanId"] as string,
+    ownerDecisionId: ownerDecision["ownerDecisionId"] as string,
+    approverId: ownerDecision["approverId"],
+    ownerSourceIdentity: ownerDecision["ownerSourceIdentity"],
+    expectedPortfolioVersion: record.portfolioVersion,
+    expectedCapacityModelVersion: record.capacityModelVersion,
+    expectedCapacityPlanVersion: record.capacityPlanVersion,
+    expectedAuthorizationStateVersion: record.authorizationStateVersion,
+    expectedCalibrationFrontierDigest: record.calibrationFrontierDigest,
   });
 }
 

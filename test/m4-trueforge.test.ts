@@ -29,6 +29,7 @@ import type {
 import { canonicalSerialize } from "../src/canonical.js";
 import { canonicalLiveDatabasePath } from "../src/m4-live.js";
 import {
+  FlakeBrakeStore,
   FACTORY_MCP_SERVICE_NAMES,
   FLAKEBRAKE_ROOT_AGENT_NAME,
   HERO_ENVIRONMENT_ID,
@@ -2236,6 +2237,194 @@ test("Qodo R2.3 MCP acceptance replay rejects a changed approver", async () => {
   }
 });
 
+test("Qodo R3.1 a replacement M2 database cannot receive portfolio mutation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r3-handle-"));
+  const originalM2 = join(directory, "original-m2.sqlite");
+  const replacementM2 = join(directory, "replacement-m2.sqlite");
+  const originalFactory = join(directory, "original-factory.sqlite");
+  const activeM2 = join(directory, "active-m2.sqlite");
+  const activeFactory = join(directory, "active-factory.sqlite");
+  initializeBoundEnvironment(originalM2, originalFactory);
+  initializeBoundEnvironment(replacementM2, originalFactory);
+  symlinkSync(originalM2, activeM2);
+  symlinkSync(originalFactory, activeFactory);
+  const cluster = await startFactoryMcpHttpCluster({
+    m2DatabasePath: activeM2,
+    factoryDatabasePath: activeFactory,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+  });
+  const originalGetAdmissionRecord =
+    FlakeBrakeStore.prototype.getAdmissionRecord;
+  let swapped = false;
+  try {
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      await client.callTool({ name: "record_current_admission", arguments: {} });
+      cloneAdmissionLedger(originalM2, replacementM2);
+      const prepared = resultObject(
+        (await client.callTool({
+          name: "prepare_portfolio_modification",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      const exact = record(prepared["arguments"], "portfolio modification");
+      const sourceAdmissionId = String(exact["admission_record_id"]);
+      const beforeOriginal = completeDatabaseSnapshot(originalM2);
+      const beforeReplacement = completeDatabaseSnapshot(replacementM2);
+      FlakeBrakeStore.prototype.getAdmissionRecord = function (admissionId) {
+        const result = originalGetAdmissionRecord.call(this, admissionId);
+        if (!swapped && admissionId === sourceAdmissionId) {
+          repointSymlink(activeM2, replacementM2);
+          swapped = true;
+        }
+        return result;
+      };
+      const rejected = (await client.callTool({
+        name: "select_portfolio_modification",
+        arguments: exact,
+      })) as CallToolResult;
+      assert.equal(rejected.isError, true);
+      assert.equal(swapped, true);
+      assert.equal(completeDatabaseSnapshot(originalM2), beforeOriginal);
+      assert.equal(completeDatabaseSnapshot(replacementM2), beforeReplacement);
+    });
+  } finally {
+    FlakeBrakeStore.prototype.getAdmissionRecord = originalGetAdmissionRecord;
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const stage of [
+  "before_open",
+  "after_first_open",
+  "handles_validated",
+] as const) {
+  test(`Qodo R3.1 replacement at ${stage} leaves both databases unchanged`, async () => {
+    await testVerifiedHandleReplacementStage(stage);
+  });
+}
+
+test("Qodo R3.1 verified-handle no-replacement control readmits once", async () => {
+  await testVerifiedHandleReplacementStage("no_replacement");
+});
+
+test(
+  "Qodo R3.2 every independently shared live database serializes",
+  { timeout: 60_000 },
+  async (context) => {
+    for (const resource of ["m2", "factory", "mission", "trueforge"] as const) {
+      await context.test(`shared ${resource} only`, async () => {
+        await assertLiveResourceLocking([resource], true, false);
+      });
+    }
+    await context.test("shared M2 through a symlink alias", async () => {
+      await assertLiveResourceLocking(["m2"], true, true);
+    });
+    await context.test("opposite overlapping resource spellings do not deadlock", async () => {
+      await assertLiveResourceLocking(["m2", "factory"], true, true);
+    });
+    await context.test("entirely disjoint runs proceed concurrently", async () => {
+      await assertLiveResourceLocking([], false, false);
+    });
+    await context.test("partial acquisition failure releases every acquired key", async () => {
+      await assertPartialLiveResourceLockRelease();
+    });
+  },
+);
+
+test("Qodo R3.3 schedule read rejects a replaced configured factory", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r3-read-"));
+  const m2Path = join(directory, "m2.sqlite");
+  const originalFactory = join(directory, "original-factory.sqlite");
+  const replacementFactory = join(directory, "replacement-factory.sqlite");
+  const activeFactory = join(directory, "active-factory.sqlite");
+  initializeBoundEnvironment(m2Path, originalFactory);
+  initializeBoundEnvironment(join(directory, "replacement-m2.sqlite"), replacementFactory);
+  symlinkSync(originalFactory, activeFactory);
+  const cluster = await startFactoryMcpHttpCluster({
+    m2DatabasePath: m2Path,
+    factoryDatabasePath: activeFactory,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+  });
+  try {
+    const beforeOriginal = completeDatabaseSnapshot(originalFactory);
+    const beforeReplacement = completeDatabaseSnapshot(replacementFactory);
+    repointSymlink(activeFactory, replacementFactory);
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      const result = (await client.callTool({
+        name: "read_schedule_state",
+        arguments: {},
+      })) as CallToolResult;
+      assert.equal(result.isError, true);
+    });
+    assert.equal(completeDatabaseSnapshot(originalFactory), beforeOriginal);
+    assert.equal(completeDatabaseSnapshot(replacementFactory), beforeReplacement);
+  } finally {
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const stage of ["after_first_open", "handles_validated"] as const) {
+  test(`Qodo R3.3 schedule read rejects replacement at ${stage}`, async () => {
+    await testScheduleReadReplacementStage(stage);
+  });
+}
+
+test("Qodo R3.3 original database resumes and no-swap read reports its basis", async () => {
+  await testScheduleReadReplacementStage("no_replacement");
+});
+
+test("Qodo R3.5 current admission never replays a stale portfolio basis", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r3-admission-"));
+  const m2Path = join(directory, "m2.sqlite");
+  const factoryPath = join(directory, "factory.sqlite");
+  initializeBoundEnvironment(m2Path, factoryPath);
+  const cluster = await startFactoryMcpHttpCluster({
+    m2DatabasePath: m2Path,
+    factoryDatabasePath: factoryPath,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+  });
+  try {
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      const first = resultObject(
+        (await client.callTool({
+          name: "record_current_admission",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      assert.equal(first["portfolioVersion"], "portfolio/v1");
+      const prepared = resultObject(
+        (await client.callTool({
+          name: "prepare_portfolio_modification",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      resultObject(
+        (await client.callTool({
+          name: "select_portfolio_modification",
+          arguments: record(prepared["arguments"], "portfolio modification"),
+        })) as CallToolResult,
+      );
+      const current = resultObject(
+        (await client.callTool({
+          name: "record_current_admission",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      assert.equal(current["portfolioVersion"], "portfolio/v2");
+      assert.equal(current["decision"], "ADMITTABLE");
+      assert.notEqual(current["admissionRecordId"], first["admissionRecordId"]);
+    });
+  } finally {
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function withHttpClient<T>(
   cluster: RunningFactoryMcpHttpCluster,
   serviceName: (typeof FACTORY_MCP_SERVICE_NAMES)[number],
@@ -2444,6 +2633,372 @@ function repointSymlink(path: string, target: string): void {
   const replacement = `${path}.replacement`;
   symlinkSync(target, replacement);
   renameSync(replacement, path);
+}
+
+type VerifiedHandleSwapStage =
+  | "before_open"
+  | "after_first_open"
+  | "handles_validated"
+  | "no_replacement";
+
+async function testVerifiedHandleReplacementStage(
+  swapStage: VerifiedHandleSwapStage,
+): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), `flakebrake-qodo-r3-${swapStage}-`));
+  const originalM2 = join(directory, "original-m2.sqlite");
+  const replacementM2 = join(directory, "replacement-m2.sqlite");
+  const originalFactory = join(directory, "original-factory.sqlite");
+  const replacementFactory = join(directory, "replacement-factory.sqlite");
+  const activeM2 = join(directory, "active-m2.sqlite");
+  const activeFactory = join(directory, "active-factory.sqlite");
+  initializeBoundEnvironment(originalM2, originalFactory);
+  initializeBoundEnvironment(replacementM2, replacementFactory);
+  symlinkSync(originalM2, activeM2);
+  symlinkSync(originalFactory, activeFactory);
+  let swapped = false;
+  const cluster = await startFactoryMcpHttpCluster({
+    m2DatabasePath: activeM2,
+    factoryDatabasePath: activeFactory,
+    now: () => HERO_HORIZON_END,
+    enableM4Tools: true,
+    databaseOperationObserver: (event) => {
+      if (
+        swapped ||
+        swapStage === "no_replacement" ||
+        event.operation !== "select_portfolio_modification" ||
+        event.stage !== swapStage
+      ) {
+        return;
+      }
+      if (
+        swapStage === "after_first_open" &&
+        event.openedKinds.includes("m2")
+      ) {
+        repointSymlink(activeFactory, replacementFactory);
+      } else {
+        repointSymlink(activeM2, replacementM2);
+      }
+      swapped = true;
+    },
+  });
+  try {
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      await client.callTool({ name: "record_current_admission", arguments: {} });
+      cloneAdmissionLedger(originalM2, replacementM2);
+      const prepared = resultObject(
+        (await client.callTool({
+          name: "prepare_portfolio_modification",
+          arguments: {},
+        })) as CallToolResult,
+      );
+      const exact = record(prepared["arguments"], "portfolio modification");
+      const before = {
+        originalM2: completeDatabaseSnapshot(originalM2),
+        replacementM2: completeDatabaseSnapshot(replacementM2),
+        originalFactory: completeDatabaseSnapshot(originalFactory),
+        replacementFactory: completeDatabaseSnapshot(replacementFactory),
+      };
+      const response = (await client.callTool({
+        name: "select_portfolio_modification",
+        arguments: exact,
+      })) as CallToolResult;
+      if (swapStage === "no_replacement") {
+        const body = resultObject(response);
+        assert.equal(body["status"], "READMITTED");
+        const replay = resultObject(
+          (await client.callTool({
+            name: "select_portfolio_modification",
+            arguments: exact,
+          })) as CallToolResult,
+        );
+        assert.equal(canonicalSerialize(replay), canonicalSerialize(body));
+        const durable = createStore({ path: originalM2 });
+        try {
+          assert.equal(durable.getAdmissionHistory().length, 2);
+          assert.equal(durable.getPortfolio().versions.portfolioVersion, "portfolio/v2");
+        } finally {
+          durable.close();
+        }
+      } else {
+        assert.equal(response.isError, true);
+        assert.equal(swapped, true);
+        assert.equal(completeDatabaseSnapshot(originalM2), before.originalM2);
+        assert.equal(completeDatabaseSnapshot(replacementM2), before.replacementM2);
+        assert.equal(
+          completeDatabaseSnapshot(originalFactory),
+          before.originalFactory,
+        );
+        assert.equal(
+          completeDatabaseSnapshot(replacementFactory),
+          before.replacementFactory,
+        );
+      }
+    });
+  } finally {
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function testScheduleReadReplacementStage(
+  swapStage: "after_first_open" | "handles_validated" | "no_replacement",
+): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), `flakebrake-qodo-r3-read-${swapStage}-`));
+  const m2Path = join(directory, "m2.sqlite");
+  const originalFactory = join(directory, "original-factory.sqlite");
+  const replacementFactory = join(directory, "replacement-factory.sqlite");
+  const activeFactory = join(directory, "active-factory.sqlite");
+  initializeBoundEnvironment(m2Path, originalFactory);
+  initializeBoundEnvironment(join(directory, "replacement-m2.sqlite"), replacementFactory);
+  symlinkSync(originalFactory, activeFactory);
+  let swapped = false;
+  const start = () =>
+    startFactoryMcpHttpCluster({
+      m2DatabasePath: m2Path,
+      factoryDatabasePath: activeFactory,
+      now: () => HERO_HORIZON_END,
+      enableM4Tools: true,
+      databaseOperationObserver: (event) => {
+        if (
+          swapped ||
+          swapStage === "no_replacement" ||
+          event.operation !== "read_schedule_state" ||
+          event.stage !== swapStage
+        ) {
+          return;
+        }
+        repointSymlink(activeFactory, replacementFactory);
+        swapped = true;
+      },
+    });
+  let cluster = await start();
+  try {
+    const beforeOriginal = completeDatabaseSnapshot(originalFactory);
+    const beforeReplacement = completeDatabaseSnapshot(replacementFactory);
+    await withHttpClient(cluster, "factory-change-control", async (client) => {
+      const response = (await client.callTool({
+        name: "read_schedule_state",
+        arguments: {},
+      })) as CallToolResult;
+      if (swapStage === "no_replacement") {
+        const body = resultObject(response);
+        const basis = record(body["verifiedBasis"], "verified schedule basis");
+        assert.equal(
+          basis["factoryDatabaseIdentity"],
+          readDatabaseInstanceIdentity(
+            originalFactory,
+            "factory",
+            HERO_ENVIRONMENT_ID,
+          ),
+        );
+      } else {
+        assert.equal(response.isError, true);
+        assert.equal(swapped, true);
+      }
+    });
+    assert.equal(completeDatabaseSnapshot(originalFactory), beforeOriginal);
+    assert.equal(completeDatabaseSnapshot(replacementFactory), beforeReplacement);
+    if (swapStage !== "no_replacement") {
+      await cluster.close();
+      repointSymlink(activeFactory, originalFactory);
+      cluster = await start();
+      await withHttpClient(cluster, "factory-change-control", async (client) => {
+        const resumed = (await client.callTool({
+          name: "read_schedule_state",
+          arguments: {},
+        })) as CallToolResult;
+        assert.equal(resumed.isError, undefined);
+      });
+    }
+  } finally {
+    await cluster.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+type LiveMutableResource = "m2" | "factory" | "mission" | "trueforge";
+
+async function assertLiveResourceLocking(
+  sharedResources: readonly LiveMutableResource[],
+  expectSerialized: boolean,
+  useAlias: boolean,
+): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r3-lock-"));
+  const firstRoot = join(directory, "first");
+  const secondRoot = join(directory, "second");
+  mkdirSync(firstRoot);
+  mkdirSync(secondRoot);
+  const m0Path = join(directory, "m0.sqlite");
+  createSyntheticM0Database(m0Path);
+  const firstOptions = liveOptions(firstRoot);
+  const secondOptions = liveOptions(secondRoot);
+  const field = {
+    m2: "m2DatabasePath",
+    factory: "factoryDatabasePath",
+    mission: "missionDatabasePath",
+    trueforge: "trueforgeDatabasePath",
+  } as const;
+  const sharedPaths = Object.fromEntries(
+    sharedResources.map((resource) => [resource, join(directory, `shared-${resource}.sqlite`)]),
+  ) as Partial<Record<LiveMutableResource, string>>;
+  if (sharedPaths.m2 !== undefined || sharedPaths.factory !== undefined) {
+    initializeBoundEnvironment(
+      sharedPaths.m2 ?? join(directory, "shared-bootstrap-m2.sqlite"),
+      sharedPaths.factory ?? join(directory, "shared-bootstrap-factory.sqlite"),
+    );
+  }
+  const firstOverrides: Record<string, string> = {};
+  const secondOverrides: Record<string, string> = {};
+  for (const resource of sharedResources) {
+    const path = sharedPaths[resource] as string;
+    firstOverrides[field[resource]] = path;
+    if (useAlias && (resource === "m2" || resource === "factory")) {
+      const alias = join(directory, `alias-${resource}.sqlite`);
+      symlinkSync(path, alias);
+      secondOverrides[field[resource]] = alias;
+    } else {
+      secondOverrides[field[resource]] = path;
+    }
+  }
+  let firstEnteredResolve: (() => void) | undefined;
+  const firstEntered = new Promise<void>((resolve) => {
+    firstEnteredResolve = resolve;
+  });
+  let releaseFirst: (() => void) | undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let secondEntered = false;
+  let sharedQueuedResolve: (() => void) | undefined;
+  const sharedQueued = new Promise<void>((resolve) => {
+    sharedQueuedResolve = resolve;
+  });
+  const expectedSharedKeys = new Set(
+    Object.values(sharedPaths).map(
+      (path) => `database:${canonicalLiveDatabasePath(path)}`,
+    ),
+  );
+  const common = {
+    m0TrueForgeDatabasePath: m0Path,
+    ownerDecisionProvider: deterministicM4OwnerDecisions(
+      "test-owner/qodo-r3-resource-lock",
+    ),
+  } as const;
+  const first = runLiveM4Mission({
+    ...firstOptions,
+    ...firstOverrides,
+    ...common,
+    lifecycleObserver: async (stage) => {
+      if (stage !== "environment_initialized") return;
+      firstEnteredResolve?.();
+      await firstGate;
+      throw new Error("planned first lock-holder release");
+    },
+  } as LiveM4MissionOptions);
+  void first.catch(() => undefined);
+  let second: Promise<unknown> | undefined;
+  try {
+    await firstEntered;
+    second = runLiveM4Mission({
+      ...secondOptions,
+      ...secondOverrides,
+      ...common,
+      liveRunLockObserver: ({ stage, key }) => {
+        if (stage === "queued" && expectedSharedKeys.has(key)) {
+          sharedQueuedResolve?.();
+        }
+      },
+      lifecycleObserver: (stage) => {
+        if (stage !== "environment_initialized") return;
+        secondEntered = true;
+        throw new Error("planned second lock-holder release");
+      },
+    } as LiveM4MissionOptions);
+    void second.catch(() => undefined);
+    if (expectSerialized) {
+      await sharedQueued;
+      assert.equal(secondEntered, false);
+    } else {
+      await second.catch(() => undefined);
+      assert.equal(secondEntered, true);
+    }
+    releaseFirst?.();
+    const outcomes = await Promise.allSettled([first, second]);
+    assert.deepEqual(
+      outcomes.map((outcome) => outcome.status),
+      ["rejected", "rejected"],
+    );
+  } finally {
+    releaseFirst?.();
+    await Promise.allSettled([first, ...(second === undefined ? [] : [second])]);
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function assertPartialLiveResourceLockRelease(): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r3-partial-lock-"));
+  const m0Path = join(directory, "m0.sqlite");
+  createSyntheticM0Database(m0Path);
+  const options = {
+    ...liveOptions(directory),
+    m0TrueForgeDatabasePath: m0Path,
+    ownerDecisionProvider: deterministicM4OwnerDecisions(
+      "test-owner/qodo-r3-partial-lock",
+    ),
+  } as LiveM4MissionOptions;
+  let acquired = 0;
+  try {
+    await assert.rejects(
+      runLiveM4Mission({
+        ...options,
+        liveRunLockObserver: ({ stage }) => {
+          if (stage !== "acquired") return;
+          acquired += 1;
+          if (acquired === 2) throw new Error("planned partial lock failure");
+        },
+      }),
+      /planned partial lock failure/u,
+    );
+    assert.equal(acquired, 2);
+    let retryEntered = false;
+    await assert.rejects(
+      runLiveM4Mission({
+        ...options,
+        lifecycleObserver: (stage) => {
+          if (stage !== "environment_initialized") return;
+          retryEntered = true;
+          throw new Error("planned partial lock retry");
+        },
+      }),
+      /planned partial lock retry/u,
+    );
+    assert.equal(retryEntered, true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function cloneAdmissionLedger(sourcePath: string, targetPath: string): void {
+  const database = new DatabaseSync(targetPath);
+  try {
+    database.prepare("ATTACH DATABASE ? AS source").run(sourcePath);
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(
+        "INSERT INTO admission_records SELECT * FROM source.admission_records",
+      );
+      database.exec(
+        "INSERT INTO admission_addenda SELECT * FROM source.admission_addenda",
+      );
+      database.exec("COMMIT");
+    } catch (error: unknown) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    database.exec("DETACH DATABASE source");
+  } finally {
+    database.close();
+  }
 }
 
 function completeDatabaseSnapshot(path: string): string {

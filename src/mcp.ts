@@ -28,7 +28,6 @@ import {
 import {
   type AuthorizedScheduleMutation,
   type CanonicalScheduleCommand,
-  readAuthoritativeFactoryExecution,
   SyntheticFactoryEnvironment,
 } from "./factory-environment.js";
 import {
@@ -37,18 +36,17 @@ import {
   createHeroProposal,
 } from "./hero-fixture.js";
 import {
-  m4AcceptanceArguments,
-  m4MutationToolArguments,
-  m4PortfolioModificationArguments,
+  m4AcceptanceArgumentsFromStore,
+  m4MutationToolArgumentsFromHandles,
+  m4PortfolioModificationArgumentsFromStore,
 } from "./m4-deterministic-model.js";
 import { stableTupleId } from "./identity.js";
 import { StrictJsonLineInput } from "./mcp-stdio-guard.js";
 import { createStore } from "./store.js";
 import type { FlakeBrakeStore } from "./store.js";
 import {
+  canonicalDatabasePath,
   canonicalJson,
-  inImmediateTransaction,
-  openSqlite,
   parseCanonicalJson,
   readDatabaseInstanceIdentity,
 } from "./sqlite.js";
@@ -71,6 +69,24 @@ export interface FactoryMcpServiceOptions {
   readonly now?: () => string;
   /** Additive M4 owner-decision and authoritative-verification tools. */
   readonly enableM4Tools?: boolean;
+  readonly databaseOperationObserver?: (
+    event: FactoryDatabaseOperationEvent,
+  ) => void;
+}
+
+export interface FactoryDatabaseOperationEvent {
+  readonly operation: string;
+  readonly stage:
+    | "before_open"
+    | "after_first_open"
+    | "handles_validated"
+    | "before_operation";
+  readonly openedKinds: readonly ("factory" | "m2")[];
+}
+
+export interface FactoryMcpDatabaseBinding {
+  readonly factoryIdentity: string;
+  readonly m2Identity: string;
 }
 
 export interface RunningFactoryMcpService {
@@ -325,6 +341,7 @@ const prepareScheduleEffectSchema = z
 export function createFactoryMcpService(
   serviceName: FactoryMcpServiceName,
   options: FactoryMcpServiceOptions,
+  durableBinding?: FactoryMcpDatabaseBinding,
 ): RunningFactoryMcpService {
   requireDatabasePath(options.factoryDatabasePath, "factoryDatabasePath");
   requireDatabasePath(options.m2DatabasePath, "m2DatabasePath");
@@ -368,23 +385,28 @@ export function createFactoryMcpService(
         );
         break;
       case "factory-change-control": {
-        const assertDatabaseBinding = authoritativeDatabaseBindingGuard(
-          options.m2DatabasePath,
-          options.factoryDatabasePath,
-        );
+        const context: ChangeControlDatabaseContext = {
+          factoryDatabasePath: options.factoryDatabasePath,
+          m2DatabasePath: options.m2DatabasePath,
+          now: authoritativeNow,
+          expectedFactoryIdentity:
+            durableBinding?.factoryIdentity ??
+            requireFactory(factory).databaseInstanceIdentity(),
+          expectedM2Identity:
+            durableBinding?.m2Identity ??
+            requireM2Store(m2Store).databaseInstanceIdentity(
+              HERO_ENVIRONMENT_ID,
+            ),
+          observer: options.databaseOperationObserver,
+        };
         registerChangeControlTools(
           server,
-          requireM2Store(m2Store),
-          requireFactory(factory),
-          assertDatabaseBinding,
+          context,
         );
         if (options.enableM4Tools === true) {
           registerM4ChangeControlTools(
             server,
-            requireM2Store(m2Store),
-            options.m2DatabasePath,
-            options.factoryDatabasePath,
-            assertDatabaseBinding,
+            context,
           );
         }
         break;
@@ -886,11 +908,141 @@ function currentPortfolioProbe(
   ) as ProposedObligation;
 }
 
+interface ChangeControlDatabaseContext {
+  readonly factoryDatabasePath: string;
+  readonly m2DatabasePath: string;
+  readonly now: () => string;
+  readonly expectedFactoryIdentity: string;
+  readonly expectedM2Identity: string;
+  readonly observer: FactoryMcpServiceOptions["databaseOperationObserver"];
+}
+
+interface VerifiedChangeControlHandles {
+  readonly store: FlakeBrakeStore;
+  readonly factory: SyntheticFactoryEnvironment;
+  readonly assertDatabaseBinding: () => void;
+}
+
+function withVerifiedChangeControlHandles<T>(
+  context: ChangeControlDatabaseContext,
+  operation: string,
+  callback: (handles: VerifiedChangeControlHandles) => T,
+): T {
+  context.observer?.({ operation, stage: "before_open", openedKinds: [] });
+  const resources = [
+    {
+      kind: "factory" as const,
+      path: canonicalDatabasePath(context.factoryDatabasePath),
+    },
+    {
+      kind: "m2" as const,
+      path: canonicalDatabasePath(context.m2DatabasePath),
+    },
+  ].sort((left, right) =>
+    `${left.path}\0${left.kind}`.localeCompare(`${right.path}\0${right.kind}`),
+  );
+  let store: FlakeBrakeStore | null = null;
+  let factory: SyntheticFactoryEnvironment | null = null;
+  const openedKinds: Array<"factory" | "m2"> = [];
+  let primaryFailure: unknown;
+  try {
+    for (const resource of resources) {
+      if (resource.kind === "m2") {
+        store = createStore({
+          path: context.m2DatabasePath,
+          authoritativeFactoryDatabasePath: context.factoryDatabasePath,
+          now: context.now,
+        });
+      } else {
+        factory = new SyntheticFactoryEnvironment({
+          path: context.factoryDatabasePath,
+          now: context.now,
+        });
+      }
+      openedKinds.push(resource.kind);
+      if (openedKinds.length === 1) {
+        context.observer?.({
+          operation,
+          stage: "after_first_open",
+          openedKinds: [...openedKinds],
+        });
+      }
+    }
+    const exactStore = requireM2Store(store);
+    const exactFactory = requireFactory(factory);
+    const assertDatabaseBinding = (): void => {
+      const exactM2Identity = exactStore.databaseInstanceIdentity(
+        HERO_ENVIRONMENT_ID,
+      );
+      const exactFactoryIdentity = exactFactory.databaseInstanceIdentity();
+      const configuredM2Identity = readDatabaseInstanceIdentity(
+        context.m2DatabasePath,
+        "m2",
+        HERO_ENVIRONMENT_ID,
+      );
+      const configuredFactoryIdentity = readDatabaseInstanceIdentity(
+        context.factoryDatabasePath,
+        "factory",
+        HERO_ENVIRONMENT_ID,
+      );
+      if (
+        exactM2Identity !== context.expectedM2Identity ||
+        exactFactoryIdentity !== context.expectedFactoryIdentity ||
+        configuredM2Identity !== exactM2Identity ||
+        configuredFactoryIdentity !== exactFactoryIdentity
+      ) {
+        throw new StatefulInputError(
+          "databaseBinding",
+          "database instance identity conflicts with the exact authoritative operation handles",
+        );
+      }
+    };
+    context.observer?.({
+      operation,
+      stage: "handles_validated",
+      openedKinds: [...openedKinds],
+    });
+    assertDatabaseBinding();
+    context.observer?.({
+      operation,
+      stage: "before_operation",
+      openedKinds: [...openedKinds],
+    });
+    assertDatabaseBinding();
+    return callback({
+      store: exactStore,
+      factory: exactFactory,
+      assertDatabaseBinding,
+    });
+  } catch (error: unknown) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    const cleanupFailures: unknown[] = [];
+    try {
+      store?.close();
+    } catch (error: unknown) {
+      cleanupFailures.push(error);
+    }
+    try {
+      factory?.close();
+    } catch (error: unknown) {
+      cleanupFailures.push(error);
+    }
+    if (primaryFailure === undefined) {
+      throwCleanupFailures(
+        cleanupFailures,
+        `Failed to close verified handles for ${operation}`,
+      );
+    } else {
+      attachCleanupErrors(primaryFailure, cleanupFailures);
+    }
+  }
+}
+
 function registerChangeControlTools(
   server: McpServer,
-  store: FlakeBrakeStore,
-  factory: SyntheticFactoryEnvironment,
-  assertDatabaseBinding: () => void,
+  context: ChangeControlDatabaseContext,
 ): void {
   server.registerTool(
     "read_schedule_state",
@@ -902,11 +1054,25 @@ function registerChangeControlTools(
       annotations: READ_ONLY_ANNOTATIONS,
     },
     () =>
-      toolResult({
-        state: factory.getScheduleState(),
-        stateDigest: factory.getScheduleStateDigest(),
-        controlledWriteCount: factory.getMutationCount(),
-      }),
+      withVerifiedChangeControlHandles(
+        context,
+        "read_schedule_state",
+        ({ factory, assertDatabaseBinding }) => {
+          const state = factory.getScheduleState();
+          const stateDigest = factory.getScheduleStateDigest();
+          const controlledWriteCount = factory.getMutationCount();
+          assertDatabaseBinding();
+          return toolResult({
+            state,
+            stateDigest,
+            controlledWriteCount,
+            verifiedBasis: {
+              environmentId: state.environmentId,
+              factoryDatabaseIdentity: context.expectedFactoryIdentity,
+            },
+          });
+        },
+      ),
   );
   server.registerTool(
     "create_schedule_reservation",
@@ -917,26 +1083,31 @@ function registerChangeControlTools(
       inputSchema: createReservationInputSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    (input) => {
-      assertDatabaseBinding();
-      const command: CanonicalScheduleCommand = {
-        schemaVersion: input.schedule_command.schema_version,
-        commandKind: input.schedule_command.command_kind,
-        environmentId: input.schedule_command.environment_id,
-        orderId: input.schedule_command.order_id,
-        productionCellId: input.schedule_command.production_cell_id,
-        quantity: input.schedule_command.quantity,
-        start: input.schedule_command.start,
-        end: input.schedule_command.end,
-      };
-      return toolResult(
-        factory.executeAuthorizedScheduleMutation(
-          store,
-          normalizedMutation(input, command),
-          assertDatabaseBinding,
-        ),
-      );
-    },
+    (input) =>
+      withVerifiedChangeControlHandles(
+        context,
+        "create_schedule_reservation",
+        ({ store, factory, assertDatabaseBinding }) => {
+          const command: CanonicalScheduleCommand = {
+            schemaVersion: input.schedule_command.schema_version,
+            commandKind: input.schedule_command.command_kind,
+            environmentId: input.schedule_command.environment_id,
+            orderId: input.schedule_command.order_id,
+            productionCellId: input.schedule_command.production_cell_id,
+            quantity: input.schedule_command.quantity,
+            start: input.schedule_command.start,
+            end: input.schedule_command.end,
+          };
+          assertDatabaseBinding();
+          return toolResult(
+            factory.executeAuthorizedScheduleMutation(
+              store,
+              normalizedMutation(input, command),
+              assertDatabaseBinding,
+            ),
+          );
+        },
+      ),
   );
   server.registerTool(
     "submit_schedule_change",
@@ -947,35 +1118,37 @@ function registerChangeControlTools(
       inputSchema: submitChangeInputSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    (input) => {
-      assertDatabaseBinding();
-      const command: CanonicalScheduleCommand = {
-        schemaVersion: "microfactory-schedule-command/v1",
-        commandKind: "create_schedule_reservation",
-        environmentId: input.schedule_change.environment_id,
-        orderId: input.schedule_change.order_id,
-        productionCellId: input.schedule_change.cell_id,
-        quantity: input.schedule_change.quantity,
-        start: input.schedule_change.starts_at,
-        end: input.schedule_change.ends_at,
-      };
-      return toolResult(
-        factory.executeAuthorizedScheduleMutation(
-          store,
-          normalizedMutation(input, command),
-          assertDatabaseBinding,
-        ),
-      );
-    },
+    (input) =>
+      withVerifiedChangeControlHandles(
+        context,
+        "submit_schedule_change",
+        ({ store, factory, assertDatabaseBinding }) => {
+          const command: CanonicalScheduleCommand = {
+            schemaVersion: "microfactory-schedule-command/v1",
+            commandKind: "create_schedule_reservation",
+            environmentId: input.schedule_change.environment_id,
+            orderId: input.schedule_change.order_id,
+            productionCellId: input.schedule_change.cell_id,
+            quantity: input.schedule_change.quantity,
+            start: input.schedule_change.starts_at,
+            end: input.schedule_change.ends_at,
+          };
+          assertDatabaseBinding();
+          return toolResult(
+            factory.executeAuthorizedScheduleMutation(
+              store,
+              normalizedMutation(input, command),
+              assertDatabaseBinding,
+            ),
+          );
+        },
+      ),
   );
 }
 
 function registerM4ChangeControlTools(
   server: McpServer,
-  store: FlakeBrakeStore,
-  m2DatabasePath: string,
-  factoryDatabasePath: string,
-  assertDatabaseBinding: () => void,
+  context: ChangeControlDatabaseContext,
 ): void {
   server.registerTool(
     "record_current_admission",
@@ -986,10 +1159,17 @@ function registerM4ChangeControlTools(
       inputSchema: noArgumentsSchema,
       annotations: LEDGER_WRITE_ANNOTATIONS,
     },
-    () => {
-      assertDatabaseBinding();
-      return toolResult(recordCurrentM4AdmissionOrReplay(store));
-    },
+    () =>
+      withVerifiedChangeControlHandles(
+        context,
+        "record_current_admission",
+        ({ store, assertDatabaseBinding }) => {
+          assertDatabaseBinding();
+          return toolResult(
+            recordCurrentM4AdmissionOrReplay(store, assertDatabaseBinding),
+          );
+        },
+      ),
   );
 
   server.registerTool(
@@ -1001,12 +1181,19 @@ function registerM4ChangeControlTools(
       inputSchema: selectPortfolioModificationSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    (input) => {
-      assertDatabaseBinding();
-      return toolResult(
-        applyM4PortfolioModification(store, m2DatabasePath, input),
-      );
-    },
+    (input) =>
+      withVerifiedChangeControlHandles(
+        context,
+        "select_portfolio_modification",
+        ({ store, assertDatabaseBinding }) =>
+          toolResult(
+            applyM4PortfolioModification(
+              store,
+              input,
+              assertDatabaseBinding,
+            ),
+          ),
+      ),
   );
 
   server.registerTool(
@@ -1018,38 +1205,45 @@ function registerM4ChangeControlTools(
       inputSchema: acceptPromiseSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    (input) => {
-      assertDatabaseBinding();
-      const result = store.acceptPromiseAndIssueGrant({
-        acceptance: {
-          admissionRecordId: input.admission_record_id,
-          selectedPlanId: input.selected_plan_id,
-          ownerDecisionId: input.owner_decision_id,
-          approverId: input.approver_id,
-          ownerSourceIdentity: "owner-source/m4-native-owner-boundary",
-          expectedPortfolioVersion: input.expected_portfolio_version,
-          expectedCapacityModelVersion: input.expected_capacity_model_version,
-          expectedCapacityPlanVersion: input.expected_capacity_plan_version,
-          expectedAuthorizationStateVersion:
-            input.expected_authorization_state_version,
-          expectedCalibrationFrontierDigest:
-            input.expected_calibration_frontier_digest,
+    (input) =>
+      withVerifiedChangeControlHandles(
+        context,
+        "accept_promise",
+        ({ store, assertDatabaseBinding }) => {
+          assertDatabaseBinding();
+          const result = store.acceptPromiseAndIssueGrant({
+            acceptance: {
+              admissionRecordId: input.admission_record_id,
+              selectedPlanId: input.selected_plan_id,
+              ownerDecisionId: input.owner_decision_id,
+              approverId: input.approver_id,
+              ownerSourceIdentity: "owner-source/m4-native-owner-boundary",
+              expectedPortfolioVersion: input.expected_portfolio_version,
+              expectedCapacityModelVersion:
+                input.expected_capacity_model_version,
+              expectedCapacityPlanVersion: input.expected_capacity_plan_version,
+              expectedAuthorizationStateVersion:
+                input.expected_authorization_state_version,
+              expectedCalibrationFrontierDigest:
+                input.expected_calibration_frontier_digest,
+            },
+            grant: {
+              grantId: input.grant.grant_id,
+              grantVersion: input.grant.grant_version,
+              admissionRecordId: input.admission_record_id,
+              promiseBasisId: input.grant.scope.promiseBasisId,
+              acceptedOwnerDecisionId: input.owner_decision_id,
+              ownerDecisionId: input.grant.grant_owner_decision_id,
+              selectedBundleId: input.grant.selected_bundle_id,
+              selectedPlanId: input.selected_plan_id,
+              scope: input.grant.scope as ApprovalScope,
+              postDenialAuthorization: null,
+            },
+          });
+          assertDatabaseBinding();
+          return toolResult(result);
         },
-        grant: {
-          grantId: input.grant.grant_id,
-          grantVersion: input.grant.grant_version,
-          admissionRecordId: input.admission_record_id,
-          promiseBasisId: input.grant.scope.promiseBasisId,
-          acceptedOwnerDecisionId: input.owner_decision_id,
-          ownerDecisionId: input.grant.grant_owner_decision_id,
-          selectedBundleId: input.grant.selected_bundle_id,
-          selectedPlanId: input.selected_plan_id,
-          scope: input.grant.scope as ApprovalScope,
-          postDenialAuthorization: null,
-        },
-      });
-      return toolResult(result);
-    },
+      ),
   );
 
   server.registerTool(
@@ -1062,13 +1256,18 @@ function registerM4ChangeControlTools(
       annotations: READ_ONLY_ANNOTATIONS,
     },
     () =>
-      toolResult({
-        toolName: "select_portfolio_modification",
-        arguments: m4PortfolioModificationArguments({
-          m2DatabasePath,
-          factoryDatabasePath,
-        }),
-      }),
+      withVerifiedChangeControlHandles(
+        context,
+        "prepare_portfolio_modification",
+        ({ store, assertDatabaseBinding }) => {
+          const arguments_ = m4PortfolioModificationArgumentsFromStore(store);
+          assertDatabaseBinding();
+          return toolResult({
+            toolName: "select_portfolio_modification",
+            arguments: arguments_,
+          });
+        },
+      ),
   );
 
   server.registerTool(
@@ -1081,13 +1280,18 @@ function registerM4ChangeControlTools(
       annotations: READ_ONLY_ANNOTATIONS,
     },
     () =>
-      toolResult({
-        toolName: "accept_promise",
-        arguments: m4AcceptanceArguments({
-          m2DatabasePath,
-          factoryDatabasePath,
-        }),
-      }),
+      withVerifiedChangeControlHandles(
+        context,
+        "prepare_promise_acceptance",
+        ({ store, assertDatabaseBinding }) => {
+          const arguments_ = m4AcceptanceArgumentsFromStore(store);
+          assertDatabaseBinding();
+          return toolResult({
+            toolName: "accept_promise",
+            arguments: arguments_,
+          });
+        },
+      ),
   );
 
   server.registerTool(
@@ -1100,17 +1304,26 @@ function registerM4ChangeControlTools(
       annotations: READ_ONLY_ANNOTATIONS,
     },
     (input) =>
-      toolResult({
-        toolName: input.tool_name,
-        arguments: m4MutationToolArguments(
-          input.tool_name,
-          { m2DatabasePath, factoryDatabasePath },
-          input.execution_attempt_id,
-          input.effect_schema_version,
-          input.start,
-          input.end,
-        ),
-      }),
+      withVerifiedChangeControlHandles(
+        context,
+        "prepare_schedule_effect",
+        ({ store, factory, assertDatabaseBinding }) => {
+          const arguments_ = m4MutationToolArgumentsFromHandles(
+            input.tool_name,
+            store,
+            factory,
+            input.execution_attempt_id,
+            input.effect_schema_version,
+            input.start,
+            input.end,
+          );
+          assertDatabaseBinding();
+          return toolResult({
+            toolName: input.tool_name,
+            arguments: arguments_,
+          });
+        },
+      ),
   );
 
   server.registerTool(
@@ -1122,21 +1335,24 @@ function registerM4ChangeControlTools(
       inputSchema: executionStatusSchema,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    ({ execution_attempt_id }) => {
-      const attempt = store.getExecutionAttempt(execution_attempt_id);
-      const fence = store.getExecutionFence(execution_attempt_id);
-      const reservation =
-        store
-          .getReservations(true)
-          .find(
-            (candidate) =>
-              candidate.executionAttemptId === execution_attempt_id,
-          ) ?? null;
-      const factory = readAuthoritativeFactoryExecution(
-        factoryDatabasePath,
-        execution_attempt_id,
-      );
-      return toolResult({
+    ({ execution_attempt_id }) =>
+      withVerifiedChangeControlHandles(
+        context,
+        "read_execution_status",
+        ({ store, factory, assertDatabaseBinding }) => {
+          const attempt = store.getExecutionAttempt(execution_attempt_id);
+          const fence = store.getExecutionFence(execution_attempt_id);
+          const reservation =
+            store
+              .getReservations(true)
+              .find(
+                (candidate) =>
+                  candidate.executionAttemptId === execution_attempt_id,
+              ) ?? null;
+          const factoryEvidence =
+            factory.readAuthoritativeExecution(execution_attempt_id);
+          assertDatabaseBinding();
+          return toolResult({
         executionAttemptId: attempt.executionAttemptId,
         admissionRecordId: attempt.admissionRecordId,
         claimState: reservation?.claimState ?? null,
@@ -1151,18 +1367,19 @@ function registerM4ChangeControlTools(
                 resultBinding: fence.resultBinding,
               },
         factory:
-          factory === null
+          factoryEvidence === null
             ? null
             : {
-                environmentId: factory.environmentId,
-                stateVersion: factory.currentState.stateVersion,
-                currentStateDigest: factory.currentStateDigest,
-                mutationStatus: factory.result.status,
-                receiptId: factory.result.receipt.receiptId,
-                receiptDigest: factory.resultDigest,
+                environmentId: factoryEvidence.environmentId,
+                stateVersion: factoryEvidence.currentState.stateVersion,
+                currentStateDigest: factoryEvidence.currentStateDigest,
+                mutationStatus: factoryEvidence.result.status,
+                receiptId: factoryEvidence.result.receipt.receiptId,
+                receiptDigest: factoryEvidence.resultDigest,
               },
-      });
-    },
+          });
+        },
+      ),
   );
 
   server.registerTool(
@@ -1174,51 +1391,65 @@ function registerM4ChangeControlTools(
       inputSchema: executionStatusSchema,
       annotations: CONSEQUENTIAL_ANNOTATIONS,
     },
-    ({ execution_attempt_id }) => {
-      assertDatabaseBinding();
-      return toolResult(
-        store.verifyExecutionAuthoritatively(execution_attempt_id),
-      );
-    },
+    ({ execution_attempt_id }) =>
+      withVerifiedChangeControlHandles(
+        context,
+        "verify_schedule_execution",
+        ({ store, factory, assertDatabaseBinding }) => {
+          const evidence = factory.readAuthoritativeExecution(
+            execution_attempt_id,
+          );
+          if (evidence === null) {
+            throw new StatefulInputError(
+              "executionAttemptId",
+              "has no authoritative committed factory result",
+            );
+          }
+          assertDatabaseBinding();
+          const result = store.verifyExecutionWithEvidence(
+            execution_attempt_id,
+            evidence,
+          );
+          assertDatabaseBinding();
+          return toolResult(result);
+        },
+      ),
   );
 }
 
 function applyM4PortfolioModification(
   store: FlakeBrakeStore,
-  m2DatabasePath: string,
   input: z.infer<typeof selectPortfolioModificationSchema>,
+  assertDatabaseBinding: () => void,
 ): {
   readonly status: "READMITTED";
   readonly ownerDecisionId: string;
   readonly freshAdmissionRecord: AdmissionRecordBody;
 } {
-  const source = store.getAdmissionRecord(input.admission_record_id);
-  if (source.record.decision !== "REPLAN") {
-    throw new TypeError("M4 portfolio modification requires a REPLAN admission");
-  }
-  if (
-    source.addenda.some((addendum) => addendum.kind === "acceptance_commit")
-  ) {
-    throw new TypeError("The source REPLAN admission was already accepted");
-  }
-  const candidate = source.record.candidatePlans.find(
-    (item) => item.candidatePlanId === input.selected_plan_id,
-  );
-  if (candidate?.feasible !== true) {
-    throw new TypeError("M4 portfolio modification requires a feasible plan");
-  }
-  const decision: OwnerDecisionInput = {
-    kind: "MODIFY",
-    admissionRecordId: input.admission_record_id,
-    selectedPlanId: input.selected_plan_id,
-    ownerDecisionId: input.owner_decision_id,
-    approverId: input.approver_id,
-  };
-
-  const database = openSqlite(m2DatabasePath);
-  let linkedAdmissionId: string | null;
-  try {
-    linkedAdmissionId = inImmediateTransaction(database, () => {
+  return store.withImmediateTransaction((database) => {
+    const source = store.getAdmissionRecord(input.admission_record_id);
+    if (source.record.decision !== "REPLAN") {
+      throw new TypeError("M4 portfolio modification requires a REPLAN admission");
+    }
+    if (
+      source.addenda.some((addendum) => addendum.kind === "acceptance_commit")
+    ) {
+      throw new TypeError("The source REPLAN admission was already accepted");
+    }
+    const candidate = source.record.candidatePlans.find(
+      (item) => item.candidatePlanId === input.selected_plan_id,
+    );
+    if (candidate?.feasible !== true) {
+      throw new TypeError("M4 portfolio modification requires a feasible plan");
+    }
+    const decision: OwnerDecisionInput = {
+      kind: "MODIFY",
+      admissionRecordId: input.admission_record_id,
+      selectedPlanId: input.selected_plan_id,
+      ownerDecisionId: input.owner_decision_id,
+      approverId: input.approver_id,
+    };
+    assertDatabaseBinding();
       const linked = m4LinkedAdmissionId(database, input.admission_record_id);
       const existingDecision = database
         .prepare(
@@ -1233,110 +1464,88 @@ function applyM4PortfolioModification(
         if (canonicalSerialize(stored) !== canonicalSerialize(decision)) {
           throw new TypeError("M4 owner decision identity was reused");
         }
-        if (linked === null) {
-          assertM4ModifiedPortfolio(database, source.record, candidate);
+        if (linked !== null) {
+          const linkedRecord = readM4Admission(database, linked);
+          assertM4FreshAdmission(
+            linkedRecord,
+            source.record.admissionRecordId,
+          );
+          return {
+            status: "READMITTED" as const,
+            ownerDecisionId: input.owner_decision_id,
+            freshAdmissionRecord: linkedRecord,
+          };
         }
-        return linked;
-      }
-      if (linked !== null) {
+        assertM4ModifiedPortfolio(database, source.record, candidate);
+      } else if (linked !== null) {
         throw new Error("M4 readmission link exists without its owner decision");
-      }
-      const currentVersions = readVersions(database);
-      if (
-        currentVersions.portfolioVersion !== source.record.portfolioVersion
-      ) {
-        throw new TypeError("M4 source REPLAN portfolio basis is stale");
-      }
-      const currentPortfolio = readM4Portfolio(database);
-      if (
-        canonicalSerialize(currentPortfolio) !==
-        canonicalSerialize(source.record.m1Result.promiseBasis.acceptedPortfolio)
-      ) {
-        throw new TypeError("M4 source REPLAN portfolio bytes are stale");
-      }
-      const modified = materializeM4Portfolio(source.record, candidate);
-      for (const obligation of modified) {
+      } else {
+        const currentVersions = readVersions(database);
+        if (
+          currentVersions.portfolioVersion !== source.record.portfolioVersion
+        ) {
+          throw new TypeError("M4 source REPLAN portfolio basis is stale");
+        }
+        const currentPortfolio = readM4Portfolio(database);
+        if (
+          canonicalSerialize(currentPortfolio) !==
+          canonicalSerialize(
+            source.record.m1Result.promiseBasis.acceptedPortfolio,
+          )
+        ) {
+          throw new TypeError("M4 source REPLAN portfolio bytes are stale");
+        }
+        const modified = materializeM4Portfolio(source.record, candidate);
+        assertDatabaseBinding();
+        for (const obligation of modified) {
+          database
+            .prepare(
+              `UPDATE portfolio_obligations SET body_json = ?
+                WHERE obligation_id = ?`,
+            )
+            .run(canonicalJson(obligation), obligation.obligationId);
+        }
         database
           .prepare(
-            `UPDATE portfolio_obligations SET body_json = ?
-              WHERE obligation_id = ?`,
+            `INSERT INTO owner_decisions
+               (owner_decision_id, created_at, body_json) VALUES (?, ?, ?)`,
           )
-          .run(canonicalJson(obligation), obligation.obligationId);
-      }
-      database
-        .prepare(
-          `INSERT INTO owner_decisions
-             (owner_decision_id, created_at, body_json) VALUES (?, ?, ?)`,
-        )
-        .run(input.owner_decision_id, HERO_HORIZON_END, canonicalJson(decision));
-      appendM4Addendum(
-        database,
-        stableTupleId("m4-portfolio-owner-choice", [
+          .run(
+            input.owner_decision_id,
+            HERO_HORIZON_END,
+            canonicalJson(decision),
+          );
+        appendM4Addendum(
+          database,
+          stableTupleId("m4-portfolio-owner-choice", [
+            input.admission_record_id,
+            input.owner_decision_id,
+            input.selected_plan_id,
+          ]),
           input.admission_record_id,
-          input.owner_decision_id,
-          input.selected_plan_id,
-        ]),
-        input.admission_record_id,
-        "owner_choice",
-        decision,
-      );
-      const next = advanceVersions(database, new Set(["portfolio"]));
-      const expectedNext = nextPortfolioVersion(source.record.portfolioVersion);
-      if (next.portfolioVersion !== expectedNext) {
-        throw new Error("M4 portfolio modification did not create exact v2 basis");
+          "owner_choice",
+          decision,
+        );
+        const next = advanceVersions(database, new Set(["portfolio"]));
+        const expectedNext = nextPortfolioVersion(source.record.portfolioVersion);
+        if (next.portfolioVersion !== expectedNext) {
+          throw new Error("M4 portfolio modification did not create exact v2 basis");
+        }
       }
-      return null;
-    });
-  } finally {
-    database.close();
-  }
 
-  if (linkedAdmissionId !== null) {
-    const linked = store.getAdmissionRecord(linkedAdmissionId).record;
-    assertM4FreshAdmission(linked, source.record.admissionRecordId);
-    return {
-      status: "READMITTED",
-      ownerDecisionId: input.owner_decision_id,
-      freshAdmissionRecord: linked,
-    };
-  }
-
-  const evaluation = store.evaluateCurrentAdmission({
-    proposal: source.record.proposalSnapshot,
-    assumptions: source.record.m1Result.promiseBasis.assumptions,
-    combinedDecisionProofs:
-      source.record.m1Result.promiseBasis.combinedDecisionProofs,
-  });
-  if (evaluation.result.decision !== "ADMITTABLE") {
-    throw new Error(
-      `M4 post-modification readmission must be ADMITTABLE, got ${evaluation.result.decision}`,
-    );
-  }
-  const freshDatabase = openSqlite(m2DatabasePath);
-  let fresh: AdmissionRecordBody;
-  try {
-    fresh = inImmediateTransaction(freshDatabase, () => {
-      const current = readVersions(freshDatabase);
-      if (
-        current.portfolioVersion !== evaluation.result.basis.portfolioVersion ||
-        current.capacityModelVersion !==
-          evaluation.result.basis.capacityModelVersion ||
-        current.capacityPlanVersion !==
-          evaluation.result.basis.capacityPlanVersion ||
-        current.authorizationStateVersion !==
-          evaluation.result.basis.authorizationStateVersion
-      ) {
-        throw new TypeError("M4 readmission basis changed before persistence");
-      }
-      const existingLink = m4LinkedAdmissionId(
-        freshDatabase,
-        source.record.admissionRecordId,
-      );
-      if (existingLink !== null) {
-        return readM4Admission(freshDatabase, existingLink);
+      const evaluation = store.evaluateCurrentAdmission({
+        proposal: source.record.proposalSnapshot,
+        assumptions: source.record.m1Result.promiseBasis.assumptions,
+        combinedDecisionProofs:
+          source.record.m1Result.promiseBasis.combinedDecisionProofs,
+      });
+      if (evaluation.result.decision !== "ADMITTABLE") {
+        throw new Error(
+          `M4 post-modification readmission must be ADMITTABLE, got ${evaluation.result.decision}`,
+        );
       }
       const matching = (
-        freshDatabase
+        database
           .prepare(
             `SELECT body_json FROM admission_records
               WHERE proposal_obligation_id = ? AND decision = 'ADMITTABLE'
@@ -1365,7 +1574,8 @@ function applyM4PortfolioModification(
       }
       const record = matching[0] ?? m4AdmissionRecord(evaluation.result);
       if (matching.length === 0) {
-        freshDatabase
+        assertDatabaseBinding();
+        database
           .prepare(
             `INSERT INTO admission_records
                (admission_record_id, created_at, decision,
@@ -1381,7 +1591,7 @@ function applyM4PortfolioModification(
           );
       }
       appendM4Addendum(
-        freshDatabase,
+        database,
         stableTupleId("m4-source-readmission-link", [
           source.record.admissionRecordId,
           input.owner_decision_id,
@@ -1397,7 +1607,7 @@ function applyM4PortfolioModification(
         },
       );
       appendM4Addendum(
-        freshDatabase,
+        database,
         stableTupleId("m4-fresh-readmission-link", [
           source.record.admissionRecordId,
           input.owner_decision_id,
@@ -1412,17 +1622,14 @@ function applyM4PortfolioModification(
           selectedModificationPlanId: input.selected_plan_id,
         },
       );
-      return record;
-    });
-  } finally {
-    freshDatabase.close();
-  }
-  assertM4FreshAdmission(fresh, source.record.admissionRecordId);
-  return {
-    status: "READMITTED",
-    ownerDecisionId: input.owner_decision_id,
-    freshAdmissionRecord: fresh,
-  };
+      assertDatabaseBinding();
+      assertM4FreshAdmission(record, source.record.admissionRecordId);
+      return {
+        status: "READMITTED" as const,
+        ownerDecisionId: input.owner_decision_id,
+        freshAdmissionRecord: record,
+      };
+  });
 }
 
 function materializeM4Portfolio(
@@ -1651,18 +1858,15 @@ function assertM4FreshAdmission(
 
 function recordCurrentM4AdmissionOrReplay(
   store: FlakeBrakeStore,
+  assertDatabaseBinding: () => void,
 ): ReturnType<FlakeBrakeStore["evaluateAndRecordAdmission"]> {
-  const proposal = createHeroProposal();
-  const recorded = store
-    .getAdmissionHistory()
-    .find(
-      (candidate) =>
-        candidate.record.proposalSnapshot.obligationId ===
-        proposal.obligationId,
-    );
-  return (
-    recorded?.record ?? store.evaluateAndRecordAdmission({ proposal })
-  );
+  return store.withImmediateTransaction(() => {
+    const proposal = createHeroProposal();
+    assertDatabaseBinding();
+    const recorded = store.evaluateAndRecordAdmissionOrReplay({ proposal });
+    assertDatabaseBinding();
+    return recorded;
+  });
 }
 
 function normalizedMutation(
@@ -1728,44 +1932,6 @@ function requireDatabasePath(value: string | undefined, name: string): string {
     throw new TypeError(`${name} must be a non-empty path`);
   }
   return value;
-}
-
-function authoritativeDatabaseBindingGuard(
-  m2DatabasePath: string,
-  factoryDatabasePath: string,
-): () => void {
-  const expected = {
-    m2: readDatabaseInstanceIdentity(
-      m2DatabasePath,
-      "m2",
-      HERO_ENVIRONMENT_ID,
-    ),
-    factory: readDatabaseInstanceIdentity(
-      factoryDatabasePath,
-      "factory",
-      HERO_ENVIRONMENT_ID,
-    ),
-  };
-  return () => {
-    const current = {
-      m2: readDatabaseInstanceIdentity(
-        m2DatabasePath,
-        "m2",
-        HERO_ENVIRONMENT_ID,
-      ),
-      factory: readDatabaseInstanceIdentity(
-        factoryDatabasePath,
-        "factory",
-        HERO_ENVIRONMENT_ID,
-      ),
-    };
-    if (current.m2 !== expected.m2 || current.factory !== expected.factory) {
-      throw new StatefulInputError(
-        "databaseBinding",
-        "database instance identity conflicts with the authoritative MCP handles",
-      );
-    }
-  };
 }
 
 function requireM2Store(store: FlakeBrakeStore | null): FlakeBrakeStore {
