@@ -16,6 +16,12 @@ import {
   type RunningM5JudgeServer,
 } from "../src/index.js";
 import { parseM5CliArguments } from "../src/m5-cli.js";
+import {
+  armSessionErrorCapture,
+  CONTROLLED_ERROR_PROBE_URL,
+  type BrowserScriptErrorObserver,
+  type ObserverSessionBrowser,
+} from "./m5-error-capture.js";
 
 describe("M5 judge-readiness audit F-01 through F-26", () => {
   const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
@@ -145,16 +151,55 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
   });
 });
 
-test("Qodo Round 1 captures browser errors before and across every document load", () => {
-  const browserSmoke = readFileSync(join(process.cwd(), "test/m5-browser-smoke.ts"), "utf8");
-  const observerIndex = browserSmoke.indexOf("addJavaScriptErrorHandler");
-  const applicationLoadIndex = browserSmoke.indexOf("await browser.get(running.url)");
-  assert.notEqual(observerIndex, -1, "the browser session must own an error observer");
-  assert.ok(observerIndex < applicationLoadIndex, "error observation must precede application load");
-  assert.match(browserSmoke, /m5-controlled-error-capture-probe/u);
-  assert.match(browserSmoke, /capturedJavascriptErrorCount = 0/u);
-  assert.doesNotMatch(browserSmoke, /window\.__m5Errors/u);
-  assert.doesNotMatch(browserSmoke, /__m5Errors \|\| \[\]/u);
+describe("Qodo Round 2: executable session error-capture arming", () => {
+  test("arming registers the observer before any navigation and clears the probe", async () => {
+    const session = createFakeBrowserSession();
+    const capture = await armSessionErrorCapture(session.script, session.browser);
+    await capture.openApplication("http://application.invalid/");
+    assert.deepEqual(session.events, [
+      `register:${String(capture.handlerId)}`,
+      "navigate:probe",
+      "refresh",
+      "navigate:http://application.invalid/",
+    ]);
+    assert.equal(capture.capturedErrorCount(), 0, "the controlled probe errors are cleared after arming");
+  });
+
+  test("the same session observer covers later application loads and reloads", async () => {
+    const session = createFakeBrowserSession();
+    const capture = await armSessionErrorCapture(session.script, session.browser);
+    await capture.openApplication("http://application.invalid/");
+    assert.equal(session.registeredHandlerCount(), 1);
+    assert.equal(session.emitSessionError(), 1);
+    await session.browser.refresh();
+    assert.equal(session.emitSessionError(), 1);
+    assert.equal(capture.capturedErrorCount(), 2);
+    await capture.dispose();
+    assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.emitSessionError(), 0);
+    assert.equal(capture.capturedErrorCount(), 2);
+    assert.equal(session.events[session.events.length - 1], `remove:${String(capture.handlerId)}`);
+  });
+
+  test("an observer that never observes errors fails closed before application navigation", async () => {
+    const session = createFakeBrowserSession({ deliverLoadErrors: false });
+    await assert.rejects(
+      armSessionErrorCapture(session.script, session.browser),
+      /did not capture the controlled load-time probe error/u,
+    );
+    assert.deepEqual(
+      session.events.filter((event) => event.startsWith("navigate:")),
+      ["navigate:probe"],
+    );
+  });
+
+  test("a page-scoped observer lost on refresh fails closed", async () => {
+    const session = createFakeBrowserSession({ dropHandlersOnRefresh: true });
+    await assert.rejects(
+      armSessionErrorCapture(session.script, session.browser),
+      /did not keep capturing the probe error across refresh/u,
+    );
+  });
 });
 
 const EXPECTED_APPROVAL_ROUTE = [
@@ -1273,4 +1318,69 @@ function fakeNode(nodes: Map<string, FakeNode>, id: string): FakeNode {
   };
   nodes.set(id, node);
   return node;
+}
+
+interface FakeBrowserSession {
+  readonly script: BrowserScriptErrorObserver;
+  readonly browser: ObserverSessionBrowser;
+  readonly events: readonly string[];
+  registeredHandlerCount(): number;
+  emitSessionError(): number;
+}
+
+function createFakeBrowserSession(options?: {
+  readonly deliverLoadErrors?: boolean;
+  readonly dropHandlersOnRefresh?: boolean;
+}): FakeBrowserSession {
+  const deliverLoadErrors = options?.deliverLoadErrors ?? true;
+  const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
+  const events: string[] = [];
+  const handlers = new Map<number, (entry: unknown) => void>();
+  let nextHandlerId = 41;
+  let currentUrl: string | null = null;
+  const deliverToRegisteredHandlers = (): number => {
+    const active = [...handlers.values()];
+    for (const handler of active) handler({ type: "javascript-error" });
+    return active.length;
+  };
+  const deliverProbeLoadError = (): void => {
+    if (deliverLoadErrors && currentUrl === CONTROLLED_ERROR_PROBE_URL) deliverToRegisteredHandlers();
+  };
+  return {
+    script: {
+      addJavaScriptErrorHandler: async (callback) => {
+        const handlerId = nextHandlerId;
+        nextHandlerId += 1;
+        handlers.set(handlerId, callback);
+        events.push(`register:${String(handlerId)}`);
+        return handlerId;
+      },
+      removeJavaScriptErrorHandler: async (handlerId) => {
+        handlers.delete(handlerId);
+        events.push(`remove:${String(handlerId)}`);
+      },
+    },
+    browser: {
+      get: async (url) => {
+        currentUrl = url;
+        events.push(url === CONTROLLED_ERROR_PROBE_URL ? "navigate:probe" : `navigate:${url}`);
+        deliverProbeLoadError();
+      },
+      refresh: async () => {
+        events.push("refresh");
+        if (dropHandlersOnRefresh) handlers.clear();
+        deliverProbeLoadError();
+      },
+      wait: async (condition, _timeoutMs, message) => {
+        for (let turn = 0; turn < 5; turn += 1) {
+          if (condition()) return;
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+        }
+        throw new Error(message);
+      },
+    },
+    events,
+    registeredHandlerCount: () => handlers.size,
+    emitSessionError: deliverToRegisteredHandlers,
+  };
 }
