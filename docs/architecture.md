@@ -73,11 +73,11 @@ services expose orders, capacity, deterministic simulation, and controlled
 change operations over Streamable HTTP; the lifecycle is also exercised over
 stdio. The browser never talks to these services directly.
 
-Consequential operations open the currently configured M2 and factory paths,
-acquire canonical per-resource locks in deterministic order, validate immutable
-database incarnations on those exact handles, authorize/fence/mutate through the
-same handles, and release in reverse order. Idempotent replay returns the
-original result. Conflicts fail before mutation.
+Consequential M3 operations sort the configured M2 and factory resource
+descriptors, open those current paths, validate immutable database incarnations
+on those exact handles, and authorize, fence, and mutate through the same
+handles. Idempotent replay returns the original result. Conflicts fail before
+mutation. Cross-resource live-run locking is an M4 responsibility.
 
 ### M4: TrueForge orchestration
 
@@ -130,10 +130,12 @@ projection. An identical replay after a lost response recovers the existing
 successor; it does not create a sibling turn or repeat admission, grant, attempt,
 mutation, receipt, actual, or terminal facts.
 
-In-process live runs acquire independently canonicalized locks for every mutable
-M2, factory, mission, and TrueForge-state resource. Runs sharing any resource
-serialize; disjoint runs may proceed concurrently. Symlink and relative aliases
-converge on physical resource identity.
+The M4 live-run wrapper acquires independently canonicalized locks for every
+mutable M2, factory, mission, and TrueForge-state resource, in deterministic
+order, and releases them in reverse order. Runs sharing any resource serialize;
+disjoint runs may proceed concurrently. Symlink and relative aliases converge
+on physical resource identity. The standalone M3 MCP wrapper does not provide
+this cross-resource live-run lock boundary.
 
 ## Trust and data boundaries
 

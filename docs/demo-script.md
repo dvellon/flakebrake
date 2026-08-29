@@ -23,7 +23,7 @@ the complete portfolio and exact capacity basis are visible.”
 
 ## 0:45–1:05 — TrueForge evidence
 
-Choose **Start deterministic mission**.
+Choose **Start hero mission**.
 
 **Show:** The TrueForge root node, three subagents, sandbox execution, four MCP
 services, and chronological tool/evidence activity.
@@ -34,19 +34,20 @@ FlakeBrake code remains the authority.”
 
 ## 1:05–1:30 — Replan winner and promise acceptance
 
-At the first approval, point to the exact action digest and effect, then approve
-the existing-order modification. Show that the winner changes a best-effort
-quantity from 10 to 8 while protected work remains unchanged.
+At the first approval, point to the exact action digest and effect, then choose
+**Approve action** for the existing-order modification. Show that the winner
+changes a best-effort quantity from 10 to 8 while protected work remains
+unchanged.
 
-At the second approval, approve the fresh portfolio-v2 `ADMITTABLE` Promise
-Basis.
+At the second approval, choose **Approve action** for the fresh portfolio-v2
+`ADMITTABLE` Promise Basis.
 
 **Say:** “Portfolio v2 is durable before readmission. Acceptance and its exact
 grant commit atomically; the old v1 `REPLAN` can never be accepted.”
 
 ## 1:30–2:05 — Human denial and mechanical denial
 
-At the primary 09:10–09:40 reservation, choose **Deny**.
+At the primary 09:10–09:40 reservation, choose **Deny action**.
 
 **Show:** The denial in the timeline, followed by “Equivalent representation
 denied mechanically.”
@@ -57,7 +58,7 @@ without another owner call or mutation.”
 
 ## 2:05–2:30 — Approved alternative and one mutation
 
-Approve the distinct 09:40–10:10 alternative.
+Choose **Approve action** for the distinct 09:40–10:10 alternative.
 
 **Show:** The metrics for one acceptance, one attempt, one mutation, and one
 receipt.

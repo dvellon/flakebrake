@@ -156,9 +156,10 @@ performs consequential mutations.
 
 Every consequential owner request shows the exact mission, predecessor turn,
 tool/action, expected effect, action digest, and owner-source identity. The UI
-does not auto-approve: the judge selects Allow or Deny. A response can authorize
-only the exact digest and arguments displayed. Missing, stale, malformed,
-replayed-with-different-arguments, or wrong-mission responses fail closed.
+does not auto-approve: the judge selects **Approve action** or **Deny action**.
+A response can authorize only the exact digest and arguments displayed.
+Missing, stale, malformed, replayed-with-different-arguments, or wrong-mission
+responses fail closed.
 
 ![Exact identity-bound owner approval](docs/assets/hero-approval.png)
 
@@ -223,7 +224,7 @@ npm run build
 npm run m5:ui
 ```
 
-Open `http://127.0.0.1:4173`, choose **Start deterministic mission**, and follow
+Open `http://127.0.0.1:4173`, choose **Start hero mission**, and follow
 the four owner prompts. The service binds to loopback by default. Press
 `Ctrl+C` for bounded cleanup. An alternate port can be selected with
 `npm run m5:ui -- --port 4174`.
