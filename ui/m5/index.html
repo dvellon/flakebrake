@@ -25,8 +25,9 @@
       <section class="hero" aria-labelledby="hero-title">
         <div>
           <p class="eyebrow">Deterministic TrueForge mission</p>
-          <h1 id="hero-title">A rush order. One safe promise.</h1>
+          <h1 id="hero-title"><span>A rush order.</span> <span class="hero-line">One safe promise.</span></h1>
           <p class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
+          <p class="basis-note"><strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores.</p>
         </div>
         <div class="hero-actions">
           <button id="start-button" class="button button-primary" type="button">Start hero mission</button>
@@ -41,41 +42,46 @@
         <div><span>Outcome</span><strong id="outcome" class="tone-neutral">Waiting</strong></div>
       </section>
 
-      <section id="approval-panel" class="approval-panel is-hidden" aria-labelledby="approval-title">
+      <section id="approval-panel" class="approval-panel is-continuing" aria-labelledby="approval-title">
         <div class="approval-heading">
           <div>
             <p class="eyebrow">External owner boundary</p>
-            <h2 id="approval-title">Your decision is required</h2>
+            <h2 id="approval-title" tabindex="-1">Mission controls ready</h2>
           </div>
-          <span id="approval-phase" class="pill pill-pending">Pending</span>
+          <span id="approval-phase" class="pill pill-neutral">Standing by</span>
         </div>
-        <p id="approval-tool" class="action-name"></p>
-        <p id="approval-effect" class="approval-effect"></p>
-        <details>
+        <p id="approval-tool" class="action-name">No consequential action is waiting</p>
+        <p id="approval-effect" class="approval-effect">Start the mission to reach the first owner decision.</p>
+        <div id="policy-decision" class="policy-decision" hidden></div>
+        <details id="approval-details">
           <summary>Durable action identity</summary>
-          <dl class="identity-grid">
+          <dl class="identity-grid technical-identity">
             <div><dt>Mission</dt><dd id="approval-mission"></dd></div>
             <div><dt>Action digest</dt><dd id="approval-digest"></dd></div>
             <div><dt>Owner source</dt><dd id="approval-source"></dd></div>
+            <div id="approval-subject-row"><dt>Bound record</dt><dd id="approval-subject"></dd></div>
           </dl>
         </details>
         <div class="approval-actions">
-          <button id="deny-button" class="button button-deny" type="button">Deny action</button>
-          <button id="allow-button" class="button button-approve" type="button">Approve action</button>
+          <button id="deny-button" class="button button-quiet" type="button" disabled>Deny action</button>
+          <button id="allow-button" class="button button-quiet" type="button" disabled>Approve action</button>
         </div>
         <p id="approval-guidance" class="guidance"></p>
+        <p id="decision-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
       </section>
 
       <div class="dashboard">
         <section class="card story-card" aria-labelledby="promise-title">
           <div class="card-heading">
-            <div><p class="eyebrow">01 · Promise basis</p><h2 id="promise-title">Capacity before commitment</h2></div>
-            <span class="pill pill-denied">REPLAN</span>
+            <div><p class="eyebrow">01 · Original promise basis</p><h2 id="promise-title">Capacity before commitment</h2></div>
+            <span class="pill pill-denied">REPLAN · original basis</span>
           </div>
+          <p class="context-note">The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.</p>
+          <p id="basis-resolution" class="basis-resolution">Original rush basis requires a bounded replan.</p>
           <div id="capacity-grid" class="capacity-grid" aria-label="Capacity evaluation"></div>
           <div class="split-list">
-            <div><h3>Protected obligations</h3><div id="obligations"></div></div>
-            <div><h3>Rush proposal</h3><div id="proposal"></div></div>
+            <div><h3>Accepted workload after bounded replan</h3><div id="obligations"></div></div>
+            <div><h3>Original rush request</h3><div id="proposal"></div></div>
           </div>
         </section>
 
@@ -112,6 +118,7 @@
           </div>
           <div id="result-metrics" class="result-metrics"></div>
           <div id="actual-facts" class="actual-facts"></div>
+          <ol id="proof-stages" class="proof-stages" aria-label="Verification proof stages"></ol>
           <p id="readback-note" class="readback-note">Independent read-back has not yet occurred.</p>
         </section>
       </div>

@@ -74,6 +74,7 @@ export interface M5PendingApproval {
   readonly expectedEffect: string;
   readonly recommendedDecision: "allow" | "deny";
   readonly ownerSourceIdentity: string;
+  readonly technicalSubject: string | null;
 }
 
 export interface M5JudgeState {
@@ -146,6 +147,7 @@ export interface M5JudgeState {
     readonly ownerSourceIdentity: string | null;
     readonly actionIdentity: string;
     readonly effect: string;
+    readonly reason: string;
     readonly denialId: string | null;
   }[];
   readonly activity: {
@@ -161,6 +163,7 @@ export interface M5JudgeState {
     readonly kind: string;
     readonly title: string;
     readonly detail: string;
+    readonly technicalIdentity: string | null;
     readonly status: "proposed" | "pending" | "denied" | "approved" | "verified" | "informational";
   }[];
   readonly execution: {
@@ -236,6 +239,7 @@ export class M5DemoCoordinator {
     kind: string;
     title: string;
     detail: string;
+    technicalIdentity: string | null;
     status: M5JudgeState["evidenceTimeline"][number]["status"];
   }[] = [];
   #pendingApproval: PendingApprovalInternal | null = null;
@@ -273,12 +277,18 @@ export class M5DemoCoordinator {
     }
     if (this.#status === "failed") {
       this.#generation += 1;
+      this.#upsertEvidence(
+        "failure",
+        "Earlier attempt stopped safely · recovered",
+        "A durable retry resumed the same mission without exposing unverified success or repeating an effect.",
+        "informational",
+      );
     }
     this.#status = "running";
     this.#replayedTerminal =
       this.#readExecution().terminalStatus === "terminal_verified";
     this.#errorCode = null;
-    this.#recordEvidence(
+    this.#upsertEvidence(
       "mission",
       "Deterministic mission started",
       "Canonical M1–M4 stores and TrueForge orchestration are starting.",
@@ -298,13 +308,21 @@ export class M5DemoCoordinator {
         this.#result = result;
         this.#status = "verified";
         this.#pendingApproval = null;
-        this.#recordEvidence(
+        const completedExecution = this.#readExecution();
+        this.#upsertEvidence(
+          "receipt",
+          "Mutation committed",
+          "One fenced mutation and its receipt are durable; independent read-back followed.",
+          "approved",
+          completedExecution.receiptId,
+        );
+        this.#upsertEvidence(
           "read-back",
           "Independent factory read-back",
           "The resulting schedule matched the mutation receipt before verification.",
           "verified",
         );
-        this.#recordEvidence(
+        this.#upsertEvidence(
           "terminal",
           "Terminal verified success",
           "Independent read-back matched the authorized mutation before root completion.",
@@ -316,7 +334,7 @@ export class M5DemoCoordinator {
         this.#status = this.#closing ? "closed" : "failed";
         this.#errorCode = classifyMissionError(error);
         if (!this.#closing) {
-          this.#recordEvidence(
+          this.#upsertEvidence(
             "failure",
             "Mission stopped safely",
             "No unverified completion was exposed. See the local server console for diagnostics.",
@@ -406,11 +424,14 @@ export class M5DemoCoordinator {
     this.#decisionHistory.set(input.actionIdentity, { response, canonicalInput });
     this.#pendingApproval = null;
     this.#status = "running";
-    this.#recordEvidence(
-      "owner_decision",
+    this.#upsertEvidence(
+      `approval:${pending.request.requestDigest}`,
       input.decision === "allow" ? "Owner approved exact action" : "Owner denied exact action",
-      pending.publicState.expectedEffect,
+      input.decision === "deny"
+        ? `${pending.publicState.expectedEffect} · ${input.reason as string}`
+        : pending.publicState.expectedEffect,
       input.decision === "allow" ? "approved" : "denied",
+      pending.request.requestDigest,
     );
     pending.resolve(response);
     this.#bumpRevision();
@@ -439,7 +460,7 @@ export class M5DemoCoordinator {
     const execution = this.#readExecution();
     const result = this.#result;
     const activity = result === null ? emptyActivity() : activityFromResult(result);
-    const timeline = this.#timeline(approvals, execution);
+    const timeline = this.#timeline(approvals);
     const ownerApprovals = approvals.filter((item) => item.source === "owner");
     const duplicateApprovals = approvals.length - new Set(approvals.map((item) => item.bridgeKey)).size;
     const directCapacity = direct.directPlan.capacityAfter;
@@ -461,9 +482,7 @@ export class M5DemoCoordinator {
             ? "idle"
             : this.#status === "awaiting_approval"
               ? "awaiting_owner"
-              : this.#status === "verified" && result?.mission.disconnectedAndResumed === true
-                ? "replayed"
-                : this.#status === "verified" && this.#replayedTerminal
+              : this.#status === "verified" && this.#replayedTerminal
                   ? "replayed"
                 : this.#status === "closed"
                   ? "closed"
@@ -535,6 +554,7 @@ export class M5DemoCoordinator {
         ownerSourceIdentity: approval.ownerSourceIdentity,
         actionIdentity: approval.bridgeKey,
         effect: approvalEffect(approval, missionSnapshot),
+        reason: approval.reason,
         denialId: approval.denialId,
       })),
       activity,
@@ -598,11 +618,12 @@ export class M5DemoCoordinator {
     this.#ownerCallsThisProcess += 1;
     this.#status = "awaiting_approval";
     const publicState = pendingApprovalState(request);
-    this.#recordEvidence(
-      "approval",
+    this.#upsertEvidence(
+      `approval:${request.requestDigest}`,
       `Owner decision required: ${humanToolName(request.toolName)}`,
       publicState.expectedEffect,
       "pending",
+      request.requestDigest,
     );
     this.#bumpRevision();
     return new Promise<M4OwnerDecisionResponse>((resolveDecision) => {
@@ -616,7 +637,7 @@ export class M5DemoCoordinator {
 
   #observeCheckpoint(checkpoint: M4MissionCheckpoint): void {
     if (checkpoint.phase === "running_turn") {
-      this.#recordEvidence(
+      this.#upsertEvidence(
         "sandbox",
         "Assurance sandbox created",
         "TrueForge Code Mode opened an isolated deterministic assurance run.",
@@ -626,10 +647,10 @@ export class M5DemoCoordinator {
       if (!this.#observedApprovals.some((item) => item.bridgeKey === checkpoint.approval.bridgeKey)) {
         this.#observedApprovals.push(checkpoint.approval);
       }
-      this.#recordEvidence(
+      this.#upsertEvidence(
         `approval:${checkpoint.approval.bridgeKey}`,
         checkpoint.approval.source === "active_m2_denial"
-          ? "Equivalent representation denied mechanically"
+          ? "Auto-blocked · active policy"
           : checkpoint.approval.decision === "allow"
             ? "Owner approved the bound action"
             : "Owner denied the bound action",
@@ -637,10 +658,11 @@ export class M5DemoCoordinator {
           ? "The active M2 denial blocked the alternate adapter without another owner call."
           : `${humanToolName(checkpoint.approval.toolName)} · exact action digest and owner source bound durably.`,
         checkpoint.approval.decision === "allow" ? "approved" : "denied",
+        checkpoint.approval.bridgeKey,
       );
     } else {
       this.#status = "verifying";
-      this.#recordEvidence(
+      this.#upsertEvidence(
         "receipt",
         "Mutation receipt committed",
         "One fenced mutation is durable; independent read-back must still verify it.",
@@ -779,17 +801,36 @@ export class M5DemoCoordinator {
 
   #timeline(
     approvals: readonly M4ApprovalRecord[],
-    execution: M5JudgeState["execution"],
   ): M5JudgeState["evidenceTimeline"] {
+    const postDecisionKinds = new Set([
+      "receipt",
+      "read-back",
+      "terminal",
+      ...(this.#status === "failed" ? ["failure"] : []),
+    ]);
+    const orchestration = this.#runtimeEvidence.filter(
+      (item) => !item.kind.startsWith("approval:") && !postDecisionKinds.has(item.kind),
+    );
+    const pending = this.#runtimeEvidence.filter(
+      (item) => item.kind.startsWith("approval:") && item.status === "pending",
+    );
+    const postDecision = this.#runtimeEvidence
+      .filter((item) => postDecisionKinds.has(item.kind))
+      .sort(
+        (left, right) =>
+          ["receipt", "read-back", "terminal", "failure"].indexOf(left.kind) -
+          ["receipt", "read-back", "terminal", "failure"].indexOf(right.kind),
+      );
     const items = [
       {
         sequence: 1,
         kind: "evaluation",
         title: "Direct rush evaluation: REPLAN",
         detail: "Canonical M1 evaluation found agent and human decision capacity violations.",
+        technicalIdentity: null,
         status: "proposed" as const,
       },
-      ...this.#runtimeEvidence.map((item, index) => ({ ...item, sequence: index + 2 })),
+      ...orchestration.map((item, index) => ({ ...item, sequence: index + 2 })),
     ];
     for (const approval of approvals) {
       const detail = `${humanToolName(approval.toolName)} · ${approval.source === "owner" ? "external owner" : "active M2 denial"}`;
@@ -797,36 +838,42 @@ export class M5DemoCoordinator {
       items.push({
         sequence: items.length + 1,
         kind: `approval:${approval.bridgeKey}`,
-        title: approval.decision === "allow" ? "Action approved" : "Action denied",
+        title:
+          approval.source === "active_m2_denial"
+            ? "Auto-blocked · active policy"
+            : approval.decision === "allow"
+              ? "Action approved"
+              : "Action denied",
         detail,
+        technicalIdentity: approval.bridgeKey,
         status: approval.decision === "allow" ? "approved" : "denied",
       });
     }
-    if (execution.receiptId !== null && !items.some((item) => item.kind === "receipt:canonical")) {
-      items.push({
-        sequence: items.length + 1,
-        kind: "receipt:canonical",
-        title: "One mutation receipt recorded",
-        detail: execution.receiptId,
-        status: execution.terminalStatus === "terminal_verified" ? "verified" : "pending",
-      });
-    }
+    items.push(...pending, ...postDecision);
     return items.map((item, index) => ({ ...item, sequence: index + 1 }));
   }
 
-  #recordEvidence(
+  #upsertEvidence(
     kind: string,
     title: string,
     detail: string,
     status: M5JudgeState["evidenceTimeline"][number]["status"],
+    technicalIdentity: string | null = null,
   ): void {
-    this.#runtimeEvidence.push({
+    const evidence = {
       sequence: this.#runtimeEvidence.length + 1,
       kind,
       title,
       detail,
+      technicalIdentity,
       status,
-    });
+    };
+    const existing = this.#runtimeEvidence.findIndex((item) => item.kind === kind);
+    if (existing === -1) this.#runtimeEvidence.push(evidence);
+    else this.#runtimeEvidence[existing] = {
+      ...evidence,
+      sequence: this.#runtimeEvidence[existing]?.sequence ?? evidence.sequence,
+    };
     this.#bumpRevision();
   }
 
@@ -1245,6 +1292,10 @@ function pendingApprovalState(request: M4OwnerApprovalRequest): M5PendingApprova
         ? "deny"
         : "allow",
     ownerSourceIdentity: OWNER_SOURCE_IDENTITY,
+    technicalSubject:
+      request.toolName === "accept_promise"
+        ? stringValue(objectValue(request.arguments)?.["admission_record_id"])
+        : null,
   };
 }
 
@@ -1259,7 +1310,7 @@ function expectedEffectForRequest(request: M4OwnerApprovalRequest): string {
   }
   const arguments_ = objectValue(request.arguments);
   if (request.toolName === "accept_promise") {
-    return `Accept fresh ADMITTABLE admission ${stringValue(arguments_?.["admission_record_id"]) ?? "(bound admission)"} and issue its exact grant`;
+    return "Accept the fresh capacity-safe promise and issue its exact authorization grant";
   }
   const schedule = objectValue(arguments_?.["schedule_command"]);
   const alternate = objectValue(arguments_?.["schedule_change"]);

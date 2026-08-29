@@ -17,6 +17,134 @@ import {
 } from "../src/index.js";
 import { parseM5CliArguments } from "../src/m5-cli.js";
 
+describe("M5 judge-readiness audit F-01 through F-26", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+  const stylesheet = readFileSync(join(process.cwd(), "ui/m5/styles.css"), "utf8");
+  const projection = readFileSync(join(process.cwd(), "src/m5-ui.ts"), "utf8");
+
+  test("F-01 exposes exactly one dynamically recommended approval action", () => {
+    assert.match(application, /setRecommendedAction/u);
+    assert.doesNotMatch(document, /id="allow-button"[^>]*button-approve/u);
+  });
+
+  test("F-02 separates agent identity from truthful status chips", () => {
+    assert.match(application, /agent-name/u);
+    assert.match(application, /agent-status status-chip/u);
+  });
+
+  test("F-03 contains capacity cards throughout the intermediate-width range", () => {
+    assert.match(stylesheet, /@media \(max-width: 1120px\)/u);
+    assert.match(stylesheet, /\.capacity-item[^}]*min-width:\s*0/u);
+  });
+
+  test("F-04 labels mechanical denial as an active-policy auto-block", () => {
+    assert.match(application, /Auto-blocked · active policy/u);
+  });
+
+  test("F-05 preserves the ordered mutation, read-back, and verification proof", () => {
+    assert.match(document, /id="proof-stages"/u);
+    assert.match(application, /Independent read-back pending/u);
+    assert.match(application, /Read-back matched · verified/u);
+  });
+
+  test("F-06 pins the timeline only while the judge remains near its latest entry", () => {
+    assert.match(application, /timelinePinned/u);
+    assert.match(application, /isTimelineNearLatest/u);
+  });
+
+  test("F-07 wraps durable identities without horizontal overflow", () => {
+    assert.match(stylesheet, /\.technical-identity[^}]*overflow-wrap:\s*anywhere/u);
+  });
+
+  test("F-08 consolidates correlated approval evidence and settles its status", () => {
+    assert.match(projection, /#upsertEvidence/u);
+    assert.match(application, /evidence-details/u);
+  });
+
+  test("F-09 distinguishes the original REPLAN basis from its bounded resolution", () => {
+    assert.match(document, /Original promise basis/u);
+    assert.match(application, /Resolved through bounded replan/u);
+  });
+
+  test("F-10 keeps judge-facing promise acceptance in human language", () => {
+    assert.match(projection, /Accept the fresh capacity-safe promise/u);
+    assert.doesNotMatch(projection, /return `Accept fresh ADMITTABLE/u);
+  });
+
+  test("F-11 explains the safe alternative and the owner's denial rationale", () => {
+    assert.match(application, /Primary denial rationale/u);
+    assert.match(application, /starts after the protected interval/u);
+  });
+
+  test("F-12 explains that the schedule conflict is interval-specific", () => {
+    assert.match(document, /interval-specific/u);
+  });
+
+  test("F-13 uses one semantic capacity baseline", () => {
+    assert.match(application, /capacity-baseline/u);
+  });
+
+  test("F-14 labels accepted work accurately and resolves proposal duplication", () => {
+    assert.match(document, /Accepted workload after bounded replan/u);
+    assert.match(application, /acceptedProposal/u);
+  });
+
+  test("F-15 distinguishes live completion from a durable browser re-attach", () => {
+    assert.match(application, /Mission complete/u);
+    assert.match(application, /Durable replay restored/u);
+  });
+
+  test("F-16 keeps the approval region mounted between decisions", () => {
+    assert.match(application, /approval-panel.*is-continuing/u);
+    assert.doesNotMatch(application, /approval-panel.*is-hidden/u);
+  });
+
+  test("F-17 moves focus and announces new approval and decision state politely", () => {
+    assert.match(document, /id="decision-announcer"[^>]*aria-live="polite"/u);
+    assert.match(document, /id="approval-title"[^>]*tabindex="-1"/u);
+  });
+
+  test("F-18 formats the verified interval for judges", () => {
+    assert.match(application, /formatFriendlyInterval/u);
+  });
+
+  test("F-19 humanizes ledger facts with explanatory subtitles", () => {
+    assert.match(application, /resourcePresentation/u);
+    assert.match(application, /fact-subtitle/u);
+  });
+
+  test("F-20 keeps the hero promise phrase together", () => {
+    assert.match(document, /class="hero-line">One safe promise\.<\/span>/u);
+  });
+
+  test("F-21 shares one topbar and content gutter", () => {
+    assert.match(stylesheet, /--content-gutter/u);
+  });
+
+  test("F-22 explains the idle canonical basis and the Start action", () => {
+    assert.match(document, /precomputed canonical basis/u);
+  });
+
+  test("F-23 preserves the full turn identity and a working fallback", () => {
+    assert.match(application, /currentTurnId \?\? "Not started"/u);
+  });
+
+  test("F-24 uses restrained dark-theme scrollbars", () => {
+    assert.match(stylesheet, /scrollbar-color/u);
+  });
+
+  test("F-25 exposes only state-backed agent activity with clear status chips", () => {
+    assert.match(application, /truthfulAgentStatus/u);
+    assert.match(stylesheet, /\.status-chip/u);
+  });
+
+  test("F-26 uses CSP-compliant semantic progress with actual values", () => {
+    assert.match(application, /<progress/u);
+    assert.doesNotMatch(application, /style="width:/u);
+  });
+});
+
 const EXPECTED_APPROVAL_ROUTE = [
   ["select_portfolio_modification", "allow", "owner"],
   ["accept_promise", "allow", "owner"],
@@ -215,6 +343,22 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(terminal.activity.subagents.length, 3);
     assert.equal(terminal.activity.sandboxExecutions, 1);
     assert.equal(terminal.activity.mcpServers.length, 4);
+    const decisionEvidence = terminal.evidenceTimeline.filter((item) => item.kind.startsWith("approval:"));
+    assert.equal(decisionEvidence.length, terminal.approvals.length);
+    assert.equal(decisionEvidence.some((item) => item.status === "pending"), false);
+    assert.equal(
+      decisionEvidence.filter((item) => item.title === "Auto-blocked · active policy").length,
+      1,
+    );
+    const receiptIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "receipt");
+    const readBackIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "read-back");
+    const terminalIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "terminal");
+    assert.equal(decisionEvidence.every((item) => item.sequence < (terminal.evidenceTimeline[receiptIndex]?.sequence ?? 0)), true);
+    assert.equal(receiptIndex < readBackIndex && readBackIndex < terminalIndex, true);
+    assert.match(
+      terminal.approvals.find((item) => item.source === "owner" && item.decision === "deny")?.reason ?? "",
+      /protected production commitments/u,
+    );
   });
 
   test("refresh returns the durable projection without repeating effects", async () => {
@@ -431,7 +575,7 @@ test("M5 Round 1 reproduction: stale poll responses cannot regress newer UI stat
     oldResponse.resolve(pending);
     await oldPoll;
     assert.equal(harness.text("outcome"), "Verified success");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -519,7 +663,7 @@ test("M5 Round 1: mutation and reset generations discard older responses", async
     stalePoll.resolve(nextApproval);
     await pollBeforeReset;
     assert.equal(harness.text("outcome"), "Waiting");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -544,7 +688,7 @@ test("M5 Round 1: reconnect generation invalidates responses issued before disco
     stale.resolve(uiProjection(idle, 2, "awaiting_approval"));
     await oldPoll;
     assert.equal(harness.text("outcome"), "Verified success");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -572,7 +716,7 @@ test("M5 Round 2 reproduction: an authoritative failed mission retry becomes act
       'mutate("/api/mission", {operation: "start", requestId: "judge-recover-0001"})',
     );
     assert.equal(harness.text("outcome"), "Owner decision");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), false);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), false);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -660,7 +804,7 @@ test("M5 Round 2: stale failures and fake recovery evidence cannot replace resum
     harness.enqueue(Promise.resolve({ ...resumed, revision: 7, run: { ...resumed.run, generation: 3 } }));
     await harness.evaluate<Promise<void>>("refresh()");
     assert.equal(harness.text("outcome"), "Verified success");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -1047,6 +1191,7 @@ function uiProjection(base: M5JudgeState, revision: number, status: "awaiting_ap
       expectedEffect: "Reserve the primary interval",
       recommendedDecision: "deny",
       ownerSourceIdentity: "owner/judge-ui",
+      technicalSubject: null,
     },
     execution: status === "verified"
       ? { ...base.execution, terminalStatus: "terminal_verified", mutationCount: 1, receiptCount: 1, attemptCount: 1, acceptanceCount: 1, actualFactCount: 2 }
