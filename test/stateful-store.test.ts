@@ -654,237 +654,465 @@ const INITIALIZER_PROCESS_SOURCE = String.raw`
   });
 `;
 
-function spawnInitializerProcess(
-  configuration: InitializerProcessConfiguration,
-): ChildProcess {
-  return spawn(
-    process.execPath,
-    [
-      "--input-type=module",
-      "--eval",
-      INITIALIZER_PROCESS_SOURCE,
-      JSON.stringify(configuration),
-    ],
-    {
-      env: { NODE_NO_WARNINGS: "1" },
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-    },
-  );
+const CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS = 5_000;
+
+type ChildProtocolRecord = Readonly<Record<string, unknown>>;
+type ChildLifecycleKind = "disconnect" | "error" | "exit";
+
+interface ChildExitState {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
 }
 
-const CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS = 5_000;
+interface ChildLifecycleSnapshot extends ChildExitState {
+  readonly disconnected: boolean;
+  readonly errorCode: string | undefined;
+  readonly syscall: string | undefined;
+  readonly workerIdentity: string;
+}
 
 interface InitializerProcessCohortMember {
   readonly child: ChildProcess;
   readonly identity: string;
+  readonly protocol: ChildProtocolObserver;
 }
 
-function spawnChildProtocolFixture(source: string): ChildProcess {
-  return spawn(
-    process.execPath,
-    ["--input-type=module", "--eval", source],
-    { stdio: ["ignore", "ignore", "ignore", "ipc"] },
+interface ChildMessageWaiter {
+  readonly expectedKind: string;
+  readonly first: boolean;
+  readonly reject: (error: Error) => void;
+  readonly resolve: (message: ChildProtocolRecord) => void;
+  settled: boolean;
+  timer?: NodeJS.Timeout;
+}
+
+interface ChildLifecycleWaiter {
+  readonly kind: ChildLifecycleKind;
+  readonly reject: (error: Error) => void;
+  readonly resolve: () => void;
+  settled: boolean;
+  timer?: NodeJS.Timeout;
+}
+
+class InitializerWorkerProtocolError extends Error {
+  readonly errorCode: string | undefined;
+  readonly exitCode: number | null;
+  readonly lifecycle: ChildLifecycleKind | "protocol" | "timeout";
+  readonly signal: NodeJS.Signals | null;
+  readonly syscall: string | undefined;
+  readonly workerIdentity: string;
+
+  constructor(options: {
+    readonly cause?: Error;
+    readonly errorCode?: string;
+    readonly exitCode: number | null;
+    readonly lifecycle: ChildLifecycleKind | "protocol" | "timeout";
+    readonly message: string;
+    readonly signal: NodeJS.Signals | null;
+    readonly syscall?: string;
+    readonly workerIdentity: string;
+  }) {
+    super(options.message, { cause: options.cause });
+    this.name = "InitializerWorkerProtocolError";
+    this.errorCode = options.errorCode;
+    this.exitCode = options.exitCode;
+    this.lifecycle = options.lifecycle;
+    this.signal = options.signal;
+    this.syscall = options.syscall;
+    this.workerIdentity = options.workerIdentity;
+  }
+}
+
+function childExitDescription(exit: ChildExitState | undefined): string {
+  return `exitCode=${String(exit?.code ?? null)} signal=${String(exit?.signal ?? null)}`;
+}
+
+function isSemanticSpawnError(
+  error: unknown,
+  workerIdentity: string,
+  expectedCode: string,
+): boolean {
+  return (
+    error instanceof InitializerWorkerProtocolError &&
+    error.lifecycle === "error" &&
+    error.workerIdentity === workerIdentity &&
+    error.errorCode === expectedCode &&
+    typeof error.syscall === "string" &&
+    /^spawn(?:\s|$)/u.test(error.syscall)
   );
 }
 
-function childExitDescription(
-  code: number | null,
-  signal: NodeJS.Signals | null,
-): string {
-  return `code=${String(code)} signal=${String(signal)}`;
-}
+class ChildProtocolObserver {
+  private disconnected = false;
+  private disposed = false;
+  private exit: ChildExitState | undefined;
+  private firstMessageConsumed = false;
+  private readonly lifecycleWaiters = new Set<ChildLifecycleWaiter>();
+  private readonly messageWaiters = new Set<ChildMessageWaiter>();
+  private readonly messages: ChildProtocolRecord[] = [];
+  private processError: NodeJS.ErrnoException | undefined;
 
-function waitForFirstChildMessage(
-  child: ChildProcess,
-  expectedKind: string,
-  workerIdentity: string,
-): Promise<Readonly<Record<string, unknown>>> {
-  return new Promise((resolve, reject) => {
-    let defensiveTimer: NodeJS.Timeout | undefined;
-    let settled = false;
-    const cleanup = (): void => {
-      if (defensiveTimer !== undefined) clearTimeout(defensiveTimer);
-      child.off("disconnect", onDisconnect);
-      child.off("error", onError);
-      child.off("exit", onExit);
-      child.off("message", onMessage);
-    };
-    const settle = (action: () => void): void => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      action();
-    };
-    const onDisconnect = (): void => {
-      settle(() => {
-        reject(
-          new Error(
-            `initializer worker=${workerIdentity} disconnected before ${expectedKind}: ${childExitDescription(child.exitCode, child.signalCode)}`,
-          ),
-        );
-      });
-    };
-    const onError = (error: Error): void => {
-      settle(() => {
-        reject(
-          new Error(
-            `initializer worker=${workerIdentity} errored before ${expectedKind}: ${childExitDescription(child.exitCode, child.signalCode)}: ${error.message}`,
-            { cause: error },
-          ),
-        );
-      });
-    };
-    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-      settle(() => {
-        reject(
-          new Error(
-            `initializer worker=${workerIdentity} exited before ${expectedKind}: ${childExitDescription(code, signal)}`,
-          ),
-        );
-      });
-    };
-    const onMessage = (message: unknown): void => {
-      settle(() => {
-        if (typeof message !== "object" || message === null) {
-          reject(
-            new Error(
-              `initializer worker=${workerIdentity} sent a malformed first message`,
-            ),
-          );
-          return;
-        }
-        const record = message as Readonly<Record<string, unknown>>;
-        if (record["kind"] === "error") {
-          reject(
-            new Error(
-              `initializer worker=${workerIdentity} failed before ${expectedKind}: ${String(record["message"] ?? "initializer failed")}`,
-            ),
-          );
-          return;
-        }
-        if (record["kind"] !== expectedKind) {
-          reject(
-            new Error(
-              `initializer worker=${workerIdentity} expected first message ${expectedKind} but received ${String(record["kind"])}`,
-            ),
-          );
-          return;
-        }
-        resolve(record);
-      });
-    };
+  private readonly onDisconnect = (): void => {
+    this.disconnected = true;
+    this.flushLifecycleWaiters("disconnect");
+    this.flushMessageWaiters();
+  };
 
-    child.on("disconnect", onDisconnect);
-    child.on("error", onError);
-    child.on("exit", onExit);
-    child.on("message", onMessage);
-    if (child.exitCode !== null || child.signalCode !== null) {
-      onExit(child.exitCode, child.signalCode);
-    } else if (!child.connected) {
-      onDisconnect();
+  private readonly onError = (error: Error): void => {
+    if (this.processError !== undefined || this.exit !== undefined) return;
+    this.processError = error as NodeJS.ErrnoException;
+    this.flushLifecycleWaiters("error");
+    this.flushMessageWaiters();
+  };
+
+  private readonly onExit = (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void => {
+    this.exit = { code, signal };
+    this.flushLifecycleWaiters("exit");
+    this.flushMessageWaiters();
+  };
+
+  private readonly onMessage = (message: unknown): void => {
+    if (
+      this.processError !== undefined ||
+      this.exit !== undefined ||
+      this.disconnected
+    ) {
+      return;
     }
-    if (!settled) {
-      defensiveTimer = setTimeout(() => {
-        settle(() => {
-          reject(
-            new Error(
-              `initializer worker=${workerIdentity} timed out before ${expectedKind}`,
-            ),
-          );
-        });
-      }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
-    }
-  });
-}
-
-function waitForChildMessage(
-  child: ChildProcess,
-  expectedKind: string,
-): Promise<Readonly<Record<string, unknown>>> {
-  return new Promise((resolve, reject) => {
-    let defensiveTimer: NodeJS.Timeout | undefined;
-    let settled = false;
-    const cleanup = (): void => {
-      if (defensiveTimer !== undefined) clearTimeout(defensiveTimer);
-      child.off("disconnect", onDisconnect);
-      child.off("error", onError);
-      child.off("exit", onExit);
-      child.off("message", onMessage);
-    };
-    const settle = (action: () => void): void => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      action();
-    };
-    const onDisconnect = (): void => {
-      settle(() => {
-        reject(
-          new Error(`initializer process disconnected before ${expectedKind}`),
-        );
-      });
-    };
-    const onError = (error: Error): void => {
-      settle(() => reject(error));
-    };
-    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-      settle(() => {
-        reject(
-          new Error(
-            `initializer process exited before ${expectedKind}: ${childExitDescription(code, signal)}`,
-          ),
-        );
-      });
-    };
-    const onMessage = (message: unknown): void => {
-      if (typeof message !== "object" || message === null) return;
-      const record = message as Readonly<Record<string, unknown>>;
+    if (typeof message !== "object" || message === null) {
+      this.processError = new Error(
+        "initializer process sent a malformed protocol message",
+      );
+    } else {
+      const record = message as ChildProtocolRecord;
       if (record["kind"] === "error") {
-        settle(() => {
-          reject(new Error(String(record["message"] ?? "initializer failed")));
-        });
+        this.processError = new Error(
+          String(record["message"] ?? "initializer failed"),
+        );
+      } else {
+        this.messages.push(record);
       }
-      if (record["kind"] === expectedKind) {
-        settle(() => resolve(record));
-      }
-    };
-    child.on("disconnect", onDisconnect);
-    child.on("error", onError);
-    child.on("exit", onExit);
-    child.on("message", onMessage);
-    if (!settled) {
-      defensiveTimer = setTimeout(() => {
-        settle(() => {
+    }
+    this.flushMessageWaiters();
+  };
+
+  constructor(
+    readonly child: ChildProcess,
+    readonly workerIdentity: string,
+  ) {
+    child.on("disconnect", this.onDisconnect);
+    child.on("error", this.onError);
+    child.on("exit", this.onExit);
+    child.on("message", this.onMessage);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.child.off("disconnect", this.onDisconnect);
+    this.child.off("error", this.onError);
+    this.child.off("exit", this.onExit);
+    this.child.off("message", this.onMessage);
+    const error = this.protocolError(
+      "protocol",
+      "observer disposal",
+      "initializer protocol observer was disposed",
+    );
+    for (const waiter of [...this.messageWaiters]) {
+      this.settleMessageWaiter(waiter, () => waiter.reject(error));
+    }
+    for (const waiter of [...this.lifecycleWaiters]) {
+      this.settleLifecycleWaiter(waiter, () => waiter.reject(error));
+    }
+  }
+
+  waitForFirstMessage(expectedKind: string): Promise<ChildProtocolRecord> {
+    if (this.firstMessageConsumed) {
+      return Promise.reject(
+        this.protocolError(
+          "protocol",
+          expectedKind,
+          "initializer first protocol message was already consumed",
+        ),
+      );
+    }
+    return this.waitForMessageInternal(expectedKind, true);
+  }
+
+  waitForMessage(expectedKind: string): Promise<ChildProtocolRecord> {
+    return this.waitForMessageInternal(expectedKind, false);
+  }
+
+  waitForLifecycle(kind: ChildLifecycleKind): Promise<void> {
+    if (this.lifecycleOccurred(kind)) return Promise.resolve();
+    if (this.disposed) {
+      return Promise.reject(
+        this.protocolError(
+          "protocol",
+          kind,
+          "initializer protocol observer was disposed",
+        ),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const waiter: ChildLifecycleWaiter = {
+        kind,
+        reject,
+        resolve,
+        settled: false,
+      };
+      this.lifecycleWaiters.add(waiter);
+      waiter.timer = setTimeout(() => {
+        this.settleLifecycleWaiter(waiter, () => {
           reject(
-            new Error(`initializer process timed out before ${expectedKind}`),
+            this.protocolError(
+              "timeout",
+              kind,
+              `initializer timed out waiting for lifecycle event ${kind}`,
+            ),
           );
         });
       }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
-    }
-  });
-}
-
-function waitForChildExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) {
-    return child.exitCode === 0
-      ? Promise.resolve()
-      : Promise.reject(
-          new Error(`initializer process exited with code ${child.exitCode}`),
-        );
+    });
   }
-  return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      if (code === 0) resolve();
-      else {
-        reject(
-          new Error(
-            `initializer process exited unexpectedly: ${String(code ?? signal)}`,
-          ),
-        );
+
+  lifecycleSnapshot(): ChildLifecycleSnapshot {
+    return {
+      code: this.exit?.code ?? this.child.exitCode,
+      disconnected: this.disconnected,
+      errorCode: this.processError?.code,
+      signal: this.exit?.signal ?? this.child.signalCode,
+      syscall: this.processError?.syscall,
+      workerIdentity: this.workerIdentity,
+    };
+  }
+
+  async waitForSuccessfulExit(): Promise<void> {
+    await this.waitForLifecycle("exit");
+    if (this.exit?.code !== 0) {
+      throw this.protocolError(
+        "exit",
+        "successful exit",
+        `initializer exited unexpectedly: ${childExitDescription(this.exit)}`,
+      );
+    }
+  }
+
+  private waitForMessageInternal(
+    expectedKind: string,
+    first: boolean,
+  ): Promise<ChildProtocolRecord> {
+    if (this.disposed) {
+      return Promise.reject(
+        this.protocolError(
+          "protocol",
+          expectedKind,
+          "initializer protocol observer was disposed",
+        ),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const waiter: ChildMessageWaiter = {
+        expectedKind,
+        first,
+        reject,
+        resolve,
+        settled: false,
+      };
+      this.messageWaiters.add(waiter);
+      this.flushMessageWaiters();
+      if (!waiter.settled) {
+        waiter.timer = setTimeout(() => {
+          this.settleMessageWaiter(waiter, () => {
+            reject(
+              this.protocolError(
+                "timeout",
+                expectedKind,
+                `initializer timed out before ${expectedKind}`,
+              ),
+            );
+          });
+        }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
       }
     });
-  });
+  }
+
+  private flushMessageWaiters(): void {
+    for (const waiter of [...this.messageWaiters]) {
+      const messageIndex = waiter.first
+        ? this.firstMessageConsumed || this.messages.length === 0
+          ? -1
+          : 0
+        : this.messages.findIndex(
+            (message) => message["kind"] === waiter.expectedKind,
+          );
+      if (messageIndex >= 0) {
+        const message = this.messages.splice(messageIndex, 1)[0];
+        if (message === undefined) continue;
+        if (waiter.first) this.firstMessageConsumed = true;
+        this.settleMessageWaiter(waiter, () => {
+          if (message["kind"] !== waiter.expectedKind) {
+            waiter.reject(
+              this.protocolError(
+                "protocol",
+                waiter.expectedKind,
+                `initializer expected ${waiter.first ? "first " : ""}message ${waiter.expectedKind} but received ${String(message["kind"])}`,
+              ),
+            );
+          } else {
+            waiter.resolve(message);
+          }
+        });
+        continue;
+      }
+      const terminal = this.currentTerminalError(waiter.expectedKind);
+      if (terminal !== undefined) {
+        this.settleMessageWaiter(waiter, () => waiter.reject(terminal));
+      }
+    }
+  }
+
+  private currentTerminalError(expectedKind: string): Error | undefined {
+    if (this.processError !== undefined) {
+      const code = this.processError.code;
+      const syscall = this.processError.syscall;
+      return this.protocolError(
+        "error",
+        expectedKind,
+        `initializer errored before ${expectedKind}: errorCode=${String(code ?? null)} syscall=${String(syscall ?? null)} ${childExitDescription(this.exit)}`,
+        this.processError,
+      );
+    }
+    if (this.exit !== undefined) {
+      return this.protocolError(
+        "exit",
+        expectedKind,
+        `initializer exited before ${expectedKind}: ${childExitDescription(this.exit)}`,
+      );
+    }
+    if (this.disconnected) {
+      return this.protocolError(
+        "disconnect",
+        expectedKind,
+        `initializer disconnected before ${expectedKind}: ${childExitDescription(this.exit)}`,
+      );
+    }
+    return undefined;
+  }
+
+  private protocolError(
+    lifecycle: ChildLifecycleKind | "protocol" | "timeout",
+    expectedKind: string,
+    detail: string,
+    cause?: NodeJS.ErrnoException,
+  ): InitializerWorkerProtocolError {
+    return new InitializerWorkerProtocolError({
+      ...(cause === undefined ? {} : { cause }),
+      ...(cause?.code === undefined ? {} : { errorCode: cause.code }),
+      exitCode: this.exit?.code ?? this.child.exitCode,
+      lifecycle,
+      message: `initializer worker=${this.workerIdentity} ${detail} awaiting=${expectedKind}`,
+      signal: this.exit?.signal ?? this.child.signalCode,
+      ...(cause?.syscall === undefined ? {} : { syscall: cause.syscall }),
+      workerIdentity: this.workerIdentity,
+    });
+  }
+
+  private lifecycleOccurred(kind: ChildLifecycleKind): boolean {
+    if (kind === "disconnect") return this.disconnected;
+    if (kind === "error") return this.processError !== undefined;
+    return this.exit !== undefined;
+  }
+
+  private flushLifecycleWaiters(kind: ChildLifecycleKind): void {
+    for (const waiter of [...this.lifecycleWaiters]) {
+      if (waiter.kind === kind) {
+        this.settleLifecycleWaiter(waiter, waiter.resolve);
+      }
+    }
+  }
+
+  private settleMessageWaiter(
+    waiter: ChildMessageWaiter,
+    action: () => void,
+  ): void {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+    this.messageWaiters.delete(waiter);
+    action();
+  }
+
+  private settleLifecycleWaiter(
+    waiter: ChildLifecycleWaiter,
+    action: () => void,
+  ): void {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+    this.lifecycleWaiters.delete(waiter);
+    action();
+  }
+}
+
+function observeChildProcess(
+  child: ChildProcess,
+  identity: string,
+): InitializerProcessCohortMember {
+  return {
+    child,
+    identity,
+    protocol: new ChildProtocolObserver(child, identity),
+  };
+}
+
+function spawnInitializerProcess(
+  configuration: InitializerProcessConfiguration,
+  identity: string,
+): InitializerProcessCohortMember {
+  return observeChildProcess(
+    spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        INITIALIZER_PROCESS_SOURCE,
+        JSON.stringify(configuration),
+      ],
+      {
+        env: { NODE_NO_WARNINGS: "1" },
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+      },
+    ),
+    identity,
+  );
+}
+
+function spawnChildProtocolFixture(
+  source: string,
+  identity: string,
+): InitializerProcessCohortMember {
+  return observeChildProcess(
+    spawn(process.execPath, ["--input-type=module", "--eval", source], {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    }),
+    identity,
+  );
+}
+
+function spawnMissingInitializerProcess(
+  executable: string,
+  identity: string,
+): InitializerProcessCohortMember {
+  return observeChildProcess(
+    spawn(executable, [], {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    }),
+    identity,
+  );
 }
 
 function sendChildMessage(
@@ -903,13 +1131,18 @@ function sendChildMessage(
   });
 }
 
-async function stopInitializerProcess(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
-  });
-  child.kill();
-  await exited;
+async function stopInitializerProcess(
+  member: InitializerProcessCohortMember,
+): Promise<void> {
+  try {
+    if (member.child.pid === undefined) return;
+    if (member.child.exitCode === null && member.child.signalCode === null) {
+      member.child.kill();
+    }
+    await member.protocol.waitForLifecycle("exit");
+  } finally {
+    member.protocol.dispose();
+  }
 }
 
 async function waitForInitializerCohortReadiness(
@@ -918,8 +1151,8 @@ async function waitForInitializerCohortReadiness(
 ): Promise<readonly Readonly<Record<string, unknown>>[]> {
   try {
     return await Promise.all(
-      members.map(({ child, identity }) =>
-        waitForFirstChildMessage(child, "modules_loaded", identity),
+      members.map(({ protocol }) =>
+        protocol.waitForFirstMessage("modules_loaded"),
       ),
     );
   } catch (error) {
@@ -930,7 +1163,7 @@ async function waitForInitializerCohortReadiness(
       cleanupErrors.push(cleanupError);
     }
     const stopped = await Promise.allSettled(
-      members.map(({ child }) => stopInitializerProcess(child)),
+      members.map(stopInitializerProcess),
     );
     for (const result of stopped) {
       if (result.status === "rejected") cleanupErrors.push(result.reason);
@@ -3795,110 +4028,235 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
 
 describe("R7.8 SQLite worker lock lifecycle", () => {
   test("readiness rejects when initializer exits before its first message", async () => {
-    const child = spawnChildProtocolFixture("process.exit(23)");
-    const exited = new Promise<{
-      readonly code: number | null;
-      readonly signal: NodeJS.Signals | null;
-    }>((resolve) => {
-      child.once("exit", (code, signal) => resolve({ code, signal }));
-    });
+    const member = spawnChildProtocolFixture(
+      "process.exit(23)",
+      "exit-before-ready",
+    );
     try {
+      await member.protocol.waitForLifecycle("exit");
       await assert.rejects(
-        waitForFirstChildMessage(child, "modules_loaded", "exit-before-ready"),
-        /worker=exit-before-ready (?:disconnected|exited) before modules_loaded: code=(?:23|null) signal=null/iu,
+        member.protocol.waitForFirstMessage("modules_loaded"),
+        (error: unknown) => {
+          assert.equal(error instanceof InitializerWorkerProtocolError, true);
+          const protocolError = error as InitializerWorkerProtocolError;
+          assert.equal(protocolError.lifecycle, "exit");
+          assert.equal(protocolError.exitCode, 23);
+          assert.equal(protocolError.signal, null);
+          assert.equal(protocolError.workerIdentity, "exit-before-ready");
+          return true;
+        },
       );
-      assert.deepEqual(await exited, { code: 23, signal: null });
-      for (const event of ["disconnect", "error", "exit", "message"]) {
-        assert.equal(child.listenerCount(event), 0, event);
-      }
     } finally {
-      await stopInitializerProcess(child);
+      await stopInitializerProcess(member);
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
     }
   });
 
-  test("readiness rejects when initializer errors before its first message", async () => {
+  test("spawn readiness validates semantic ENOENT without native errno", async () => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-spawn-error-"));
-    const child = spawn(join(directory, "missing-initializer"), [], {
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-    });
+    const member = spawnMissingInitializerProcess(
+      join(directory, "missing-initializer"),
+      "spawn-error",
+    );
     try {
       await assert.rejects(
-        waitForFirstChildMessage(child, "modules_loaded", "spawn-error"),
-        /worker=spawn-error errored before modules_loaded: code=-2 signal=null/iu,
+        member.protocol.waitForFirstMessage("modules_loaded"),
+        (error: unknown) => isSemanticSpawnError(error, "spawn-error", "ENOENT"),
       );
-      for (const event of ["disconnect", "error", "exit", "message"]) {
-        assert.equal(child.listenerCount(event), 0, event);
+      const snapshot = member.protocol.lifecycleSnapshot();
+      assert.equal(snapshot.errorCode, "ENOENT");
+      assert.match(snapshot.syscall ?? "", /^spawn(?:\s|$)/u);
+      assert.equal(snapshot.workerIdentity, "spawn-error");
+
+      for (const errno of [-2, -4058]) {
+        const source = Object.assign(new Error("missing executable"), {
+          code: "ENOENT",
+          errno,
+          syscall: "spawn missing-initializer",
+        });
+        const semantic = new InitializerWorkerProtocolError({
+          cause: source,
+          errorCode: source.code,
+          exitCode: null,
+          lifecycle: "error",
+          message: "semantic spawn fixture",
+          signal: null,
+          syscall: source.syscall,
+          workerIdentity: "spawn-shape",
+        });
+        assert.equal(
+          isSemanticSpawnError(semantic, "spawn-shape", "ENOENT"),
+          true,
+        );
       }
+
+      const unrelated = new InitializerWorkerProtocolError({
+        errorCode: "EACCES",
+        exitCode: null,
+        lifecycle: "error",
+        message: "unrelated spawn fixture",
+        signal: null,
+        syscall: "spawn missing-initializer",
+        workerIdentity: "spawn-shape",
+      });
+      assert.equal(
+        isSemanticSpawnError(unrelated, "spawn-shape", "ENOENT"),
+        false,
+      );
     } finally {
-      await stopInitializerProcess(child);
+      await stopInitializerProcess(member);
       rmSync(directory, { recursive: true, force: true });
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
     }
   });
 
   test("readiness rejects when initializer disconnects before its first message", async () => {
-    const child = spawnChildProtocolFixture(String.raw`
-      process.disconnect();
-      setImmediate(() => {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
-      });
-    `);
+    const member = spawnChildProtocolFixture(
+      String.raw`
+        process.disconnect();
+        setImmediate(() => {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        });
+      `,
+      "disconnect-before-ready",
+    );
     try {
+      await member.protocol.waitForLifecycle("disconnect");
       await assert.rejects(
-        waitForFirstChildMessage(
-          child,
-          "modules_loaded",
-          "disconnect-before-ready",
-        ),
-        /worker=disconnect-before-ready disconnected before modules_loaded: code=null signal=null/iu,
+        member.protocol.waitForFirstMessage("modules_loaded"),
+        /worker=disconnect-before-ready initializer disconnected before modules_loaded/iu,
       );
-      for (const event of ["disconnect", "error", "exit", "message"]) {
-        assert.equal(child.listenerCount(event), 0, event);
-      }
     } finally {
-      await stopInitializerProcess(child);
+      await stopInitializerProcess(member);
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
     }
   });
 
-  test("readiness settles once and removes listeners before later exit", async () => {
-    const child = spawnChildProtocolFixture(String.raw`
-      process.on("message", (message) => {
-        if (message?.kind === "start") {
-          process.send({ kind: "modules_loaded", storeKind: "m2" });
-        } else if (message?.kind === "exit") {
-          process.exit(0);
-        }
-      });
-    `);
-    const listenerEvents = ["disconnect", "error", "exit", "message"] as const;
-    let settlementCount = 0;
-    try {
-      const readiness = waitForFirstChildMessage(
-        child,
-        "modules_loaded",
-        "ready-then-exit",
+  for (const lifecycle of ["exit", "disconnect", "error"] as const) {
+    test(`${lifecycle} between phases rejects immediately from buffered lifecycle state`, async () => {
+      const member = spawnChildProtocolFixture(
+        String.raw`
+          process.on("message", (message) => {
+            if (message?.kind === "start") {
+              process.send({ kind: "modules_loaded", storeKind: "m2" });
+            } else if (message?.kind === "exit") {
+              process.exit(31);
+            } else if (message?.kind === "disconnect") {
+              process.disconnect();
+              setImmediate(() => {
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+              });
+            }
+          });
+        `,
+        `${lifecycle}-between-phases`,
       );
+      try {
+        const readiness = member.protocol.waitForFirstMessage("modules_loaded");
+        await sendChildMessage(member.child, { kind: "start" });
+        await readiness;
+        if (lifecycle === "error") {
+          member.child.emit(
+            "error",
+            Object.assign(new Error("planned inter-phase error"), {
+              code: "EIO",
+              syscall: "planned-worker-operation",
+            }),
+          );
+        } else {
+          await sendChildMessage(member.child, { kind: lifecycle });
+        }
+        await member.protocol.waitForLifecycle(lifecycle);
+
+        let rejected = false;
+        void member.protocol.waitForMessage("operation_committed").catch(() => {
+          rejected = true;
+        });
+        await Promise.resolve();
+        assert.equal(rejected, true);
+        await assert.rejects(
+          member.protocol.waitForMessage("operation_committed"),
+          (error: unknown) => {
+            assert.equal(error instanceof InitializerWorkerProtocolError, true);
+            const protocolError = error as InitializerWorkerProtocolError;
+            assert.equal(protocolError.lifecycle, lifecycle);
+            assert.equal(
+              protocolError.workerIdentity,
+              `${lifecycle}-between-phases`,
+            );
+            if (lifecycle === "exit") assert.equal(protocolError.exitCode, 31);
+            if (lifecycle === "error") assert.equal(protocolError.errorCode, "EIO");
+            return true;
+          },
+        );
+      } finally {
+        await stopInitializerProcess(member);
+      }
+      for (const event of ["disconnect", "error", "exit", "message"]) {
+        assert.equal(member.child.listenerCount(event), 0, event);
+      }
+    });
+  }
+
+  test("later-phase messages are buffered and delivered exactly once", async () => {
+    const member = spawnChildProtocolFixture(
+      String.raw`
+        process.on("message", (message) => {
+          if (message?.kind === "start") {
+            process.send({ kind: "modules_loaded", storeKind: "m2" });
+            process.send({ kind: "operation_committed", sequence: 1 });
+          } else if (message?.kind === "exit") {
+            process.exit(0);
+          }
+        });
+      `,
+      "buffered-message",
+    );
+    let readinessSettlements = 0;
+    try {
+      const readiness = member.protocol.waitForFirstMessage("modules_loaded");
       void readiness.then(
         () => {
-          settlementCount += 1;
+          readinessSettlements += 1;
         },
         () => {
-          settlementCount += 1;
+          readinessSettlements += 1;
         },
       );
-      await sendChildMessage(child, { kind: "start" });
-      const ready = await readiness;
-      assert.equal(ready["storeKind"], "m2");
-      assert.equal(settlementCount, 1);
-      for (const event of listenerEvents) {
-        assert.equal(child.listenerCount(event), 0, event);
-      }
+      await sendChildMessage(member.child, { kind: "start" });
+      assert.equal((await readiness)["storeKind"], "m2");
+      assert.equal(readinessSettlements, 1);
+      assert.equal(
+        (await member.protocol.waitForMessage("operation_committed"))["sequence"],
+        1,
+      );
 
-      const exited = waitForChildExit(child);
-      await sendChildMessage(child, { kind: "exit" });
-      await exited;
-      assert.equal(settlementCount, 1);
+      const duplicate = member.protocol.waitForMessage("operation_committed");
+      await sendChildMessage(member.child, { kind: "exit" });
+      await assert.rejects(duplicate, (error: unknown) => {
+        assert.equal(error instanceof InitializerWorkerProtocolError, true);
+        const protocolError = error as InitializerWorkerProtocolError;
+        assert.equal(
+          protocolError.lifecycle === "disconnect" ||
+            protocolError.lifecycle === "exit",
+          true,
+        );
+        assert.equal(protocolError.workerIdentity, "buffered-message");
+        return true;
+      });
+      await member.protocol.waitForSuccessfulExit();
+      assert.equal(readinessSettlements, 1);
     } finally {
-      await stopInitializerProcess(child);
+      await stopInitializerProcess(member);
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
     }
   });
 
@@ -3910,28 +4268,31 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
     const blocker = new DatabaseSync(path);
     blocker.exec("BEGIN IMMEDIATE");
     const children = [
-      spawnChildProtocolFixture("process.exit(41)"),
-      spawnChildProtocolFixture('process.on("message", () => {})'),
-      spawnChildProtocolFixture('process.on("message", () => {})'),
+      spawnChildProtocolFixture("process.exit(41)", "cohort-0"),
+      spawnChildProtocolFixture(
+        'process.on("message", () => {})',
+        "cohort-1",
+      ),
+      spawnChildProtocolFixture(
+        'process.on("message", () => {})',
+        "cohort-2",
+      ),
     ];
     let ownershipReleaseCount = 0;
     try {
       await assert.rejects(
         waitForInitializerCohortReadiness(
-          children.map((child, index) => ({
-            child,
-            identity: `cohort-${String(index)}`,
-          })),
+          children,
           () => {
             ownershipReleaseCount += 1;
             if (blocker.isTransaction) blocker.exec("ROLLBACK");
             if (blocker.isOpen) blocker.close();
           },
         ),
-        /worker=cohort-0 (?:disconnected|exited) before modules_loaded: code=(?:41|null) signal=null/iu,
+        /worker=cohort-0 initializer (?:disconnected|exited) before modules_loaded/iu,
       );
       assert.equal(ownershipReleaseCount, 1);
-      for (const child of children) {
+      for (const { child } of children) {
         assert.equal(
           child.exitCode !== null || child.signalCode !== null,
           true,
@@ -3966,25 +4327,25 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
 
   test("initializer readiness follows module loading", async () => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-modules-"));
-    const child = spawnInitializerProcess({
-      factoryModuleUrl: new URL(
-        "../src/factory-environment.js",
-        import.meta.url,
-      ).href,
-      path: join(directory, "m2.sqlite"),
-      sqliteModuleUrl: new URL("../src/sqlite.js", import.meta.url).href,
-      storeKind: "m2",
-    });
+    const member = spawnInitializerProcess(
+      {
+        factoryModuleUrl: new URL(
+          "../src/factory-environment.js",
+          import.meta.url,
+        ).href,
+        path: join(directory, "m2.sqlite"),
+        sqliteModuleUrl: new URL("../src/sqlite.js", import.meta.url).href,
+        storeKind: "m2",
+      },
+      "module-readiness",
+    );
     try {
-      const firstMessage = await waitForFirstChildMessage(
-        child,
-        "modules_loaded",
-        "module-readiness",
-      );
+      const firstMessage =
+        await member.protocol.waitForFirstMessage("modules_loaded");
       assert.equal(firstMessage["kind"], "modules_loaded");
       assert.equal(firstMessage["storeKind"], "m2");
     } finally {
-      await stopInitializerProcess(child);
+      await stopInitializerProcess(member);
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -4247,20 +4608,20 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
           blocker.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
           const children = Array.from(
             { length: processCount },
-            () =>
-              spawnInitializerProcess({
-                factoryModuleUrl,
-                path,
-                sqliteModuleUrl,
-                storeKind: fixture.storeKind,
-              }),
+            (_, index) =>
+              spawnInitializerProcess(
+                {
+                  factoryModuleUrl,
+                  path,
+                  sqliteModuleUrl,
+                  storeKind: fixture.storeKind,
+                },
+                `${fixture.storeKind}-round-${String(round)}-worker-${String(index)}`,
+              ),
           );
           try {
             const modulesLoaded = await waitForInitializerCohortReadiness(
-              children.map((child, index) => ({
-                child,
-                identity: `${fixture.storeKind}-round-${String(round)}-worker-${String(index)}`,
-              })),
+              children,
               () => {
                 if (blocker.isTransaction) blocker.exec("ROLLBACK");
                 if (blocker.isOpen) blocker.close();
@@ -4271,11 +4632,11 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
               Array.from({ length: processCount }, () => fixture.storeKind),
             );
 
-            const contentionObserved = children.map((child) =>
-              waitForChildMessage(child, "sqlite_contention_observed"),
+            const contentionObserved = children.map(({ protocol }) =>
+              protocol.waitForMessage("sqlite_contention_observed"),
             );
             await Promise.all(
-              children.map((child) =>
+              children.map(({ child }) =>
                 sendChildMessage(child, {
                   kind: "probe_sqlite_contention",
                 }),
@@ -4294,15 +4655,17 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
             blocker.exec("COMMIT");
             blocker.close();
 
-            const committed = children.map((child) =>
-              waitForChildMessage(child, "operation_committed"),
+            const committed = children.map(({ protocol }) =>
+              protocol.waitForMessage("operation_committed"),
             );
-            const closed = children.map((child) =>
-              waitForChildMessage(child, "handle_closed"),
+            const closed = children.map(({ protocol }) =>
+              protocol.waitForMessage("handle_closed"),
             );
-            const exited = children.map(waitForChildExit);
+            const exited = children.map(({ protocol }) =>
+              protocol.waitForSuccessfulExit(),
+            );
             await Promise.all(
-              children.map((child) =>
+              children.map(({ child }) =>
                 sendChildMessage(child, { kind: "initialize" }),
               ),
             );
