@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>FlakeBrake · Promise control room</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to mission controls</a>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="FlakeBrake judge UI home">
+        <span class="brand-mark" aria-hidden="true">FB</span>
+        <span><strong>FlakeBrake</strong><small>Promise control room</small></span>
+      </a>
+      <div class="connection" role="status" aria-live="polite">
+        <span id="connection-dot" class="status-dot"></span>
+        <span id="connection-label">Connecting…</span>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div>
+          <p class="eyebrow">Deterministic TrueForge mission</p>
+          <h1 id="hero-title">A rush order. One safe promise.</h1>
+          <p class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
+        </div>
+        <div class="hero-actions">
+          <button id="start-button" class="button button-primary" type="button">Start hero mission</button>
+          <button id="reset-button" class="button button-quiet" type="button">Reset demo</button>
+        </div>
+      </section>
+
+      <section class="mission-strip" aria-label="Mission identity and status">
+        <div><span>Mission</span><strong id="mission-id">—</strong></div>
+        <div><span>Session</span><strong id="session-id">Not started</strong></div>
+        <div><span>Current turn</span><strong id="turn-id">—</strong></div>
+        <div><span>Outcome</span><strong id="outcome" class="tone-neutral">Waiting</strong></div>
+      </section>
+
+      <section id="approval-panel" class="approval-panel is-hidden" aria-labelledby="approval-title">
+        <div class="approval-heading">
+          <div>
+            <p class="eyebrow">External owner boundary</p>
+            <h2 id="approval-title">Your decision is required</h2>
+          </div>
+          <span id="approval-phase" class="pill pill-pending">Pending</span>
+        </div>
+        <p id="approval-tool" class="action-name"></p>
+        <p id="approval-effect" class="approval-effect"></p>
+        <details>
+          <summary>Durable action identity</summary>
+          <dl class="identity-grid">
+            <div><dt>Mission</dt><dd id="approval-mission"></dd></div>
+            <div><dt>Action digest</dt><dd id="approval-digest"></dd></div>
+            <div><dt>Owner source</dt><dd id="approval-source"></dd></div>
+          </dl>
+        </details>
+        <div class="approval-actions">
+          <button id="deny-button" class="button button-deny" type="button">Deny action</button>
+          <button id="allow-button" class="button button-approve" type="button">Approve action</button>
+        </div>
+        <p id="approval-guidance" class="guidance"></p>
+      </section>
+
+      <div class="dashboard">
+        <section class="card story-card" aria-labelledby="promise-title">
+          <div class="card-heading">
+            <div><p class="eyebrow">01 · Promise basis</p><h2 id="promise-title">Capacity before commitment</h2></div>
+            <span class="pill pill-denied">REPLAN</span>
+          </div>
+          <div id="capacity-grid" class="capacity-grid" aria-label="Capacity evaluation"></div>
+          <div class="split-list">
+            <div><h3>Protected obligations</h3><div id="obligations"></div></div>
+            <div><h3>Rush proposal</h3><div id="proposal"></div></div>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="candidates-title">
+          <div class="card-heading">
+            <div><p class="eyebrow">02 · Bounded replan</p><h2 id="candidates-title">Candidate comparison</h2></div>
+          </div>
+          <div id="winning-change" class="winning-change"></div>
+          <div id="candidate-list" class="candidate-list"></div>
+        </section>
+
+        <section class="card full-width" aria-labelledby="activity-title">
+          <div class="card-heading">
+            <div><p class="eyebrow">03 · Orchestration</p><h2 id="activity-title">TrueForge activity</h2></div>
+            <span id="model-requests" class="quiet-metric">0 model requests</span>
+          </div>
+          <div class="activity-layout">
+            <div id="agent-tree" class="agent-tree"></div>
+            <div><h3>Sandbox & MCP evidence</h3><div id="runtime-chips" class="chip-list"></div></div>
+          </div>
+        </section>
+
+        <section class="card timeline-card" aria-labelledby="timeline-title">
+          <div class="card-heading">
+            <div><p class="eyebrow">04 · Durable evidence</p><h2 id="timeline-title">Mission timeline</h2></div>
+          </div>
+          <ol id="timeline" class="timeline"></ol>
+        </section>
+
+        <section class="card result-card" aria-labelledby="result-title">
+          <div class="card-heading">
+            <div><p class="eyebrow">05 · Verified outcome</p><h2 id="result-title">Execution ledger</h2></div>
+            <span id="verification-pill" class="pill pill-neutral">Not executed</span>
+          </div>
+          <div id="result-metrics" class="result-metrics"></div>
+          <div id="actual-facts" class="actual-facts"></div>
+          <p id="readback-note" class="readback-note">Independent read-back has not yet occurred.</p>
+        </section>
+      </div>
+      <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
+    </main>
+    <footer>Local deterministic evidence · loopback only · no credentials required</footer>
+  </body>
+</html>
