@@ -672,43 +672,195 @@ function spawnInitializerProcess(
   );
 }
 
+const CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS = 5_000;
+
+interface InitializerProcessCohortMember {
+  readonly child: ChildProcess;
+  readonly identity: string;
+}
+
+function spawnChildProtocolFixture(source: string): ChildProcess {
+  return spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    { stdio: ["ignore", "ignore", "ignore", "ipc"] },
+  );
+}
+
+function childExitDescription(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): string {
+  return `code=${String(code)} signal=${String(signal)}`;
+}
+
+function waitForFirstChildMessage(
+  child: ChildProcess,
+  expectedKind: string,
+  workerIdentity: string,
+): Promise<Readonly<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    let defensiveTimer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const cleanup = (): void => {
+      if (defensiveTimer !== undefined) clearTimeout(defensiveTimer);
+      child.off("disconnect", onDisconnect);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      child.off("message", onMessage);
+    };
+    const settle = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+    };
+    const onDisconnect = (): void => {
+      settle(() => {
+        reject(
+          new Error(
+            `initializer worker=${workerIdentity} disconnected before ${expectedKind}: ${childExitDescription(child.exitCode, child.signalCode)}`,
+          ),
+        );
+      });
+    };
+    const onError = (error: Error): void => {
+      settle(() => {
+        reject(
+          new Error(
+            `initializer worker=${workerIdentity} errored before ${expectedKind}: ${childExitDescription(child.exitCode, child.signalCode)}: ${error.message}`,
+            { cause: error },
+          ),
+        );
+      });
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      settle(() => {
+        reject(
+          new Error(
+            `initializer worker=${workerIdentity} exited before ${expectedKind}: ${childExitDescription(code, signal)}`,
+          ),
+        );
+      });
+    };
+    const onMessage = (message: unknown): void => {
+      settle(() => {
+        if (typeof message !== "object" || message === null) {
+          reject(
+            new Error(
+              `initializer worker=${workerIdentity} sent a malformed first message`,
+            ),
+          );
+          return;
+        }
+        const record = message as Readonly<Record<string, unknown>>;
+        if (record["kind"] === "error") {
+          reject(
+            new Error(
+              `initializer worker=${workerIdentity} failed before ${expectedKind}: ${String(record["message"] ?? "initializer failed")}`,
+            ),
+          );
+          return;
+        }
+        if (record["kind"] !== expectedKind) {
+          reject(
+            new Error(
+              `initializer worker=${workerIdentity} expected first message ${expectedKind} but received ${String(record["kind"])}`,
+            ),
+          );
+          return;
+        }
+        resolve(record);
+      });
+    };
+
+    child.on("disconnect", onDisconnect);
+    child.on("error", onError);
+    child.on("exit", onExit);
+    child.on("message", onMessage);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      onExit(child.exitCode, child.signalCode);
+    } else if (!child.connected) {
+      onDisconnect();
+    }
+    if (!settled) {
+      defensiveTimer = setTimeout(() => {
+        settle(() => {
+          reject(
+            new Error(
+              `initializer worker=${workerIdentity} timed out before ${expectedKind}`,
+            ),
+          );
+        });
+      }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
+    }
+  });
+}
+
 function waitForChildMessage(
   child: ChildProcess,
   expectedKind: string,
 ): Promise<Readonly<Record<string, unknown>>> {
   return new Promise((resolve, reject) => {
+    let defensiveTimer: NodeJS.Timeout | undefined;
+    let settled = false;
     const cleanup = (): void => {
+      if (defensiveTimer !== undefined) clearTimeout(defensiveTimer);
+      child.off("disconnect", onDisconnect);
       child.off("error", onError);
       child.off("exit", onExit);
       child.off("message", onMessage);
     };
-    const onError = (error: Error): void => {
+    const settle = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
       cleanup();
-      reject(error);
+      action();
+    };
+    const onDisconnect = (): void => {
+      settle(() => {
+        reject(
+          new Error(`initializer process disconnected before ${expectedKind}`),
+        );
+      });
+    };
+    const onError = (error: Error): void => {
+      settle(() => reject(error));
     };
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-      cleanup();
-      reject(
-        new Error(
-          `initializer process exited before ${expectedKind}: ${String(code ?? signal)}`,
-        ),
-      );
+      settle(() => {
+        reject(
+          new Error(
+            `initializer process exited before ${expectedKind}: ${childExitDescription(code, signal)}`,
+          ),
+        );
+      });
     };
     const onMessage = (message: unknown): void => {
       if (typeof message !== "object" || message === null) return;
       const record = message as Readonly<Record<string, unknown>>;
       if (record["kind"] === "error") {
-        cleanup();
-        reject(new Error(String(record["message"] ?? "initializer failed")));
+        settle(() => {
+          reject(new Error(String(record["message"] ?? "initializer failed")));
+        });
       }
       if (record["kind"] === expectedKind) {
-        cleanup();
-        resolve(record);
+        settle(() => resolve(record));
       }
     };
+    child.on("disconnect", onDisconnect);
     child.on("error", onError);
     child.on("exit", onExit);
     child.on("message", onMessage);
+    if (!settled) {
+      defensiveTimer = setTimeout(() => {
+        settle(() => {
+          reject(
+            new Error(`initializer process timed out before ${expectedKind}`),
+          );
+        });
+      }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
+    }
   });
 }
 
@@ -758,6 +910,41 @@ async function stopInitializerProcess(child: ChildProcess): Promise<void> {
   });
   child.kill();
   await exited;
+}
+
+async function waitForInitializerCohortReadiness(
+  members: readonly InitializerProcessCohortMember[],
+  releaseParentOwnership: () => void | Promise<void>,
+): Promise<readonly Readonly<Record<string, unknown>>[]> {
+  try {
+    return await Promise.all(
+      members.map(({ child, identity }) =>
+        waitForFirstChildMessage(child, "modules_loaded", identity),
+      ),
+    );
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    try {
+      await releaseParentOwnership();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    const stopped = await Promise.allSettled(
+      members.map(({ child }) => stopInitializerProcess(child)),
+    );
+    for (const result of stopped) {
+      if (result.status === "rejected") cleanupErrors.push(result.reason);
+    }
+    if (cleanupErrors.length > 0 && error instanceof Error) {
+      Object.defineProperty(error, "cleanupErrors", {
+        configurable: true,
+        enumerable: false,
+        value: Object.freeze([...cleanupErrors]),
+        writable: false,
+      });
+    }
+    throw error;
+  }
 }
 
 function waitForWorkerMessage(
@@ -3607,6 +3794,176 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
 });
 
 describe("R7.8 SQLite worker lock lifecycle", () => {
+  test("readiness rejects when initializer exits before its first message", async () => {
+    const child = spawnChildProtocolFixture("process.exit(23)");
+    const exited = new Promise<{
+      readonly code: number | null;
+      readonly signal: NodeJS.Signals | null;
+    }>((resolve) => {
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+      await assert.rejects(
+        waitForFirstChildMessage(child, "modules_loaded", "exit-before-ready"),
+        /worker=exit-before-ready (?:disconnected|exited) before modules_loaded: code=(?:23|null) signal=null/iu,
+      );
+      assert.deepEqual(await exited, { code: 23, signal: null });
+      for (const event of ["disconnect", "error", "exit", "message"]) {
+        assert.equal(child.listenerCount(event), 0, event);
+      }
+    } finally {
+      await stopInitializerProcess(child);
+    }
+  });
+
+  test("readiness rejects when initializer errors before its first message", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-spawn-error-"));
+    const child = spawn(join(directory, "missing-initializer"), [], {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    try {
+      await assert.rejects(
+        waitForFirstChildMessage(child, "modules_loaded", "spawn-error"),
+        /worker=spawn-error errored before modules_loaded: code=-2 signal=null/iu,
+      );
+      for (const event of ["disconnect", "error", "exit", "message"]) {
+        assert.equal(child.listenerCount(event), 0, event);
+      }
+    } finally {
+      await stopInitializerProcess(child);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("readiness rejects when initializer disconnects before its first message", async () => {
+    const child = spawnChildProtocolFixture(String.raw`
+      process.disconnect();
+      setImmediate(() => {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+      });
+    `);
+    try {
+      await assert.rejects(
+        waitForFirstChildMessage(
+          child,
+          "modules_loaded",
+          "disconnect-before-ready",
+        ),
+        /worker=disconnect-before-ready disconnected before modules_loaded: code=null signal=null/iu,
+      );
+      for (const event of ["disconnect", "error", "exit", "message"]) {
+        assert.equal(child.listenerCount(event), 0, event);
+      }
+    } finally {
+      await stopInitializerProcess(child);
+    }
+  });
+
+  test("readiness settles once and removes listeners before later exit", async () => {
+    const child = spawnChildProtocolFixture(String.raw`
+      process.on("message", (message) => {
+        if (message?.kind === "start") {
+          process.send({ kind: "modules_loaded", storeKind: "m2" });
+        } else if (message?.kind === "exit") {
+          process.exit(0);
+        }
+      });
+    `);
+    const listenerEvents = ["disconnect", "error", "exit", "message"] as const;
+    let settlementCount = 0;
+    try {
+      const readiness = waitForFirstChildMessage(
+        child,
+        "modules_loaded",
+        "ready-then-exit",
+      );
+      void readiness.then(
+        () => {
+          settlementCount += 1;
+        },
+        () => {
+          settlementCount += 1;
+        },
+      );
+      await sendChildMessage(child, { kind: "start" });
+      const ready = await readiness;
+      assert.equal(ready["storeKind"], "m2");
+      assert.equal(settlementCount, 1);
+      for (const event of listenerEvents) {
+        assert.equal(child.listenerCount(event), 0, event);
+      }
+
+      const exited = waitForChildExit(child);
+      await sendChildMessage(child, { kind: "exit" });
+      await exited;
+      assert.equal(settlementCount, 1);
+    } finally {
+      await stopInitializerProcess(child);
+    }
+  });
+
+  test("one startup failure releases ownership and reaps its cohort", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-cohort-"));
+    const path = join(directory, "m2.sqlite");
+    const initial = createStore({ path, initialState: initialState() });
+    initial.close();
+    const blocker = new DatabaseSync(path);
+    blocker.exec("BEGIN IMMEDIATE");
+    const children = [
+      spawnChildProtocolFixture("process.exit(41)"),
+      spawnChildProtocolFixture('process.on("message", () => {})'),
+      spawnChildProtocolFixture('process.on("message", () => {})'),
+    ];
+    let ownershipReleaseCount = 0;
+    try {
+      await assert.rejects(
+        waitForInitializerCohortReadiness(
+          children.map((child, index) => ({
+            child,
+            identity: `cohort-${String(index)}`,
+          })),
+          () => {
+            ownershipReleaseCount += 1;
+            if (blocker.isTransaction) blocker.exec("ROLLBACK");
+            if (blocker.isOpen) blocker.close();
+          },
+        ),
+        /worker=cohort-0 (?:disconnected|exited) before modules_loaded: code=(?:41|null) signal=null/iu,
+      );
+      assert.equal(ownershipReleaseCount, 1);
+      for (const child of children) {
+        assert.equal(
+          child.exitCode !== null || child.signalCode !== null,
+          true,
+        );
+        for (const event of ["disconnect", "error", "exit", "message"]) {
+          assert.equal(child.listenerCount(event), 0, event);
+        }
+      }
+      const reader = new DatabaseSync(path);
+      try {
+        reader.exec("BEGIN IMMEDIATE; ROLLBACK");
+        assert.equal(
+          (reader.prepare("PRAGMA quick_check").get() as Record<
+            string,
+            unknown
+          >)["quick_check"],
+          "ok",
+        );
+      } finally {
+        reader.close();
+      }
+    } finally {
+      if (blocker.isOpen) {
+        if (blocker.isTransaction) blocker.exec("ROLLBACK");
+        blocker.close();
+      }
+      await Promise.all(children.map(stopInitializerProcess));
+      rmSync(directory, { recursive: true, force: true });
+    }
+    assert.equal(existsSync(directory), false);
+  });
+
   test("initializer readiness follows module loading", async () => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-modules-"));
     const child = spawnInitializerProcess({
@@ -3619,17 +3976,10 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
       storeKind: "m2",
     });
     try {
-      const firstMessage = await new Promise<Readonly<Record<string, unknown>>>(
-        (resolve, reject) => {
-          child.once("error", reject);
-          child.once("message", (message: unknown) => {
-            if (typeof message !== "object" || message === null) {
-              reject(new Error("initializer process sent a malformed message"));
-              return;
-            }
-            resolve(message as Readonly<Record<string, unknown>>);
-          });
-        },
+      const firstMessage = await waitForFirstChildMessage(
+        child,
+        "modules_loaded",
+        "module-readiness",
       );
       assert.equal(firstMessage["kind"], "modules_loaded");
       assert.equal(firstMessage["storeKind"], "m2");
@@ -3906,10 +4256,15 @@ describe("R7.8 SQLite worker lock lifecycle", () => {
               }),
           );
           try {
-            const modulesLoaded = await Promise.all(
-              children.map((child) =>
-                waitForChildMessage(child, "modules_loaded"),
-              ),
+            const modulesLoaded = await waitForInitializerCohortReadiness(
+              children.map((child, index) => ({
+                child,
+                identity: `${fixture.storeKind}-round-${String(round)}-worker-${String(index)}`,
+              })),
+              () => {
+                if (blocker.isTransaction) blocker.exec("ROLLBACK");
+                if (blocker.isOpen) blocker.close();
+              },
             );
             assert.deepEqual(
               modulesLoaded.map((message) => message["storeKind"]),
