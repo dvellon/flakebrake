@@ -737,6 +737,151 @@ test("M5 Round 2: unsettled handlers retain durable ownership and a later close 
   }
 });
 
+test("M5 Round 3 reproduction: malformed request targets stay inside the handler lifecycle", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-malformed-target-"));
+  const moduleUrl = new URL("../src/index.js", import.meta.url).href;
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `
+        import { startM5JudgeServer } from ${JSON.stringify(moduleUrl)};
+        const running = await startM5JudgeServer({
+          dataRoot: ${JSON.stringify(directory)},
+          port: 0,
+          cleanupDataOnClose: true,
+        });
+        process.send?.({ type: "ready", port: running.port });
+        process.on("message", async (message) => {
+          if (message !== "close") return;
+          await running.close();
+          process.send?.({ type: "closed" });
+          process.disconnect();
+        });
+      `,
+    ],
+    {
+      cwd: process.cwd(),
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+    },
+  );
+  try {
+    const ready = await waitForChildProtocolMessage(child, "ready");
+    assert.equal(typeof ready["port"], "number");
+    const port = ready["port"] as number;
+    const malformed = await rawHttpExchange(
+      port,
+      `GET //[::1 HTTP/1.1\r\nHost: 127.0.0.1:${String(port)}\r\nConnection: close\r\n\r\n`,
+    );
+    assert.match(malformed, /^HTTP\/1\.1 400 /u);
+    assert.match(malformed, /"error":"invalid_request_target"/u);
+
+    const valid = await rawHttpExchange(
+      port,
+      `GET /api/state?after=malformed HTTP/1.1\r\nHost: 127.0.0.1:${String(port)}\r\nConnection: close\r\n\r\n`,
+    );
+    assert.match(valid, /^HTTP\/1\.1 200 /u);
+    child.send("close");
+    await waitForChildProtocolMessage(child, "closed");
+    const exited = await waitForChildExit(child);
+    assert.equal(exited.code, 0);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await waitForChildExit(child).catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 3: request targets are strict origin-form and settle without effects", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-target-validation-"));
+  const running = await startM5JudgeServer({
+    dataRoot: directory,
+    port: 0,
+    cleanupDataOnClose: true,
+  });
+  try {
+    const invalidTargets = [
+      { target: "/api/state?malformed=%ZZ", applicationRejected: true },
+      { target: "//[::1", applicationRejected: true },
+      {
+        target: `http://127.0.0.1:${String(running.port)}/api/state`,
+        applicationRejected: true,
+      },
+      {
+        target: `127.0.0.1:${String(running.port)}`,
+        applicationRejected: false,
+      },
+      { target: "*", applicationRejected: true },
+    ];
+    for (const { target, applicationRejected } of invalidTargets) {
+      const response = await rawHttpExchange(
+        running.port,
+        `GET ${target} HTTP/1.1\r\nHost: 127.0.0.1:${String(running.port)}\r\nConnection: close\r\n\r\n`,
+      );
+      assert.match(response, /^HTTP\/1\.1 400 /u, target);
+      if (applicationRejected) {
+        assert.match(response, /"error":"invalid_request_target"/u, target);
+      }
+      await waitForActiveRequestCount(running, 0);
+    }
+
+    const valid = await rawHttpExchange(
+      running.port,
+      `GET /api/state?path=%2Fjudge%20flow&mode=read HTTP/1.1\r\nHost: 127.0.0.1:${String(running.port)}\r\nConnection: close\r\n\r\n`,
+    );
+    assert.match(valid, /^HTTP\/1\.1 200 /u);
+    await waitForActiveRequestCount(running, 0);
+    const state = running.coordinator.state();
+    assert.equal(state.run.status, "idle");
+    assert.equal(state.execution.mutationCount, 0);
+    assert.deepEqual(readdirSync(directory).sort(), [".flakebrake-m5-owned-v1"]);
+  } finally {
+    await running.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 3: malformed requests settle during bounded shutdown", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-malformed-close-"));
+  const settlementEntered = deferred<void>();
+  const releaseSettlement = deferred<void>();
+  const running = await startM5JudgeServer({
+    dataRoot: directory,
+    port: 0,
+    cleanupDataOnClose: true,
+    requestDrainTimeoutMs: 100,
+    beforeHandlerSettlement: async ({ pathname }) => {
+      if (pathname !== "<invalid-request-target>") return;
+      settlementEntered.resolve();
+      await releaseSettlement.promise;
+    },
+  });
+  try {
+    const malformed = rawHttpExchange(
+      running.port,
+      `GET //[::1 HTTP/1.1\r\nHost: 127.0.0.1:${String(running.port)}\r\nConnection: close\r\n\r\n`,
+    );
+    await settlementEntered.promise;
+    assert.equal(running.activeRequestCount(), 1);
+    const close = running.close();
+    releaseSettlement.resolve();
+    assert.match(await malformed, /^HTTP\/1\.1 400 /u);
+    await close;
+    assert.equal(running.activeRequestCount(), 0);
+    const state = running.coordinator.state();
+    assert.equal(state.run.status, "closed");
+    assert.equal(state.execution.mutationCount, 0);
+    for (const name of ["m2.sqlite", "factory.sqlite", "mission.sqlite", "trueforge.sqlite"]) {
+      assert.equal(existsSync(join(directory, name)), false);
+    }
+  } finally {
+    releaseSettlement.resolve();
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function acceptedFragmentedRequest(running: RunningM5JudgeServer): Promise<{ socket: Socket; remainder: string }> {
   const socket = createConnection({ host: "127.0.0.1", port: running.port });
   await once(socket, "connect");
@@ -751,6 +896,76 @@ async function acceptedFragmentedRequest(running: RunningM5JudgeServer): Promise
     response += chunk.toString("utf8");
   }
   return { socket, remainder: body.slice(fragmentLength) };
+}
+
+async function rawHttpExchange(port: number, request: string): Promise<string> {
+  const socket = createConnection({ host: "127.0.0.1", port });
+  let response = "";
+  socket.setEncoding("utf8");
+  return await new Promise<string>((resolveResponse, rejectResponse) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      rejectResponse(new Error("raw HTTP exchange did not settle"));
+    }, 5_000);
+    const settle = (error?: Error): void => {
+      clearTimeout(timer);
+      if (error !== undefined && response.length === 0) rejectResponse(error);
+      else resolveResponse(response);
+    };
+    socket.on("data", (chunk: string) => { response += chunk; });
+    socket.once("connect", () => socket.end(request));
+    socket.once("error", settle);
+    socket.once("close", () => settle());
+  });
+}
+
+async function waitForActiveRequestCount(
+  running: RunningM5JudgeServer,
+  expected: number,
+): Promise<void> {
+  for (let turn = 0; turn < 100; turn += 1) {
+    if (running.activeRequestCount() === expected) return;
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  }
+  assert.equal(running.activeRequestCount(), expected);
+}
+
+async function waitForChildProtocolMessage(
+  child: ChildProcess,
+  expectedType: string,
+): Promise<Record<string, unknown>> {
+  return await new Promise<Record<string, unknown>>((resolveMessage, rejectMessage) => {
+    const timer = setTimeout(
+      () => rejectMessage(new Error(`child did not report ${expectedType}`)),
+      5_000,
+    );
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const onMessage = (message: unknown): void => {
+      if (message === null || typeof message !== "object") return;
+      const record = message as Record<string, unknown>;
+      if (record["type"] !== expectedType) return;
+      cleanup();
+      resolveMessage(record);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      rejectMessage(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      cleanup();
+      rejectMessage(
+        new Error(`child exited before ${expectedType} (${String(code)}/${String(signal)})`),
+      );
+    };
+    child.on("message", onMessage);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
 }
 
 async function waitForChildOutput(child: ChildProcess, text: string, timeout = 20_000): Promise<void> {

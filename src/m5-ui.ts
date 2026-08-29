@@ -856,6 +856,7 @@ export interface RunningM5JudgeServer {
   readonly url: string;
   readonly port: number;
   readonly coordinator: M5DemoCoordinator;
+  activeRequestCount(): number;
   close(): Promise<void>;
 }
 
@@ -919,16 +920,19 @@ export async function startM5JudgeServer(
       response.once("finish", settleResponse);
       response.once("close", settleResponse);
     });
-    const pathname = request.url === undefined
-      ? "/"
-      : new URL(request.url, "http://127.0.0.1").pathname;
+    let pathname = "<invalid-request-target>";
     const handlerLifecycle = (async (): Promise<void> => {
       try {
         if (!acceptingRequests) {
           sendJson(response, 503, { error: "server_closing", message: "The judge UI is closing" });
           request.destroy();
         } else {
-          await handleRequest(request, response);
+          assertAcceptingRequests();
+          applySecurityHeaders(response);
+          validateHostAndOrigin(request, publicOrigin);
+          const url = parseOriginFormRequestTarget(request.url, publicOrigin);
+          pathname = url.pathname;
+          await handleRequest(request, response, url);
         }
       } catch (error: unknown) {
         const requestError =
@@ -968,11 +972,9 @@ export async function startM5JudgeServer(
   async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
+    url: URL,
   ): Promise<void> {
     assertAcceptingRequests();
-    applySecurityHeaders(response);
-    validateHostAndOrigin(request, publicOrigin);
-    const url = new URL(request.url ?? "/", publicOrigin);
     if (url.pathname === "/api/state") {
       requireMethod(request, "GET");
       sendJson(response, 200, coordinator.state());
@@ -1107,6 +1109,7 @@ export async function startM5JudgeServer(
     url: publicOrigin,
     port: address.port,
     coordinator,
+    activeRequestCount: () => activeRequests.size,
     async close(): Promise<void> {
       if (closed) return;
       if (closing !== null) return closing;
@@ -1405,6 +1408,37 @@ function validateHostAndOrigin(request: IncomingMessage, publicOrigin: string): 
   }
   if (request.method === "POST" && origin !== publicOrigin) {
     throw new M5RequestError(403, "origin_required", "Mutating requests require the exact UI origin");
+  }
+}
+
+function parseOriginFormRequestTarget(target: string | undefined, publicOrigin: string): URL {
+  if (
+    target === undefined ||
+    !target.startsWith("/") ||
+    target.startsWith("//") ||
+    target.includes("\\") ||
+    target.includes("#") ||
+    /[\u0000-\u0020\u007f]/u.test(target) ||
+    /%(?![0-9A-Fa-f]{2})/u.test(target)
+  ) {
+    throw new M5RequestError(
+      400,
+      "invalid_request_target",
+      "Request target must be a valid HTTP origin-form path",
+    );
+  }
+  try {
+    const url = new URL(target, publicOrigin);
+    if (url.origin !== publicOrigin || url.username.length > 0 || url.password.length > 0) {
+      throw new TypeError("request target escaped the bound origin");
+    }
+    return url;
+  } catch {
+    throw new M5RequestError(
+      400,
+      "invalid_request_target",
+      "Request target must be a valid HTTP origin-form path",
+    );
   }
 }
 
