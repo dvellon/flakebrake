@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -508,6 +509,723 @@ function assertConcurrentCommitSurvivesInitializationFailure(
   } finally {
     peer?.close();
   }
+}
+
+interface InitializerProcessConfiguration {
+  readonly factoryModuleUrl: string;
+  readonly path: string;
+  readonly sqliteModuleUrl: string;
+  readonly storeKind: "m2" | "factory";
+}
+
+const INITIALIZER_PROCESS_SOURCE = String.raw`
+  const configuration = JSON.parse(process.argv[1]);
+  const send = (message, disconnect = false) => new Promise((resolve, reject) => {
+    if (typeof process.send !== "function") {
+      reject(new Error("initializer process has no IPC channel"));
+      return;
+    }
+    process.send(message, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (disconnect) process.disconnect();
+      resolve();
+    });
+  });
+  const receive = (expectedKind) => new Promise((resolve, reject) => {
+    const cleanup = () => {
+      process.off("disconnect", onDisconnect);
+      process.off("message", onMessage);
+    };
+    const onDisconnect = () => {
+      cleanup();
+      reject(new Error("initializer process IPC disconnected"));
+    };
+    const onMessage = (message) => {
+      cleanup();
+      if (message?.kind !== expectedKind) {
+        reject(new Error(
+          "initializer process expected " + expectedKind +
+          " but received " + String(message?.kind),
+        ));
+        return;
+      }
+      resolve(message);
+    };
+    process.once("disconnect", onDisconnect);
+    process.once("message", onMessage);
+  });
+
+  (async () => {
+    const [{ DatabaseSync }, { openSqlite }, { SyntheticFactoryEnvironment }] =
+      await Promise.all([
+        import("node:sqlite"),
+        import(configuration.sqliteModuleUrl),
+        import(configuration.factoryModuleUrl),
+      ]);
+    const probeRequest = receive("probe_sqlite_contention");
+    await send({
+      kind: "modules_loaded",
+      storeKind: configuration.storeKind,
+    });
+    await probeRequest;
+
+    let probe;
+    let contentionCode;
+    try {
+      probe = new DatabaseSync(configuration.path);
+      probe.exec("PRAGMA busy_timeout = 0");
+      try {
+        probe.exec("BEGIN IMMEDIATE");
+      } catch (error) {
+        const errcode = Number(error?.errcode);
+        if (errcode !== 5 && errcode !== 6) throw error;
+        contentionCode = errcode;
+      }
+      if (contentionCode === undefined) {
+        if (probe.isTransaction) probe.exec("ROLLBACK");
+        throw new Error("SQLite contention probe acquired the write lock");
+      }
+    } finally {
+      if (probe?.isTransaction) probe.exec("ROLLBACK");
+      probe?.close();
+    }
+
+    const initializeRequest = receive("initialize");
+    await send({
+      kind: "sqlite_contention_observed",
+      sqliteCode: contentionCode,
+    });
+    await initializeRequest;
+
+    let resource;
+    try {
+      let identity;
+      if (configuration.storeKind === "m2") {
+        resource = openSqlite(configuration.path);
+        const row = resource.prepare(
+          "SELECT incarnation_id FROM database_incarnation WHERE singleton = 1",
+        ).get();
+        identity = row.incarnation_id;
+      } else if (configuration.storeKind === "factory") {
+        resource = new SyntheticFactoryEnvironment({
+          path: configuration.path,
+        });
+        identity = resource.databaseInstanceIdentity();
+      } else {
+        throw new Error("unsupported initializer store kind");
+      }
+      await send({
+        kind: "operation_committed",
+        handleState: "open",
+        identity,
+      });
+      resource.close();
+      resource = undefined;
+      await send({
+        kind: "handle_closed",
+        handleState: "closed",
+        identity,
+      }, true);
+    } catch (error) {
+      let cleanupError;
+      try {
+        resource?.close();
+      } catch (caught) {
+        cleanupError = caught;
+      }
+      await send({
+        kind: "error",
+        cleanupFailed: cleanupError !== undefined,
+        message: String(error?.message ?? error),
+      }, true);
+    }
+  })().catch(async (error) => {
+    try {
+      await send({
+        kind: "error",
+        message: String(error?.message ?? error),
+      }, true);
+    } catch {
+      process.exitCode = 1;
+    }
+  });
+`;
+
+const CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS = 5_000;
+
+type ChildProtocolRecord = Readonly<Record<string, unknown>>;
+type ChildLifecycleKind = "disconnect" | "error" | "exit";
+
+interface ChildExitState {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
+interface ChildLifecycleSnapshot extends ChildExitState {
+  readonly disconnected: boolean;
+  readonly errorCode: string | undefined;
+  readonly syscall: string | undefined;
+  readonly workerIdentity: string;
+}
+
+interface InitializerProcessCohortMember {
+  readonly child: ChildProcess;
+  readonly identity: string;
+  readonly protocol: ChildProtocolObserver;
+}
+
+interface ChildMessageWaiter {
+  readonly expectedKind: string;
+  readonly first: boolean;
+  readonly reject: (error: Error) => void;
+  readonly resolve: (message: ChildProtocolRecord) => void;
+  settled: boolean;
+  timer?: NodeJS.Timeout;
+}
+
+interface ChildLifecycleWaiter {
+  readonly kind: ChildLifecycleKind;
+  readonly reject: (error: Error) => void;
+  readonly resolve: () => void;
+  settled: boolean;
+  timer?: NodeJS.Timeout;
+}
+
+class InitializerWorkerProtocolError extends Error {
+  readonly errorCode: string | undefined;
+  readonly exitCode: number | null;
+  readonly lifecycle: ChildLifecycleKind | "protocol" | "timeout";
+  readonly signal: NodeJS.Signals | null;
+  readonly syscall: string | undefined;
+  readonly workerIdentity: string;
+
+  constructor(options: {
+    readonly cause?: Error;
+    readonly errorCode?: string;
+    readonly exitCode: number | null;
+    readonly lifecycle: ChildLifecycleKind | "protocol" | "timeout";
+    readonly message: string;
+    readonly signal: NodeJS.Signals | null;
+    readonly syscall?: string;
+    readonly workerIdentity: string;
+  }) {
+    super(options.message, { cause: options.cause });
+    this.name = "InitializerWorkerProtocolError";
+    this.errorCode = options.errorCode;
+    this.exitCode = options.exitCode;
+    this.lifecycle = options.lifecycle;
+    this.signal = options.signal;
+    this.syscall = options.syscall;
+    this.workerIdentity = options.workerIdentity;
+  }
+}
+
+function childExitDescription(exit: ChildExitState | undefined): string {
+  return `exitCode=${String(exit?.code ?? null)} signal=${String(exit?.signal ?? null)}`;
+}
+
+function isSemanticSpawnError(
+  error: unknown,
+  workerIdentity: string,
+  expectedCode: string,
+): boolean {
+  return (
+    error instanceof InitializerWorkerProtocolError &&
+    error.lifecycle === "error" &&
+    error.workerIdentity === workerIdentity &&
+    error.errorCode === expectedCode &&
+    typeof error.syscall === "string" &&
+    /^spawn(?:\s|$)/u.test(error.syscall)
+  );
+}
+
+class ChildProtocolObserver {
+  private disconnected = false;
+  private disposed = false;
+  private exit: ChildExitState | undefined;
+  private firstMessageConsumed = false;
+  private readonly lifecycleWaiters = new Set<ChildLifecycleWaiter>();
+  private readonly messageWaiters = new Set<ChildMessageWaiter>();
+  private readonly messages: ChildProtocolRecord[] = [];
+  private processError: NodeJS.ErrnoException | undefined;
+
+  private readonly onDisconnect = (): void => {
+    this.disconnected = true;
+    this.flushLifecycleWaiters("disconnect");
+    this.flushMessageWaiters();
+  };
+
+  private readonly onError = (error: Error): void => {
+    if (this.processError !== undefined || this.exit !== undefined) return;
+    this.processError = error as NodeJS.ErrnoException;
+    this.flushLifecycleWaiters("error");
+    this.flushMessageWaiters();
+  };
+
+  private readonly onExit = (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void => {
+    this.exit = { code, signal };
+    this.flushLifecycleWaiters("exit");
+    this.flushMessageWaiters();
+  };
+
+  private readonly onMessage = (message: unknown): void => {
+    if (
+      this.processError !== undefined ||
+      this.exit !== undefined ||
+      this.disconnected
+    ) {
+      return;
+    }
+    if (typeof message !== "object" || message === null) {
+      this.processError = new Error(
+        "initializer process sent a malformed protocol message",
+      );
+    } else {
+      const record = message as ChildProtocolRecord;
+      if (record["kind"] === "error") {
+        this.processError = new Error(
+          String(record["message"] ?? "initializer failed"),
+        );
+      } else {
+        this.messages.push(record);
+      }
+    }
+    this.flushMessageWaiters();
+  };
+
+  constructor(
+    readonly child: ChildProcess,
+    readonly workerIdentity: string,
+  ) {
+    child.on("disconnect", this.onDisconnect);
+    child.on("error", this.onError);
+    child.on("exit", this.onExit);
+    child.on("message", this.onMessage);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.child.off("disconnect", this.onDisconnect);
+    this.child.off("error", this.onError);
+    this.child.off("exit", this.onExit);
+    this.child.off("message", this.onMessage);
+    const error = this.protocolError(
+      "protocol",
+      "observer disposal",
+      "initializer protocol observer was disposed",
+    );
+    for (const waiter of [...this.messageWaiters]) {
+      this.settleMessageWaiter(waiter, () => waiter.reject(error));
+    }
+    for (const waiter of [...this.lifecycleWaiters]) {
+      this.settleLifecycleWaiter(waiter, () => waiter.reject(error));
+    }
+  }
+
+  waitForFirstMessage(expectedKind: string): Promise<ChildProtocolRecord> {
+    if (this.firstMessageConsumed) {
+      return Promise.reject(
+        this.protocolError(
+          "protocol",
+          expectedKind,
+          "initializer first protocol message was already consumed",
+        ),
+      );
+    }
+    return this.waitForMessageInternal(expectedKind, true);
+  }
+
+  waitForMessage(expectedKind: string): Promise<ChildProtocolRecord> {
+    return this.waitForMessageInternal(expectedKind, false);
+  }
+
+  waitForLifecycle(kind: ChildLifecycleKind): Promise<void> {
+    if (this.lifecycleOccurred(kind)) return Promise.resolve();
+    if (this.disposed) {
+      return Promise.reject(
+        this.protocolError(
+          "protocol",
+          kind,
+          "initializer protocol observer was disposed",
+        ),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const waiter: ChildLifecycleWaiter = {
+        kind,
+        reject,
+        resolve,
+        settled: false,
+      };
+      this.lifecycleWaiters.add(waiter);
+      waiter.timer = setTimeout(() => {
+        this.settleLifecycleWaiter(waiter, () => {
+          reject(
+            this.protocolError(
+              "timeout",
+              kind,
+              `initializer timed out waiting for lifecycle event ${kind}`,
+            ),
+          );
+        });
+      }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
+    });
+  }
+
+  lifecycleSnapshot(): ChildLifecycleSnapshot {
+    return {
+      code: this.exit?.code ?? this.child.exitCode,
+      disconnected: this.disconnected,
+      errorCode: this.processError?.code,
+      signal: this.exit?.signal ?? this.child.signalCode,
+      syscall: this.processError?.syscall,
+      workerIdentity: this.workerIdentity,
+    };
+  }
+
+  async waitForSuccessfulExit(): Promise<void> {
+    await this.waitForLifecycle("exit");
+    if (this.exit?.code !== 0) {
+      throw this.protocolError(
+        "exit",
+        "successful exit",
+        `initializer exited unexpectedly: ${childExitDescription(this.exit)}`,
+      );
+    }
+  }
+
+  private waitForMessageInternal(
+    expectedKind: string,
+    first: boolean,
+  ): Promise<ChildProtocolRecord> {
+    if (this.disposed) {
+      return Promise.reject(
+        this.protocolError(
+          "protocol",
+          expectedKind,
+          "initializer protocol observer was disposed",
+        ),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const waiter: ChildMessageWaiter = {
+        expectedKind,
+        first,
+        reject,
+        resolve,
+        settled: false,
+      };
+      this.messageWaiters.add(waiter);
+      this.flushMessageWaiters();
+      if (!waiter.settled) {
+        waiter.timer = setTimeout(() => {
+          this.settleMessageWaiter(waiter, () => {
+            reject(
+              this.protocolError(
+                "timeout",
+                expectedKind,
+                `initializer timed out before ${expectedKind}`,
+              ),
+            );
+          });
+        }, CHILD_PROTOCOL_DEFENSIVE_TIMEOUT_MS);
+      }
+    });
+  }
+
+  private flushMessageWaiters(): void {
+    for (const waiter of [...this.messageWaiters]) {
+      const messageIndex = waiter.first
+        ? this.firstMessageConsumed || this.messages.length === 0
+          ? -1
+          : 0
+        : this.messages.findIndex(
+            (message) => message["kind"] === waiter.expectedKind,
+          );
+      if (messageIndex >= 0) {
+        const message = this.messages.splice(messageIndex, 1)[0];
+        if (message === undefined) continue;
+        if (waiter.first) this.firstMessageConsumed = true;
+        this.settleMessageWaiter(waiter, () => {
+          if (message["kind"] !== waiter.expectedKind) {
+            waiter.reject(
+              this.protocolError(
+                "protocol",
+                waiter.expectedKind,
+                `initializer expected ${waiter.first ? "first " : ""}message ${waiter.expectedKind} but received ${String(message["kind"])}`,
+              ),
+            );
+          } else {
+            waiter.resolve(message);
+          }
+        });
+        continue;
+      }
+      const terminal = this.currentTerminalError(waiter.expectedKind);
+      if (terminal !== undefined) {
+        this.settleMessageWaiter(waiter, () => waiter.reject(terminal));
+      }
+    }
+  }
+
+  private currentTerminalError(expectedKind: string): Error | undefined {
+    if (this.processError !== undefined) {
+      const code = this.processError.code;
+      const syscall = this.processError.syscall;
+      return this.protocolError(
+        "error",
+        expectedKind,
+        `initializer errored before ${expectedKind}: errorCode=${String(code ?? null)} syscall=${String(syscall ?? null)} ${childExitDescription(this.exit)}`,
+        this.processError,
+      );
+    }
+    if (this.exit !== undefined) {
+      return this.protocolError(
+        "exit",
+        expectedKind,
+        `initializer exited before ${expectedKind}: ${childExitDescription(this.exit)}`,
+      );
+    }
+    if (this.disconnected) {
+      return this.protocolError(
+        "disconnect",
+        expectedKind,
+        `initializer disconnected before ${expectedKind}: ${childExitDescription(this.exit)}`,
+      );
+    }
+    return undefined;
+  }
+
+  private protocolError(
+    lifecycle: ChildLifecycleKind | "protocol" | "timeout",
+    expectedKind: string,
+    detail: string,
+    cause?: NodeJS.ErrnoException,
+  ): InitializerWorkerProtocolError {
+    return new InitializerWorkerProtocolError({
+      ...(cause === undefined ? {} : { cause }),
+      ...(cause?.code === undefined ? {} : { errorCode: cause.code }),
+      exitCode: this.exit?.code ?? this.child.exitCode,
+      lifecycle,
+      message: `initializer worker=${this.workerIdentity} ${detail} awaiting=${expectedKind}`,
+      signal: this.exit?.signal ?? this.child.signalCode,
+      ...(cause?.syscall === undefined ? {} : { syscall: cause.syscall }),
+      workerIdentity: this.workerIdentity,
+    });
+  }
+
+  private lifecycleOccurred(kind: ChildLifecycleKind): boolean {
+    if (kind === "disconnect") return this.disconnected;
+    if (kind === "error") return this.processError !== undefined;
+    return this.exit !== undefined;
+  }
+
+  private flushLifecycleWaiters(kind: ChildLifecycleKind): void {
+    for (const waiter of [...this.lifecycleWaiters]) {
+      if (waiter.kind === kind) {
+        this.settleLifecycleWaiter(waiter, waiter.resolve);
+      }
+    }
+  }
+
+  private settleMessageWaiter(
+    waiter: ChildMessageWaiter,
+    action: () => void,
+  ): void {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+    this.messageWaiters.delete(waiter);
+    action();
+  }
+
+  private settleLifecycleWaiter(
+    waiter: ChildLifecycleWaiter,
+    action: () => void,
+  ): void {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+    this.lifecycleWaiters.delete(waiter);
+    action();
+  }
+}
+
+function observeChildProcess(
+  child: ChildProcess,
+  identity: string,
+): InitializerProcessCohortMember {
+  return {
+    child,
+    identity,
+    protocol: new ChildProtocolObserver(child, identity),
+  };
+}
+
+function spawnInitializerProcess(
+  configuration: InitializerProcessConfiguration,
+  identity: string,
+): InitializerProcessCohortMember {
+  return observeChildProcess(
+    spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        INITIALIZER_PROCESS_SOURCE,
+        JSON.stringify(configuration),
+      ],
+      {
+        env: { NODE_NO_WARNINGS: "1" },
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+      },
+    ),
+    identity,
+  );
+}
+
+function spawnChildProtocolFixture(
+  source: string,
+  identity: string,
+): InitializerProcessCohortMember {
+  return observeChildProcess(
+    spawn(process.execPath, ["--input-type=module", "--eval", source], {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    }),
+    identity,
+  );
+}
+
+function spawnMissingInitializerProcess(
+  executable: string,
+  identity: string,
+): InitializerProcessCohortMember {
+  return observeChildProcess(
+    spawn(executable, [], {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    }),
+    identity,
+  );
+}
+
+function sendChildMessage(
+  child: ChildProcess,
+  message: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!child.connected) {
+      reject(new Error("initializer process IPC channel is closed"));
+      return;
+    }
+    child.send(message, (error) => {
+      if (error === null) resolve();
+      else reject(error);
+    });
+  });
+}
+
+async function stopInitializerProcess(
+  member: InitializerProcessCohortMember,
+): Promise<void> {
+  try {
+    if (member.child.pid === undefined) return;
+    if (member.child.exitCode === null && member.child.signalCode === null) {
+      member.child.kill();
+    }
+    await member.protocol.waitForLifecycle("exit");
+  } finally {
+    member.protocol.dispose();
+  }
+}
+
+async function waitForInitializerCohortReadiness(
+  members: readonly InitializerProcessCohortMember[],
+  releaseParentOwnership: () => void | Promise<void>,
+): Promise<readonly Readonly<Record<string, unknown>>[]> {
+  try {
+    return await Promise.all(
+      members.map(({ protocol }) =>
+        protocol.waitForFirstMessage("modules_loaded"),
+      ),
+    );
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    try {
+      await releaseParentOwnership();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    const stopped = await Promise.allSettled(
+      members.map(stopInitializerProcess),
+    );
+    for (const result of stopped) {
+      if (result.status === "rejected") cleanupErrors.push(result.reason);
+    }
+    if (cleanupErrors.length > 0 && error instanceof Error) {
+      Object.defineProperty(error, "cleanupErrors", {
+        configurable: true,
+        enumerable: false,
+        value: Object.freeze([...cleanupErrors]),
+        writable: false,
+      });
+    }
+    throw error;
+  }
+}
+
+function waitForWorkerMessage(
+  worker: Worker,
+  expectedKind: string,
+): Promise<Readonly<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+      worker.off("message", onMessage);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number): void => {
+      cleanup();
+      reject(
+        new Error(`initializer worker exited before ${expectedKind}: ${code}`),
+      );
+    };
+    const onMessage = (message: unknown): void => {
+      if (typeof message !== "object" || message === null) return;
+      const record = message as Readonly<Record<string, unknown>>;
+      if (record["kind"] === "error") {
+        cleanup();
+        reject(new Error(String(record["message"] ?? "initializer failed")));
+      }
+      if (record["kind"] === expectedKind) {
+        cleanup();
+        resolve(record);
+      }
+    };
+    worker.on("error", onError);
+    worker.on("exit", onExit);
+    worker.on("message", onMessage);
+  });
+}
+
+function waitForWorkerExit(worker: Worker): Promise<void> {
+  return new Promise((resolve, reject) => {
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`initializer worker exited with code ${code}`));
+    });
+  });
 }
 
 function demand(values: DemandValues): ResourceDemand {
@@ -3139,14 +3857,20 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       Atomics.wait(new Int32Array(workerData.barrier), 0, 0);
       import(workerData.moduleUrl).then(({ openSqlite }) => {
         const database = openSqlite(workerData.path);
+        let incarnationId;
         try {
           const row = database.prepare(
             "SELECT incarnation_id FROM database_incarnation WHERE singleton = 1",
           ).get();
-          parentPort.postMessage({ kind: "result", incarnationId: row.incarnation_id });
+          incarnationId = row.incarnation_id;
         } finally {
           database.close();
         }
+        parentPort.postMessage({
+          kind: "result",
+          handleState: "closed",
+          incarnationId,
+        });
       }).catch((error) => {
         parentPort.postMessage({ kind: "error", message: String(error?.stack ?? error) });
       });
@@ -3183,7 +3907,7 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       await Promise.all(ready);
       const resultPromises = workers.map(
           (worker) =>
-            new Promise<string>((resolve, reject) => {
+            new Promise<{ readonly handleState: string; readonly incarnationId: string }>((resolve, reject) => {
               worker.once("error", reject);
               worker.on("message", (message: unknown) => {
                 if (
@@ -3203,9 +3927,13 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
                   );
                 } else if (
                   message.kind === "result" &&
+                  "handleState" in message &&
                   "incarnationId" in message
                 ) {
-                  resolve(String(message.incarnationId));
+                  resolve({
+                    handleState: String(message.handleState),
+                    incarnationId: String(message.incarnationId),
+                  });
                 }
               });
             }),
@@ -3213,7 +3941,11 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       Atomics.store(new Int32Array(barrier), 0, 1);
       Atomics.notify(new Int32Array(barrier), 0, workers.length);
       const results = await Promise.all(resultPromises);
-      assert.equal(results[0], results[1]);
+      assert.equal(results[0]?.incarnationId, results[1]?.incarnationId);
+      assert.deepEqual(
+        results.map((result) => result.handleState),
+        ["closed", "closed"],
+      );
       const database = new DatabaseSync(path, { readOnly: true });
       try {
         assert.equal(
@@ -3290,6 +4022,713 @@ describe("Qodo Round 7 concurrency-safe SQLite rollback", () => {
       assert.equal(sqliteDurableSnapshot(item.path).journalMode, "wal");
     } finally {
       rmSync(item.directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("R7.8 SQLite worker lock lifecycle", () => {
+  test("readiness rejects when initializer exits before its first message", async () => {
+    const member = spawnChildProtocolFixture(
+      "process.exit(23)",
+      "exit-before-ready",
+    );
+    try {
+      await member.protocol.waitForLifecycle("exit");
+      await assert.rejects(
+        member.protocol.waitForFirstMessage("modules_loaded"),
+        (error: unknown) => {
+          assert.equal(error instanceof InitializerWorkerProtocolError, true);
+          const protocolError = error as InitializerWorkerProtocolError;
+          assert.equal(protocolError.lifecycle, "exit");
+          assert.equal(protocolError.exitCode, 23);
+          assert.equal(protocolError.signal, null);
+          assert.equal(protocolError.workerIdentity, "exit-before-ready");
+          return true;
+        },
+      );
+    } finally {
+      await stopInitializerProcess(member);
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
+    }
+  });
+
+  test("spawn readiness validates semantic ENOENT without native errno", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-spawn-error-"));
+    const member = spawnMissingInitializerProcess(
+      join(directory, "missing-initializer"),
+      "spawn-error",
+    );
+    try {
+      await assert.rejects(
+        member.protocol.waitForFirstMessage("modules_loaded"),
+        (error: unknown) => isSemanticSpawnError(error, "spawn-error", "ENOENT"),
+      );
+      const snapshot = member.protocol.lifecycleSnapshot();
+      assert.equal(snapshot.errorCode, "ENOENT");
+      assert.match(snapshot.syscall ?? "", /^spawn(?:\s|$)/u);
+      assert.equal(snapshot.workerIdentity, "spawn-error");
+
+      for (const errno of [-2, -4058]) {
+        const source = Object.assign(new Error("missing executable"), {
+          code: "ENOENT",
+          errno,
+          syscall: "spawn missing-initializer",
+        });
+        const semantic = new InitializerWorkerProtocolError({
+          cause: source,
+          errorCode: source.code,
+          exitCode: null,
+          lifecycle: "error",
+          message: "semantic spawn fixture",
+          signal: null,
+          syscall: source.syscall,
+          workerIdentity: "spawn-shape",
+        });
+        assert.equal(
+          isSemanticSpawnError(semantic, "spawn-shape", "ENOENT"),
+          true,
+        );
+      }
+
+      const unrelated = new InitializerWorkerProtocolError({
+        errorCode: "EACCES",
+        exitCode: null,
+        lifecycle: "error",
+        message: "unrelated spawn fixture",
+        signal: null,
+        syscall: "spawn missing-initializer",
+        workerIdentity: "spawn-shape",
+      });
+      assert.equal(
+        isSemanticSpawnError(unrelated, "spawn-shape", "ENOENT"),
+        false,
+      );
+    } finally {
+      await stopInitializerProcess(member);
+      rmSync(directory, { recursive: true, force: true });
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
+    }
+  });
+
+  test("readiness rejects when initializer disconnects before its first message", async () => {
+    const member = spawnChildProtocolFixture(
+      String.raw`
+        process.disconnect();
+        setImmediate(() => {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        });
+      `,
+      "disconnect-before-ready",
+    );
+    try {
+      await member.protocol.waitForLifecycle("disconnect");
+      await assert.rejects(
+        member.protocol.waitForFirstMessage("modules_loaded"),
+        /worker=disconnect-before-ready initializer disconnected before modules_loaded/iu,
+      );
+    } finally {
+      await stopInitializerProcess(member);
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
+    }
+  });
+
+  for (const lifecycle of ["exit", "disconnect", "error"] as const) {
+    test(`${lifecycle} between phases rejects immediately from buffered lifecycle state`, async () => {
+      const member = spawnChildProtocolFixture(
+        String.raw`
+          process.on("message", (message) => {
+            if (message?.kind === "start") {
+              process.send({ kind: "modules_loaded", storeKind: "m2" });
+            } else if (message?.kind === "exit") {
+              process.exit(31);
+            } else if (message?.kind === "disconnect") {
+              process.disconnect();
+              setImmediate(() => {
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+              });
+            }
+          });
+        `,
+        `${lifecycle}-between-phases`,
+      );
+      try {
+        const readiness = member.protocol.waitForFirstMessage("modules_loaded");
+        await sendChildMessage(member.child, { kind: "start" });
+        await readiness;
+        if (lifecycle === "error") {
+          member.child.emit(
+            "error",
+            Object.assign(new Error("planned inter-phase error"), {
+              code: "EIO",
+              syscall: "planned-worker-operation",
+            }),
+          );
+        } else {
+          await sendChildMessage(member.child, { kind: lifecycle });
+        }
+        await member.protocol.waitForLifecycle(lifecycle);
+
+        let rejected = false;
+        void member.protocol.waitForMessage("operation_committed").catch(() => {
+          rejected = true;
+        });
+        await Promise.resolve();
+        assert.equal(rejected, true);
+        await assert.rejects(
+          member.protocol.waitForMessage("operation_committed"),
+          (error: unknown) => {
+            assert.equal(error instanceof InitializerWorkerProtocolError, true);
+            const protocolError = error as InitializerWorkerProtocolError;
+            assert.equal(protocolError.lifecycle, lifecycle);
+            assert.equal(
+              protocolError.workerIdentity,
+              `${lifecycle}-between-phases`,
+            );
+            if (lifecycle === "exit") assert.equal(protocolError.exitCode, 31);
+            if (lifecycle === "error") assert.equal(protocolError.errorCode, "EIO");
+            return true;
+          },
+        );
+      } finally {
+        await stopInitializerProcess(member);
+      }
+      for (const event of ["disconnect", "error", "exit", "message"]) {
+        assert.equal(member.child.listenerCount(event), 0, event);
+      }
+    });
+  }
+
+  test("later-phase messages are buffered and delivered exactly once", async () => {
+    const member = spawnChildProtocolFixture(
+      String.raw`
+        process.on("message", (message) => {
+          if (message?.kind === "start") {
+            process.send({ kind: "modules_loaded", storeKind: "m2" });
+            process.send({ kind: "operation_committed", sequence: 1 });
+          } else if (message?.kind === "exit") {
+            process.exit(0);
+          }
+        });
+      `,
+      "buffered-message",
+    );
+    let readinessSettlements = 0;
+    try {
+      const readiness = member.protocol.waitForFirstMessage("modules_loaded");
+      void readiness.then(
+        () => {
+          readinessSettlements += 1;
+        },
+        () => {
+          readinessSettlements += 1;
+        },
+      );
+      await sendChildMessage(member.child, { kind: "start" });
+      assert.equal((await readiness)["storeKind"], "m2");
+      assert.equal(readinessSettlements, 1);
+      assert.equal(
+        (await member.protocol.waitForMessage("operation_committed"))["sequence"],
+        1,
+      );
+
+      const duplicate = member.protocol.waitForMessage("operation_committed");
+      await sendChildMessage(member.child, { kind: "exit" });
+      await assert.rejects(duplicate, (error: unknown) => {
+        assert.equal(error instanceof InitializerWorkerProtocolError, true);
+        const protocolError = error as InitializerWorkerProtocolError;
+        assert.equal(
+          protocolError.lifecycle === "disconnect" ||
+            protocolError.lifecycle === "exit",
+          true,
+        );
+        assert.equal(protocolError.workerIdentity, "buffered-message");
+        return true;
+      });
+      await member.protocol.waitForSuccessfulExit();
+      assert.equal(readinessSettlements, 1);
+    } finally {
+      await stopInitializerProcess(member);
+    }
+    for (const event of ["disconnect", "error", "exit", "message"]) {
+      assert.equal(member.child.listenerCount(event), 0, event);
+    }
+  });
+
+  test("one startup failure releases ownership and reaps its cohort", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-cohort-"));
+    const path = join(directory, "m2.sqlite");
+    const initial = createStore({ path, initialState: initialState() });
+    initial.close();
+    const blocker = new DatabaseSync(path);
+    blocker.exec("BEGIN IMMEDIATE");
+    const children = [
+      spawnChildProtocolFixture("process.exit(41)", "cohort-0"),
+      spawnChildProtocolFixture(
+        'process.on("message", () => {})',
+        "cohort-1",
+      ),
+      spawnChildProtocolFixture(
+        'process.on("message", () => {})',
+        "cohort-2",
+      ),
+    ];
+    let ownershipReleaseCount = 0;
+    try {
+      await assert.rejects(
+        waitForInitializerCohortReadiness(
+          children,
+          () => {
+            ownershipReleaseCount += 1;
+            if (blocker.isTransaction) blocker.exec("ROLLBACK");
+            if (blocker.isOpen) blocker.close();
+          },
+        ),
+        /worker=cohort-0 initializer (?:disconnected|exited) before modules_loaded/iu,
+      );
+      assert.equal(ownershipReleaseCount, 1);
+      for (const { child } of children) {
+        assert.equal(
+          child.exitCode !== null || child.signalCode !== null,
+          true,
+        );
+        for (const event of ["disconnect", "error", "exit", "message"]) {
+          assert.equal(child.listenerCount(event), 0, event);
+        }
+      }
+      const reader = new DatabaseSync(path);
+      try {
+        reader.exec("BEGIN IMMEDIATE; ROLLBACK");
+        assert.equal(
+          (reader.prepare("PRAGMA quick_check").get() as Record<
+            string,
+            unknown
+          >)["quick_check"],
+          "ok",
+        );
+      } finally {
+        reader.close();
+      }
+    } finally {
+      if (blocker.isOpen) {
+        if (blocker.isTransaction) blocker.exec("ROLLBACK");
+        blocker.close();
+      }
+      await Promise.all(children.map(stopInitializerProcess));
+      rmSync(directory, { recursive: true, force: true });
+    }
+    assert.equal(existsSync(directory), false);
+  });
+
+  test("initializer readiness follows module loading", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-r78-modules-"));
+    const member = spawnInitializerProcess(
+      {
+        factoryModuleUrl: new URL(
+          "../src/factory-environment.js",
+          import.meta.url,
+        ).href,
+        path: join(directory, "m2.sqlite"),
+        sqliteModuleUrl: new URL("../src/sqlite.js", import.meta.url).href,
+        storeKind: "m2",
+      },
+      "module-readiness",
+    );
+    try {
+      const firstMessage =
+        await member.protocol.waitForFirstMessage("modules_loaded");
+      assert.equal(firstMessage["kind"], "modules_loaded");
+      assert.equal(firstMessage["storeKind"], "m2");
+    } finally {
+      await stopInitializerProcess(member);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("ready long-lived M2 and factory handles permit independent reads", async () => {
+    const workerSource = String.raw`
+      const { parentPort, workerData } = require("node:worker_threads");
+      let resource;
+      parentPort.postMessage({ kind: "ready" });
+      Atomics.wait(new Int32Array(workerData.startBarrier), 0, 0);
+      (async () => {
+        if (workerData.storeKind === "m2") {
+          const { openSqlite } = await import(workerData.sqliteModuleUrl);
+          resource = openSqlite(workerData.path);
+        } else {
+          const { SyntheticFactoryEnvironment } = await import(
+            workerData.factoryModuleUrl
+          );
+          resource = new SyntheticFactoryEnvironment({ path: workerData.path });
+        }
+        parentPort.postMessage({ kind: "opened", handleState: "open" });
+        Atomics.wait(new Int32Array(workerData.closeBarrier), 0, 0);
+        resource.close();
+        resource = undefined;
+        parentPort.postMessage({ kind: "closed", handleState: "closed" });
+      })().catch((error) => {
+        try { resource?.close(); } catch {}
+        parentPort.postMessage({
+          kind: "error",
+          message: String(error?.message ?? error),
+        });
+      });
+    `;
+    const sqliteModuleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const factoryModuleUrl = new URL(
+      "../src/factory-environment.js",
+      import.meta.url,
+    ).href;
+
+    for (const storeKind of ["m2", "factory"] as const) {
+      const directory = mkdtempSync(
+        join(tmpdir(), `flakebrake-r78-open-${storeKind}-`),
+      );
+      const path = join(directory, `${storeKind}.sqlite`);
+      const startBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const closeBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const worker = new Worker(workerSource, {
+        eval: true,
+        workerData: {
+          closeBarrier,
+          factoryModuleUrl,
+          path,
+          sqliteModuleUrl,
+          startBarrier,
+          storeKind,
+        },
+      });
+      try {
+        await waitForWorkerMessage(worker, "ready");
+        const openedPromise = waitForWorkerMessage(worker, "opened");
+        Atomics.store(new Int32Array(startBarrier), 0, 1);
+        Atomics.notify(new Int32Array(startBarrier), 0, 1);
+        const opened = await openedPromise;
+        assert.equal(opened["handleState"], "open");
+
+        const reader = new DatabaseSync(path, { readOnly: true });
+        try {
+          assert.equal(
+            Number(
+              (
+                reader
+                  .prepare("SELECT COUNT(*) AS count FROM database_incarnation")
+                  .get() as Record<string, unknown>
+              )["count"],
+            ),
+            1,
+          );
+          assert.equal(
+            (reader.prepare("PRAGMA quick_check").get() as Record<
+              string,
+              unknown
+            >)["quick_check"],
+            "ok",
+          );
+        } finally {
+          reader.close();
+        }
+
+        const closedPromise = waitForWorkerMessage(worker, "closed");
+        const exitPromise = waitForWorkerExit(worker);
+        Atomics.store(new Int32Array(closeBarrier), 0, 1);
+        Atomics.notify(new Int32Array(closeBarrier), 0, 1);
+        const closed = await closedPromise;
+        assert.equal(closed["handleState"], "closed");
+        await exitPromise;
+      } finally {
+        await worker.terminate();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("worker initialization failures acknowledge only after cleanup", async () => {
+    const workerSource = String.raw`
+      const { DatabaseSync } = require("node:sqlite");
+      const { parentPort, workerData } = require("node:worker_threads");
+      const originalExec = DatabaseSync.prototype.exec;
+      let injected = false;
+      DatabaseSync.prototype.exec = function (sql) {
+        originalExec.call(this, sql);
+        if (!injected && sql.includes(workerData.failureMarker)) {
+          injected = true;
+          throw new Error("planned initializer worker failure");
+        }
+      };
+      parentPort.postMessage({ kind: "ready" });
+      Atomics.wait(new Int32Array(workerData.startBarrier), 0, 0);
+      (async () => {
+        try {
+          if (workerData.storeKind === "m2") {
+            const { openSqlite } = await import(workerData.sqliteModuleUrl);
+            openSqlite(workerData.path);
+          } else {
+            const { SyntheticFactoryEnvironment } = await import(
+              workerData.factoryModuleUrl
+            );
+            new SyntheticFactoryEnvironment({ path: workerData.path });
+          }
+          throw new Error("initializer failure was not injected");
+        } catch (error) {
+          DatabaseSync.prototype.exec = originalExec;
+          parentPort.postMessage({
+            kind: "failure-cleaned",
+            handleState: "closed",
+            injected,
+            planned: String(error?.message ?? error).includes(
+              "planned initializer worker failure"
+            ),
+          });
+        }
+      })().catch((error) => {
+        DatabaseSync.prototype.exec = originalExec;
+        parentPort.postMessage({
+          kind: "error",
+          message: String(error?.message ?? error),
+        });
+      });
+    `;
+    const sqliteModuleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const factoryModuleUrl = new URL(
+      "../src/factory-environment.js",
+      import.meta.url,
+    ).href;
+
+    for (const fixture of [
+      {
+        construct: (path: string) =>
+          createStore({ path, initialState: initialState() }),
+        failureMarker: "admission_records_immutable_update",
+        storeKind: "m2",
+      },
+      {
+        construct: (path: string) => new SyntheticFactoryEnvironment({ path }),
+        failureMarker: "incoming_proposals_no_update",
+        storeKind: "factory",
+      },
+    ] as const) {
+      const directory = mkdtempSync(
+        join(tmpdir(), `flakebrake-r78-error-${fixture.storeKind}-`),
+      );
+      const path = join(directory, `${fixture.storeKind}.sqlite`);
+      const startBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const worker = new Worker(workerSource, {
+        eval: true,
+        workerData: {
+          factoryModuleUrl,
+          failureMarker: fixture.failureMarker,
+          path,
+          sqliteModuleUrl,
+          startBarrier,
+          storeKind: fixture.storeKind,
+        },
+      });
+      try {
+        await waitForWorkerMessage(worker, "ready");
+        const cleanedPromise = waitForWorkerMessage(
+          worker,
+          "failure-cleaned",
+        );
+        const exitPromise = waitForWorkerExit(worker);
+        Atomics.store(new Int32Array(startBarrier), 0, 1);
+        Atomics.notify(new Int32Array(startBarrier), 0, 1);
+        const cleaned = await cleanedPromise;
+        assert.equal(cleaned["handleState"], "closed");
+        assert.equal(cleaned["injected"], true);
+        assert.equal(cleaned["planned"], true);
+        for (const artifact of [
+          path,
+          `${path}-wal`,
+          `${path}-shm`,
+          `${path}-journal`,
+        ]) {
+          assert.equal(existsSync(artifact), false, artifact);
+        }
+
+        const restarted = fixture.construct(path);
+        restarted.close();
+        const reader = new DatabaseSync(path, { readOnly: true });
+        try {
+          assert.equal(
+            (reader.prepare("PRAGMA quick_check").get() as Record<
+              string,
+              unknown
+            >)["quick_check"],
+            "ok",
+          );
+        } finally {
+          reader.close();
+        }
+        await exitPromise;
+      } finally {
+        await worker.terminate();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("independent initializer processes close before completion under repeated contention", async () => {
+    assert.equal(/setTimeout|sleep/iu.test(INITIALIZER_PROCESS_SOURCE), false);
+    const sqliteModuleUrl = new URL("../src/sqlite.js", import.meta.url).href;
+    const factoryModuleUrl = new URL(
+      "../src/factory-environment.js",
+      import.meta.url,
+    ).href;
+    const processCount = 4;
+    const rounds = 4;
+
+    for (const fixture of [
+      {
+        create: (path: string) =>
+          createStore({ path, initialState: initialState() }),
+        storeKind: "m2",
+      },
+      {
+        create: (path: string) => new SyntheticFactoryEnvironment({ path }),
+        storeKind: "factory",
+      },
+    ] as const) {
+      const directory = mkdtempSync(
+        join(tmpdir(), `flakebrake-r78-process-${fixture.storeKind}-`),
+      );
+      const path = join(directory, `${fixture.storeKind}.sqlite`);
+      const initial = fixture.create(path);
+      initial.close();
+      const before = sqliteDurableSnapshot(path);
+      const identities = new Set<string>();
+      try {
+        for (let round = 0; round < rounds; round += 1) {
+          const blocker = new DatabaseSync(path);
+          blocker.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+          const children = Array.from(
+            { length: processCount },
+            (_, index) =>
+              spawnInitializerProcess(
+                {
+                  factoryModuleUrl,
+                  path,
+                  sqliteModuleUrl,
+                  storeKind: fixture.storeKind,
+                },
+                `${fixture.storeKind}-round-${String(round)}-worker-${String(index)}`,
+              ),
+          );
+          try {
+            const modulesLoaded = await waitForInitializerCohortReadiness(
+              children,
+              () => {
+                if (blocker.isTransaction) blocker.exec("ROLLBACK");
+                if (blocker.isOpen) blocker.close();
+              },
+            );
+            assert.deepEqual(
+              modulesLoaded.map((message) => message["storeKind"]),
+              Array.from({ length: processCount }, () => fixture.storeKind),
+            );
+
+            const contentionObserved = children.map(({ protocol }) =>
+              protocol.waitForMessage("sqlite_contention_observed"),
+            );
+            await Promise.all(
+              children.map(({ child }) =>
+                sendChildMessage(child, {
+                  kind: "probe_sqlite_contention",
+                }),
+              ),
+            );
+            const observations = await Promise.all(contentionObserved);
+            assert.equal(observations.length, processCount);
+            for (const observation of observations) {
+              assert.equal(
+                observation["sqliteCode"] === 5 ||
+                  observation["sqliteCode"] === 6,
+                true,
+              );
+            }
+
+            blocker.exec("COMMIT");
+            blocker.close();
+
+            const committed = children.map(({ protocol }) =>
+              protocol.waitForMessage("operation_committed"),
+            );
+            const closed = children.map(({ protocol }) =>
+              protocol.waitForMessage("handle_closed"),
+            );
+            const exited = children.map(({ protocol }) =>
+              protocol.waitForSuccessfulExit(),
+            );
+            await Promise.all(
+              children.map(({ child }) =>
+                sendChildMessage(child, { kind: "initialize" }),
+              ),
+            );
+            const committedResults = await Promise.all(committed);
+            for (const result of committedResults) {
+              assert.equal(result["handleState"], "open");
+            }
+            const closedResults = await Promise.all(closed);
+            for (let index = 0; index < closedResults.length; index += 1) {
+              const result = closedResults[index];
+              assert.equal(result?.["handleState"], "closed");
+              assert.equal(
+                result?.["identity"],
+                committedResults[index]?.["identity"],
+              );
+              identities.add(String(result?.["identity"]));
+            }
+            const reader = new DatabaseSync(path, { readOnly: true });
+            try {
+              assert.equal(
+                Number(
+                  (
+                    reader
+                      .prepare(
+                        "SELECT COUNT(*) AS count FROM database_incarnation",
+                      )
+                      .get() as Record<string, unknown>
+                  )["count"],
+                ),
+                1,
+              );
+              assert.equal(
+                (reader.prepare("PRAGMA quick_check").get() as Record<
+                  string,
+                  unknown
+                >)["quick_check"],
+                "ok",
+              );
+            } finally {
+              reader.close();
+            }
+            await Promise.all(exited);
+          } finally {
+            if (blocker.isOpen) {
+              if (blocker.isTransaction) blocker.exec("ROLLBACK");
+              blocker.close();
+            }
+            await Promise.all(children.map(stopInitializerProcess));
+          }
+        }
+        assert.equal(identities.size, 1);
+        const after = sqliteDurableSnapshot(path);
+        assert.deepEqual(after.schema, before.schema);
+        assert.deepEqual(after.columns, before.columns);
+        assert.deepEqual(after.foreignKeys, before.foreignKeys);
+        assert.deepEqual(after.indexes, before.indexes);
+        assert.deepEqual(after.metadata, before.metadata);
+        assert.deepEqual(after.rows, before.rows);
+        assert.deepEqual(after.triggers, before.triggers);
+        assert.equal(after.journalMode, "wal");
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
     }
   });
 });
