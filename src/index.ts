@@ -102,3 +102,9 @@ export type * from "./m4-live.js";
 export { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 export { DuplicateJsonKeyError } from "./strict-json.js";
 export { readDatabaseInstanceIdentity } from "./sqlite.js";
+export {
+  M5DemoCoordinator,
+  M5RequestError,
+  startM5JudgeServer,
+} from "./m5-ui.js";
+export type * from "./m5-ui.js";

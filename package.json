@@ -9,16 +9,21 @@
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-m5-assets.mjs",
     "mcp:all": "npm run build --silent && node dist/src/mcp-cli.js --all",
     "mcp:serve": "npm run build --silent && node dist/src/mcp-cli.js",
     "m4:mission": "npm run build --silent && node dist/src/m4-cli.js",
     "m4:live": "npm run build --silent && node dist/src/m4-cli.js --live",
+    "m5:ui": "npm run build --silent && node dist/src/m5-cli.js",
     "test": "npm run build --silent && node --test --experimental-test-isolation=none dist/test/*.test.js",
+    "test:m5": "npm run build --silent && node --test --experimental-test-isolation=none dist/test/m5-ui.test.js",
+    "test:m5:browser": "npm run build --silent && node dist/test/m5-browser-smoke.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/selenium-webdriver": "4.35.6",
+    "selenium-webdriver": "4.48.0",
     "typescript": "^5.9.0"
   },
   "dependencies": {
