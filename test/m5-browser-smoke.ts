@@ -17,6 +17,7 @@ const running = await startM5JudgeServer({
 });
 let driver: WebDriver | null = null;
 let smokeStage = "startup";
+let primaryError: unknown = null;
 
 try {
   const options = new firefox.Options().addArguments("-headless");
@@ -123,7 +124,7 @@ try {
   await screenshot(browser, join(screenshots, "05-tablet.png"));
   process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
 } catch (error: unknown) {
-  const durable = (await fetch(`${running.url}/api/state`).then((response) => response.json())) as {
+  const durable = await fetch(`${running.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
     readonly run?: { readonly status?: string; readonly errorCode?: string | null };
     readonly pendingApproval?: { readonly toolName?: string } | null;
     readonly approvals?: readonly unknown[];
@@ -133,8 +134,8 @@ try {
       ? null
       : await driver.executeScript<Record<string, unknown>>(
           "return {connection: document.getElementById('connection-label')?.textContent, outcome: document.getElementById('outcome')?.textContent, verification: document.getElementById('verification-pill')?.textContent, toast: document.getElementById('toast')?.textContent, approvalClass: document.getElementById('approval-panel')?.className, approvalDigest: document.getElementById('approval-digest')?.textContent, allowDisabled: document.getElementById('allow-button')?.disabled, denyDisabled: document.getElementById('deny-button')?.disabled, guidance: document.getElementById('approval-guidance')?.textContent, approvalRequests: performance.getEntriesByType('resource').filter((item) => item.name.includes('/api/approval')).length};",
-        );
-  throw new Error(
+        ).catch(() => null);
+  primaryError = new Error(
     `M5 browser smoke stopped: ${JSON.stringify({
       runStatus: durable.run?.status ?? "unknown",
       errorCode: durable.run?.errorCode ?? null,
@@ -145,10 +146,38 @@ try {
     })}`,
     { cause: error },
   );
-} finally {
+}
+
+const cleanupErrors: unknown[] = [];
+try {
   await driver?.quit();
+  if (process.env["FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE"] === "1") {
+    throw new Error("injected Selenium shutdown failure");
+  }
+} catch (error: unknown) {
+  cleanupErrors.push(error);
+}
+try {
   await running.close();
+} catch (error: unknown) {
+  cleanupErrors.push(error);
+}
+try {
   rmSync(root, { recursive: true, force: true });
+} catch (error: unknown) {
+  cleanupErrors.push(error);
+}
+
+if (primaryError !== null) {
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError([primaryError, ...cleanupErrors], "M5 browser smoke and cleanup failed", {
+      cause: primaryError instanceof Error ? primaryError : undefined,
+    });
+  }
+  throw primaryError;
+}
+if (cleanupErrors.length > 0) {
+  throw new AggregateError(cleanupErrors, "M5 browser smoke cleanup failed");
 }
 
 await assert.rejects(fetch(running.url), /fetch failed|ECONNREFUSED/u);

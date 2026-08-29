@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { createContext, runInContext } from "node:vm";
 
 import {
   M5DemoCoordinator,
@@ -366,3 +370,332 @@ test("M5 coordinator rejects unowned data roots without mutation", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("M5 Round 1 reproduction: CLI close failure still removes its temporary root", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "flakebrake-m5-cli-close-"));
+  const child = spawn(process.execPath, [join(process.cwd(), "dist/src/m5-cli.js"), "--port", "0"], {
+    cwd: process.cwd(),
+    env: { ...process.env, TMPDIR: parent },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    await waitForChildOutput(child, "FlakeBrake judge UI ready:");
+    const roots = readdirSync(parent);
+    assert.equal(roots.length, 1);
+    writeFileSync(join(parent, roots[0] as string, ".flakebrake-m5-owned-v1"), "invalid\n");
+    child.kill("SIGTERM");
+    await waitForChildExit(child);
+    assert.deepEqual(readdirSync(parent), []);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await waitForChildExit(child).catch(() => undefined);
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 1 reproduction: a driver quit failure cannot skip server and data cleanup", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "flakebrake-m5-driver-close-"));
+  const child = spawn(process.execPath, [join(process.cwd(), "dist/test/m5-browser-smoke.js")], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      TMPDIR: parent,
+      FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    const result = await waitForChildExit(child, 120_000);
+    assert.notEqual(result.code, 0);
+    assert.deepEqual(findOwnedM5Roots(parent), []);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await waitForChildExit(child).catch(() => undefined);
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 1 reproduction: stale poll responses cannot regress newer UI state", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-poll-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const idle = coordinator.state();
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const terminal = uiProjection(idle, 3, "verified");
+    const oldResponse = deferred<M5JudgeState>();
+    const newResponse = deferred<M5JudgeState>();
+    const harness = await createPollingHarness(idle, [oldResponse.promise, newResponse.promise]);
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    const newPoll = harness.evaluate<Promise<void>>("refresh()");
+    newResponse.resolve(terminal);
+    await newPoll;
+    oldResponse.resolve(pending);
+    await oldPoll;
+    assert.equal(harness.text("outcome"), "Verified success");
+    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 1 reproduction: fragmented accepted requests cannot block bounded shutdown", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-fragment-"));
+  const running = await startM5JudgeServer({ dataRoot: directory, port: 0, cleanupDataOnClose: false });
+  let socket: Socket | null = null;
+  try {
+    ({ socket } = await acceptedFragmentedRequest(running));
+    const close = running.close();
+    const result = await Promise.race([
+      close.then(() => "closed" as const),
+      new Promise<"timed_out">((resolveTimeout) => setTimeout(() => resolveTimeout("timed_out"), 2_000)),
+    ]);
+    if (result === "timed_out") socket.destroy();
+    await close;
+    assert.equal(result, "closed");
+  } finally {
+    socket?.destroy();
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 1: shutdown rejects an accepted mutation and close is idempotent", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-post-close-"));
+  const running = await startM5JudgeServer({ dataRoot: directory, port: 0, cleanupDataOnClose: false });
+  let socket: Socket | null = null;
+  try {
+    const fragmented = await acceptedFragmentedRequest(running);
+    socket = fragmented.socket;
+    const generation = running.coordinator.state().run.generation;
+    const close = running.close();
+    socket.write(fragmented.remainder);
+    await close;
+    await running.close();
+    assert.equal(running.coordinator.state().run.generation, generation);
+    await assert.rejects(fetch(running.url), /fetch failed|ECONNREFUSED/u);
+  } finally {
+    socket?.destroy();
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 1: mutation and reset generations discard older responses", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-mutation-race-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const idle = coordinator.state();
+    const firstApproval = uiProjection(idle, 2, "awaiting_approval");
+    const nextApproval = {
+      ...uiProjection(idle, 3, "awaiting_approval"),
+      pendingApproval: {
+        ...(uiProjection(idle, 3, "awaiting_approval").pendingApproval as NonNullable<M5JudgeState["pendingApproval"]>),
+        actionIdentity: `sha256:${"b".repeat(64)}`,
+        expectedEffect: "Reserve the safe alternative",
+      },
+    };
+    const staleMutation = deferred<unknown>();
+    const freshPoll = deferred<unknown>();
+    const harness = await createPollingHarness(idle, [staleMutation.promise, freshPoll.promise]);
+    const mutation = harness.evaluate<Promise<void>>(
+      `mutate("/api/approval", {missionId: ${JSON.stringify(idle.mission.missionId)}, actionIdentity: ${JSON.stringify(firstApproval.pendingApproval?.actionIdentity)}, decision: "deny", reason: "bounded", requestId: "race-approval"})`,
+    );
+    const poll = harness.evaluate<Promise<void>>("refresh()");
+    freshPoll.resolve(nextApproval);
+    await poll;
+    staleMutation.resolve({ state: firstApproval });
+    await mutation;
+    assert.equal(harness.text("approval-digest"), nextApproval.pendingApproval?.actionIdentity);
+
+    const stalePoll = deferred<unknown>();
+    const resetResponse = deferred<unknown>();
+    harness.enqueue(stalePoll.promise, resetResponse.promise);
+    const pollBeforeReset = harness.evaluate<Promise<void>>("refresh()");
+    const reset = harness.evaluate<Promise<void>>(
+      'mutate("/api/mission", {operation: "reset", requestId: "race-reset"})',
+    );
+    resetResponse.resolve({ state: { ...idle, revision: 4, run: { ...idle.run, generation: idle.run.generation + 1 } } });
+    await reset;
+    stalePoll.resolve(nextApproval);
+    await pollBeforeReset;
+    assert.equal(harness.text("outcome"), "Waiting");
+    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 1: reconnect generation invalidates responses issued before disconnect", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-reconnect-race-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const idle = coordinator.state();
+    const stale = deferred<unknown>();
+    const disconnected = deferred<unknown>();
+    const terminal = uiProjection(idle, 5, "verified");
+    const harness = await createPollingHarness(idle, [stale.promise, disconnected.promise]);
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    const reconnect = harness.evaluate<Promise<void>>("refresh()");
+    disconnected.reject(new Error("controlled disconnect"));
+    await reconnect;
+    harness.enqueue(Promise.resolve(terminal));
+    await harness.evaluate<Promise<void>>("refresh()");
+    stale.resolve(uiProjection(idle, 2, "awaiting_approval"));
+    await oldPoll;
+    assert.equal(harness.text("outcome"), "Verified success");
+    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+async function acceptedFragmentedRequest(running: RunningM5JudgeServer): Promise<{ socket: Socket; remainder: string }> {
+  const socket = createConnection({ host: "127.0.0.1", port: running.port });
+  await once(socket, "connect");
+  const body = JSON.stringify({ operation: "reset", requestId: "judge-fragmented-close-0001" });
+  const fragmentLength = 3;
+  socket.write(
+    `POST /api/mission HTTP/1.1\r\nHost: 127.0.0.1:${running.port}\r\nOrigin: ${running.url}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nExpect: 100-continue\r\nConnection: keep-alive\r\n\r\n${body.slice(0, fragmentLength)}`,
+  );
+  let response = "";
+  while (!response.includes("100 Continue")) {
+    const [chunk] = await once(socket, "data") as [Buffer];
+    response += chunk.toString("utf8");
+  }
+  return { socket, remainder: body.slice(fragmentLength) };
+}
+
+async function waitForChildOutput(child: ChildProcess, text: string, timeout = 20_000): Promise<void> {
+  let output = "";
+  await new Promise<void>((resolveReady, rejectReady) => {
+    const timer = setTimeout(() => rejectReady(new Error(`child did not report ${text}`)), timeout);
+    const inspect = (chunk: Buffer): void => {
+      output += chunk.toString("utf8");
+      if (output.includes(text)) {
+        clearTimeout(timer);
+        child.stdout?.off("data", inspect);
+        resolveReady();
+      }
+    };
+    child.stdout?.on("data", inspect);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      rejectReady(new Error(`child exited before readiness (${String(code)}/${String(signal)})`));
+    });
+  });
+}
+
+async function waitForChildExit(child: ChildProcess, timeout = 20_000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
+  return await new Promise((resolveExit, rejectExit) => {
+    const timer = setTimeout(() => rejectExit(new Error("child did not exit")), timeout);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolveExit({ code, signal });
+    });
+  });
+}
+
+function findOwnedM5Roots(parent: string): readonly string[] {
+  return readdirSync(parent)
+    .map((entry) => join(parent, entry))
+    .filter((path) => existsSync(join(path, ".flakebrake-m5-owned-v1")));
+}
+
+function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {
+  let resolvePromise!: (value: T) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolveValue, rejectValue) => {
+    resolvePromise = resolveValue;
+    rejectPromise = rejectValue;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
+
+function uiProjection(base: M5JudgeState, revision: number, status: "awaiting_approval" | "verified"): M5JudgeState {
+  return {
+    ...base,
+    revision,
+    run: { ...base.run, status, connection: status === "verified" ? "connected" : "awaiting_owner" },
+    mission: { ...base.mission, sessionId: "session/ui-race", currentTurnId: "turn/ui-race" },
+    pendingApproval: status === "verified" ? null : {
+      missionId: base.mission.missionId,
+      actionIdentity: `sha256:${"a".repeat(64)}`,
+      phase: "consequential_effect",
+      toolName: "create_schedule_reservation",
+      expectedEffect: "Reserve the primary interval",
+      recommendedDecision: "deny",
+      ownerSourceIdentity: "owner/judge-ui",
+    },
+    execution: status === "verified"
+      ? { ...base.execution, terminalStatus: "terminal_verified", mutationCount: 1, receiptCount: 1, attemptCount: 1, acceptanceCount: 1, actualFactCount: 2 }
+      : base.execution,
+  };
+}
+
+async function createPollingHarness(initial: M5JudgeState, responses: readonly Promise<unknown>[]): Promise<{
+  evaluate<T>(source: string): T;
+  enqueue(...responses: readonly Promise<unknown>[]): void;
+  text(id: string): string;
+  hasClass(id: string, className: string): boolean;
+}> {
+  const nodeMap = new Map<string, FakeNode>();
+  const responseQueue = [Promise.resolve(initial), ...responses];
+  const context = createContext({
+    console,
+    Date,
+    document: { getElementById: (id: string) => fakeNode(nodeMap, id) },
+    fetch: async () => ({ ok: true, json: async () => await (responseQueue.shift() as Promise<unknown>) }),
+    setInterval: () => 1,
+    clearInterval: () => undefined,
+    setTimeout,
+    clearTimeout,
+    addEventListener: () => undefined,
+  });
+  (context as Record<string, unknown>)["window"] = context;
+  runInContext(readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8"), context);
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  return {
+    evaluate: <T>(source: string): T => runInContext(source, context) as T,
+    enqueue: (...items): void => { responseQueue.push(...items); },
+    text: (id: string): string => fakeNode(nodeMap, id).textContent,
+    hasClass: (id: string, className: string): boolean => fakeNode(nodeMap, id).classList.values.has(className),
+  };
+}
+
+interface FakeNode {
+  textContent: string;
+  innerHTML: string;
+  className: string;
+  disabled: boolean;
+  classList: { readonly values: Set<string>; add(...values: string[]): void; remove(...values: string[]): void; toggle(value: string, force?: boolean): boolean };
+  addEventListener(): void;
+}
+
+function fakeNode(nodes: Map<string, FakeNode>, id: string): FakeNode {
+  const existing = nodes.get(id);
+  if (existing !== undefined) return existing;
+  const values = new Set<string>();
+  const node: FakeNode = {
+    textContent: "",
+    innerHTML: "",
+    className: "",
+    disabled: false,
+    classList: {
+      values,
+      add: (...items) => { for (const item of items) values.add(item); },
+      remove: (...items) => { for (const item of items) values.delete(item); },
+      toggle: (item, force) => {
+        const active = force ?? !values.has(item);
+        if (active) values.add(item); else values.delete(item);
+        return active;
+      },
+    },
+    addEventListener: () => undefined,
+  };
+  nodes.set(id, node);
+  return node;
+}

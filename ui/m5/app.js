@@ -14,6 +14,9 @@ let poll = null;
 let requestCounter = 0;
 let missionMutationInFlight = false;
 let approvalMutationInFlight = null;
+let responseGeneration = 1;
+let responseSequence = 0;
+let latestAppliedSequence = 0;
 
 function escapeHtml(value) {
   return String(value)
@@ -42,11 +45,15 @@ async function api(path, options = {}) {
 }
 
 async function refresh() {
+  const token = responseToken();
   try {
-    state = await api("/api/state");
-    render();
-    nodes["connection-dot"].classList.add("connected");
+    const candidate = await api("/api/state");
+    if (applyState(candidate, token, false)) {
+      nodes["connection-dot"].classList.add("connected");
+    }
   } catch (error) {
+    if (!isCurrentResponse(token)) return;
+    invalidateResponses();
     nodes["connection-dot"].classList.remove("connected");
     nodes["connection-label"].textContent = "Reconnecting…";
     showError(error instanceof Error ? error.message : "State refresh failed safely");
@@ -62,6 +69,8 @@ async function mutate(path, body) {
     if (missionMutationInFlight) return;
     missionMutationInFlight = true;
   }
+  invalidateResponses();
+  const token = responseToken();
   render();
   try {
     const response = await api(path, {
@@ -69,8 +78,7 @@ async function mutate(path, body) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    state = response.state;
-    render();
+    applyState(response.state, token, path === "/api/mission" && body.operation === "reset");
   } catch (error) {
     showError(error instanceof Error ? error.message : "Request failed safely");
     await refresh();
@@ -79,6 +87,45 @@ async function mutate(path, body) {
     else missionMutationInFlight = false;
     render();
   }
+}
+
+function responseToken() {
+  responseSequence += 1;
+  return { generation: responseGeneration, sequence: responseSequence };
+}
+
+function invalidateResponses() {
+  responseGeneration += 1;
+  latestAppliedSequence = 0;
+}
+
+function isCurrentResponse(token) {
+  return token.generation === responseGeneration && token.sequence >= latestAppliedSequence;
+}
+
+function applyState(candidate, token, allowTerminalReset) {
+  if (!isCurrentResponse(token)) return false;
+  if (state !== null) {
+    const currentTerminal = state.run.status === "verified" || state.run.status === "failed";
+    const candidateTerminal = candidate.run.status === "verified" || candidate.run.status === "failed";
+    if (currentTerminal && !candidateTerminal && !allowTerminalReset) return false;
+    if (candidate.run.generation < state.run.generation) return false;
+    if (
+      candidate.run.generation === state.run.generation &&
+      candidate.revision < state.revision
+    ) return false;
+    if (
+      state.mission.sessionId !== null &&
+      candidate.mission.sessionId !== null &&
+      candidate.mission.sessionId !== state.mission.sessionId &&
+      !allowTerminalReset
+    ) return false;
+    if (candidate.mission.missionId !== state.mission.missionId && !allowTerminalReset) return false;
+  }
+  latestAppliedSequence = token.sequence;
+  state = candidate;
+  render();
+  return true;
 }
 
 function render() {

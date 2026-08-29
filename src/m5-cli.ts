@@ -69,8 +69,15 @@ async function main(arguments_: readonly string[]): Promise<void> {
     port: parsed.port,
     cleanupDataOnClose: temporary,
   }).catch(async (error: unknown) => {
-    if (temporary) await rm(dataRoot, { recursive: true, force: true });
-    throw error;
+    const cleanupErrors: unknown[] = [];
+    if (temporary) {
+      try {
+        await rm(dataRoot, { recursive: true, force: true });
+      } catch (cleanupError: unknown) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    throw attachCleanupDiagnostics(error, cleanupErrors, "M5 startup failed during cleanup");
   });
   process.stdout.write(`FlakeBrake judge UI ready: ${running.url}\n`);
   process.stdout.write("Press Ctrl+C to stop.\n");
@@ -79,8 +86,22 @@ async function main(arguments_: readonly string[]): Promise<void> {
   const stop = (): Promise<void> => {
     if (stopping !== null) return stopping;
     stopping = (async () => {
-      await running.close();
-      if (temporary) await rm(dataRoot, { recursive: true, force: true });
+      const cleanupErrors: unknown[] = [];
+      try {
+        await running.close();
+      } catch (error: unknown) {
+        cleanupErrors.push(error);
+      }
+      if (temporary) {
+        try {
+          await rm(dataRoot, { recursive: true, force: true });
+        } catch (error: unknown) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(cleanupErrors, "M5 CLI cleanup failed");
+      }
     })();
     return stopping;
   };
@@ -90,6 +111,17 @@ async function main(arguments_: readonly string[]): Promise<void> {
     };
     process.once("SIGINT", signal);
     process.once("SIGTERM", signal);
+  });
+}
+
+function attachCleanupDiagnostics(
+  primaryError: unknown,
+  cleanupErrors: readonly unknown[],
+  message: string,
+): unknown {
+  if (cleanupErrors.length === 0) return primaryError;
+  return new AggregateError([primaryError, ...cleanupErrors], message, {
+    cause: primaryError instanceof Error ? primaryError : undefined,
   });
 }
 

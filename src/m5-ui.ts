@@ -15,6 +15,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import type { Socket } from "node:net";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,6 +55,7 @@ const OWNERSHIP_MARKER = ".flakebrake-m5-owned-v1";
 const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_RECORDS = 256;
 const HERO_ATTEMPT_ID = "attempt/m4-approved-alternative";
+const DEFAULT_REQUEST_DRAIN_TIMEOUT_MS = 500;
 
 export type M5RunStatus =
   | "idle"
@@ -839,6 +841,7 @@ export class M5DemoCoordinator {
 export interface StartM5JudgeServerOptions extends M5DemoCoordinatorOptions {
   readonly port?: number;
   readonly assetRoot?: string;
+  readonly requestDrainTimeoutMs?: number;
 }
 
 export interface RunningM5JudgeServer {
@@ -855,6 +858,10 @@ export async function startM5JudgeServer(
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
     throw new TypeError("M5 port must be an integer between 0 and 65535");
   }
+  const requestDrainTimeoutMs = options.requestDrainTimeoutMs ?? DEFAULT_REQUEST_DRAIN_TIMEOUT_MS;
+  if (!Number.isSafeInteger(requestDrainTimeoutMs) || requestDrainTimeoutMs < 1) {
+    throw new TypeError("M5 request drain timeout must be a positive integer");
+  }
   const coordinator = new M5DemoCoordinator(options);
   const assetRoot =
     options.assetRoot ??
@@ -865,23 +872,58 @@ export async function startM5JudgeServer(
   >();
   let publicOrigin = "";
   let closing: Promise<void> | null = null;
+  let acceptingRequests = true;
+  const activeRequests = new Map<IncomingMessage, ServerResponse>();
+  const sockets = new Set<Socket>();
+  const drainWaiters = new Set<() => void>();
   const server = createServer((request, response) => {
+    activeRequests.set(request, response);
+    let settled = false;
+    const settleRequest = (): void => {
+      if (settled) return;
+      settled = true;
+      activeRequests.delete(request);
+      if (activeRequests.size === 0) {
+        for (const resolveDrain of drainWaiters) resolveDrain();
+        drainWaiters.clear();
+      }
+    };
+    response.once("finish", settleRequest);
+    response.once("close", settleRequest);
+    if (!acceptingRequests) {
+      sendJson(response, 503, { error: "server_closing", message: "The judge UI is closing" });
+      request.destroy();
+      return;
+    }
     void handleRequest(request, response).catch((error: unknown) => {
       const requestError =
         error instanceof M5RequestError
           ? error
           : new M5RequestError(500, "internal_error", "The request failed safely");
-      sendJson(response, requestError.statusCode, {
-        error: requestError.code,
-        message: requestError.message,
-      });
+      if (!response.destroyed && !response.writableEnded) {
+        sendJson(response, requestError.statusCode, {
+          error: requestError.code,
+          message: requestError.message,
+        });
+      }
     });
   });
+  server.on("connection", (socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+
+  const assertAcceptingRequests = (): void => {
+    if (!acceptingRequests) {
+      throw new M5RequestError(503, "server_closing", "The judge UI is closing");
+    }
+  };
 
   async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
+    assertAcceptingRequests();
     applySecurityHeaders(response);
     validateHostAndOrigin(request, publicOrigin);
     const url = new URL(request.url ?? "/", publicOrigin);
@@ -893,6 +935,7 @@ export async function startM5JudgeServer(
     if (url.pathname === "/api/mission") {
       requireMethod(request, "POST");
       const body = await readJsonObject(request);
+      assertAcceptingRequests();
       validateExactKeys(body, ["operation", "requestId"]);
       const operation = requireEnum(body["operation"], ["start", "reset"], "operation");
       const requestId = requireRequestId(body["requestId"]);
@@ -914,6 +957,7 @@ export async function startM5JudgeServer(
     if (url.pathname === "/api/approval") {
       requireMethod(request, "POST");
       const body = await readJsonObject(request);
+      assertAcceptingRequests();
       validateExactKeys(body, [
         "missionId",
         "actionIdentity",
@@ -972,13 +1016,34 @@ export async function startM5JudgeServer(
       });
     });
   } catch (error: unknown) {
-    await coordinator.close();
+    const cleanupErrors: unknown[] = [];
+    try {
+      await coordinator.close();
+    } catch (cleanupError: unknown) {
+      cleanupErrors.push(cleanupError);
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([error, ...cleanupErrors], "M5 startup and cleanup failed", {
+        cause: error instanceof Error ? error : undefined,
+      });
+    }
     throw error;
   }
   const address = server.address();
   if (address === null || typeof address === "string") {
-    await coordinator.close();
-    throw new Error("M5 judge server did not expose a TCP address");
+    const error = new Error("M5 judge server did not expose a TCP address");
+    const cleanupErrors: unknown[] = [];
+    try {
+      await coordinator.close();
+    } catch (cleanupError: unknown) {
+      cleanupErrors.push(cleanupError);
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([error, ...cleanupErrors], "M5 startup and cleanup failed", {
+        cause: error,
+      });
+    }
+    throw error;
   }
   publicOrigin = `http://${LOOPBACK_HOST}:${address.port}`;
   return {
@@ -987,29 +1052,72 @@ export async function startM5JudgeServer(
     coordinator,
     async close(): Promise<void> {
       if (closing !== null) return closing;
-      closing = closeServer(server, coordinator);
+      acceptingRequests = false;
+      closing = closeServer(
+        server,
+        coordinator,
+        activeRequests,
+        sockets,
+        drainWaiters,
+        requestDrainTimeoutMs,
+      );
       return closing;
     },
   };
 }
 
-async function closeServer(server: Server, coordinator: M5DemoCoordinator): Promise<void> {
-  const errors: unknown[] = [];
-  await new Promise<void>((resolveClose) => {
+async function closeServer(
+  server: Server,
+  coordinator: M5DemoCoordinator,
+  activeRequests: ReadonlyMap<IncomingMessage, ServerResponse>,
+  sockets: ReadonlySet<Socket>,
+  drainWaiters: Set<() => void>,
+  requestDrainTimeoutMs: number,
+): Promise<void> {
+  const serverClose = new Promise<void>((resolveClose, rejectClose) => {
     server.close((error) => {
-      if (error !== undefined) errors.push(error);
-      resolveClose();
+      if (error === undefined) resolveClose();
+      else rejectClose(error);
     });
     server.closeIdleConnections();
   });
-  try {
-    await coordinator.close();
-  } catch (error: unknown) {
-    errors.push(error);
+  const coordinatorClose = coordinator.close();
+  const drained = await waitForRequestDrain(activeRequests, drainWaiters, requestDrainTimeoutMs);
+  if (!drained) {
+    for (const [request, response] of activeRequests) {
+      request.destroy(new Error("M5 request aborted during bounded shutdown"));
+      response.destroy(new Error("M5 response aborted during bounded shutdown"));
+    }
+    for (const socket of sockets) socket.destroy();
+    server.closeAllConnections();
   }
+  const results = await Promise.allSettled([serverClose, coordinatorClose]);
+  const errors = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason as unknown);
   if (errors.length > 0) {
     throw new AggregateError(errors, "M5 judge server cleanup failed");
   }
+}
+
+async function waitForRequestDrain(
+  activeRequests: ReadonlyMap<IncomingMessage, ServerResponse>,
+  drainWaiters: Set<() => void>,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (activeRequests.size === 0) return true;
+  let timer: NodeJS.Timeout | null = null;
+  let resolveDrain!: () => void;
+  const drained = new Promise<void>((resolveValue) => { resolveDrain = resolveValue; });
+  drainWaiters.add(resolveDrain);
+  const timeout = new Promise<"timeout">((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout("timeout"), timeoutMs);
+    timer.unref();
+  });
+  const result = await Promise.race([drained.then(() => "drained" as const), timeout]);
+  drainWaiters.delete(resolveDrain);
+  if (timer !== null) clearTimeout(timer);
+  return result === "drained";
 }
 
 function establishOwnedDataRoot(dataRoot: string): void {
