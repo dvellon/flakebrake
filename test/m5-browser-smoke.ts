@@ -8,6 +8,11 @@ import firefox from "selenium-webdriver/firefox.js";
 
 import { startM5JudgeServer } from "../src/m5-ui.js";
 
+interface BrowserScriptErrorObserver {
+  addJavaScriptErrorHandler(callback: (entry: unknown) => void): Promise<number>;
+  removeJavaScriptErrorHandler(id: number): Promise<void>;
+}
+
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
 const running = await startM5JudgeServer({
@@ -16,23 +21,39 @@ const running = await startM5JudgeServer({
   cleanupDataOnClose: true,
 });
 let driver: WebDriver | null = null;
+let browserScript: BrowserScriptErrorObserver | null = null;
+let javascriptErrorHandlerId: number | null = null;
+let capturedJavascriptErrorCount = 0;
 let smokeStage = "startup";
 let primaryError: unknown = null;
 
 try {
   const options = new firefox.Options().addArguments("-headless");
+  options.enableBidi();
   const explicitFirefox = process.env["FLAKEBRAKE_FIREFOX_BINARY"];
   const localSnapFirefox = "/snap/firefox/current/usr/lib/firefox/firefox";
   if (explicitFirefox !== undefined) options.setBinary(explicitFirefox);
   else if (existsSync(localSnapFirefox)) options.setBinary(localSnapFirefox);
   const browser = await new Builder().forBrowser("firefox").setFirefoxOptions(options).build();
   driver = browser;
+  browserScript = (
+    browser as WebDriver & { script(): BrowserScriptErrorObserver }
+  ).script();
+  javascriptErrorHandlerId = await browserScript.addJavaScriptErrorHandler(() => {
+    capturedJavascriptErrorCount += 1;
+  });
   await browser.manage().setTimeouts({ implicit: 0, pageLoad: 20_000, script: 10_000 });
   await browser.manage().window().setRect({ width: 1440, height: 1000 });
+  const captureProbeUrl = `data:text/html;charset=utf-8,${encodeURIComponent(
+    "<script>throw new Error('m5-controlled-error-capture-probe')</script>",
+  )}`;
+  await browser.get(captureProbeUrl);
+  await browser.wait(async () => capturedJavascriptErrorCount > 0, 5_000);
+  const firstProbeCount = capturedJavascriptErrorCount;
+  await browser.navigate().refresh();
+  await browser.wait(async () => capturedJavascriptErrorCount > firstProbeCount, 5_000);
+  capturedJavascriptErrorCount = 0;
   await browser.get(running.url);
-  await browser.executeScript(
-    "window.__m5Errors=[]; window.addEventListener('error',(event)=>window.__m5Errors.push(String(event.message))); window.addEventListener('unhandledrejection',(event)=>window.__m5Errors.push(String(event.reason)));",
-  );
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
   await waitText(browser, By.css(".pill-denied"), "REPLAN");
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
@@ -171,8 +192,11 @@ try {
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
   await screenshot(browser, join(screenshots, "07-tablet-820x1180.png"));
-  const capturedErrors = await browser.executeScript<readonly string[]>("return window.__m5Errors || [];");
-  assert.deepEqual(capturedErrors, []);
+  assert.equal(
+    capturedJavascriptErrorCount,
+    0,
+    "the session-level observer captured no JavaScript errors across application loads",
+  );
   const browserLogs = await browser.manage().logs().get("browser").catch(() => []);
   assert.deepEqual(browserLogs.filter((item) => item.level.name === "SEVERE"), []);
   process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
@@ -202,6 +226,14 @@ try {
 }
 
 const cleanupErrors: unknown[] = [];
+try {
+  if (browserScript !== null && javascriptErrorHandlerId !== null) {
+    await browserScript.removeJavaScriptErrorHandler(javascriptErrorHandlerId);
+    javascriptErrorHandlerId = null;
+  }
+} catch (error: unknown) {
+  cleanupErrors.push(error);
+}
 try {
   await driver?.quit();
   if (process.env["FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE"] === "1") {

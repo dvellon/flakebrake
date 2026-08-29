@@ -145,6 +145,18 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
   });
 });
 
+test("Qodo Round 1 captures browser errors before and across every document load", () => {
+  const browserSmoke = readFileSync(join(process.cwd(), "test/m5-browser-smoke.ts"), "utf8");
+  const observerIndex = browserSmoke.indexOf("addJavaScriptErrorHandler");
+  const applicationLoadIndex = browserSmoke.indexOf("await browser.get(running.url)");
+  assert.notEqual(observerIndex, -1, "the browser session must own an error observer");
+  assert.ok(observerIndex < applicationLoadIndex, "error observation must precede application load");
+  assert.match(browserSmoke, /m5-controlled-error-capture-probe/u);
+  assert.match(browserSmoke, /capturedJavascriptErrorCount = 0/u);
+  assert.doesNotMatch(browserSmoke, /window\.__m5Errors/u);
+  assert.doesNotMatch(browserSmoke, /__m5Errors \|\| \[\]/u);
+});
+
 const EXPECTED_APPROVAL_ROUTE = [
   ["select_portfolio_modification", "allow", "owner"],
   ["accept_promise", "allow", "owner"],
