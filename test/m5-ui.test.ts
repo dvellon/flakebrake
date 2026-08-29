@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { createContext, runInContext } from "node:vm";
 
@@ -372,10 +372,10 @@ test("M5 coordinator rejects unowned data roots without mutation", () => {
 });
 
 test("M5 Round 1 reproduction: CLI close failure still removes its temporary root", async () => {
-  const parent = mkdtempSync(join(tmpdir(), "flakebrake-m5-cli-close-"));
+  const parent = mkdtempSync(join(tmpdir(), "flakebrake M5 CLI close "));
   const child = spawn(process.execPath, [join(process.cwd(), "dist/src/m5-cli.js"), "--port", "0"], {
     cwd: process.cwd(),
-    env: { ...process.env, TMPDIR: parent },
+    env: portableTemporaryEnvironment(parent),
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {
@@ -394,12 +394,11 @@ test("M5 Round 1 reproduction: CLI close failure still removes its temporary roo
 });
 
 test("M5 Round 1 reproduction: a driver quit failure cannot skip server and data cleanup", async () => {
-  const parent = mkdtempSync(join(tmpdir(), "flakebrake-m5-driver-close-"));
+  const parent = mkdtempSync(join(tmpdir(), "flakebrake M5 driver close "));
   const child = spawn(process.execPath, [join(process.cwd(), "dist/test/m5-browser-smoke.js")], {
     cwd: process.cwd(),
     env: {
-      ...process.env,
-      TMPDIR: parent,
+      ...portableTemporaryEnvironment(parent),
       FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -552,6 +551,192 @@ test("M5 Round 1: reconnect generation invalidates responses issued before disco
   }
 });
 
+test("M5 Round 2 reproduction: an authoritative failed mission retry becomes actionable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-recovery-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const idle = coordinator.state();
+    const failed: M5JudgeState = {
+      ...idle,
+      revision: 2,
+      run: { ...idle.run, status: "failed", generation: 1, errorCode: "controlled_failure" },
+      mission: { ...idle.mission, sessionId: "session/ui-recovery", currentTurnId: "turn/failed" },
+    };
+    const resumed: M5JudgeState = {
+      ...uiProjection(failed, 3, "awaiting_approval"),
+      run: { ...failed.run, status: "awaiting_approval", generation: 2, errorCode: null },
+      mission: { ...failed.mission, currentTurnId: "turn/resumed" },
+    };
+    const harness = await createPollingHarness(failed, [Promise.resolve({ state: resumed })]);
+    await harness.evaluate<Promise<void>>(
+      'mutate("/api/mission", {operation: "start", requestId: "judge-recover-0001"})',
+    );
+    assert.equal(harness.text("outcome"), "Owner decision");
+    assert.equal(harness.hasClass("approval-panel", "is-hidden"), false);
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 2 reproduction: coordinator cleanup waits for an accepted handler", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-handler-order-"));
+  const running = await startM5JudgeServer({
+    dataRoot: directory,
+    port: 0,
+    cleanupDataOnClose: false,
+    requestDrainTimeoutMs: 5_000,
+  });
+  let socket: Socket | null = null;
+  try {
+    const fragmented = await acceptedFragmentedRequest(running);
+    socket = fragmented.socket;
+    const close = running.close();
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.notEqual(running.coordinator.state().run.status, "closed");
+    socket.write(fragmented.remainder);
+    await close;
+  } finally {
+    socket?.destroy();
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 2 reproduction: subprocess temp ownership is portable", () => {
+  const directory = resolve(tmpdir(), "flakebrake M5 portable temp fixture");
+  const environment = portableTemporaryEnvironment(directory);
+  assert.equal(isAbsolute(directory), true);
+  assert.equal(environment["TMPDIR"], directory);
+  assert.equal(environment["TMP"], directory);
+  assert.equal(environment["TEMP"], directory);
+});
+
+test("M5 Round 2: stale failures and fake recovery evidence cannot replace resumed state", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-recovery-races-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const idle = coordinator.state();
+    const failed: M5JudgeState = {
+      ...idle,
+      revision: 2,
+      run: { ...idle.run, status: "failed", generation: 1, errorCode: "controlled_failure" },
+      mission: { ...idle.mission, sessionId: "session/ui-recovery", currentTurnId: "turn/failed" },
+    };
+    const resumed: M5JudgeState = {
+      ...uiProjection(failed, 3, "awaiting_approval"),
+      run: { ...failed.run, status: "awaiting_approval", generation: 2, errorCode: null },
+      mission: { ...failed.mission, currentTurnId: "turn/resumed" },
+    };
+    const staleFailure = deferred<unknown>();
+    const recoveryResponse = deferred<unknown>();
+    const harness = await createPollingHarness(failed, [staleFailure.promise, recoveryResponse.promise]);
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    const recovery = harness.evaluate<Promise<void>>(
+      'mutate("/api/mission", {operation: "start", requestId: "judge-recover-race-0001"})',
+    );
+    recoveryResponse.resolve({ state: resumed });
+    await recovery;
+    staleFailure.resolve({ ...failed, revision: 4 });
+    await oldPoll;
+    assert.equal(harness.text("outcome"), "Owner decision");
+    assert.equal(harness.text("approval-digest"), resumed.pendingApproval?.actionIdentity);
+
+    const fakeRetry = {
+      ...resumed,
+      revision: 5,
+      run: { ...resumed.run, generation: 3, status: "running" as const },
+    };
+    const fakeHarness = await createPollingHarness(failed, [Promise.resolve(fakeRetry)]);
+    await fakeHarness.evaluate<Promise<void>>("refresh()");
+    assert.equal(fakeHarness.text("outcome"), "Stopped safely");
+
+    const terminal = {
+      ...uiProjection(resumed, 6, "verified"),
+      mission: resumed.mission,
+    };
+    harness.enqueue(Promise.resolve(terminal));
+    await harness.evaluate<Promise<void>>("refresh()");
+    harness.enqueue(Promise.resolve({ ...resumed, revision: 7, run: { ...resumed.run, generation: 3 } }));
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("outcome"), "Verified success");
+    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 2: a failed durable coordinator retry advances its recovery generation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-durable-retry-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const trueforgePath = join(directory, "trueforge.sqlite");
+    writeFileSync(trueforgePath, "controlled invalid SQLite fixture\n");
+    const started = coordinator.start();
+    assert.equal(started.run.generation, 1);
+    const failed = await waitForCoordinatorState(coordinator, (state) => state.run.status === "failed");
+    assert.equal(failed.run.generation, 1);
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) rmSync(`${trueforgePath}${suffix}`, { force: true });
+
+    const retry = coordinator.start();
+    assert.equal(retry.run.generation, 2);
+    const resumed = await waitForCoordinatorState(
+      coordinator,
+      (state) => state.run.status === "awaiting_approval",
+    );
+    assert.equal(resumed.run.generation, 2);
+    assert.ok(resumed.pendingApproval);
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("M5 Round 2: unsettled handlers retain durable ownership and a later close retries", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-stuck-handler-"));
+  const releaseSettlement = deferred<void>();
+  let blockSettlement = false;
+  const running = await startM5JudgeServer({
+    dataRoot: directory,
+    port: 0,
+    cleanupDataOnClose: true,
+    requestDrainTimeoutMs: 25,
+    beforeHandlerSettlement: async ({ pathname }) => {
+      if (blockSettlement && pathname === "/api/mission") await releaseSettlement.promise;
+    },
+  });
+  let socket: Socket | null = null;
+  try {
+    await postJson(running, "/api/mission", {
+      operation: "start",
+      requestId: "judge-stuck-handler-start-0001",
+    });
+    await waitForState(running, (state) => state.pendingApproval !== null);
+    assert.equal(existsSync(join(directory, "m2.sqlite")), true);
+    blockSettlement = true;
+    const fragmented = await acceptedFragmentedRequest(running);
+    socket = fragmented.socket;
+    const close = running.close();
+    socket.write(fragmented.remainder);
+    await assert.rejects(close, /handler shutdown did not settle safely/u);
+    assert.equal(running.coordinator.state().run.status, "awaiting_approval");
+    assert.equal(existsSync(join(directory, "m2.sqlite")), true);
+
+    releaseSettlement.resolve();
+    await running.close();
+    await running.close();
+    assert.equal(running.coordinator.state().run.status, "closed");
+    assert.equal(existsSync(join(directory, "m2.sqlite")), false);
+    assert.equal(existsSync(join(directory, "factory.sqlite")), false);
+  } finally {
+    releaseSettlement.resolve();
+    socket?.destroy();
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function acceptedFragmentedRequest(running: RunningM5JudgeServer): Promise<{ socket: Socket; remainder: string }> {
   const socket = createConnection({ host: "127.0.0.1", port: running.port });
   await once(socket, "connect");
@@ -588,6 +773,18 @@ async function waitForChildOutput(child: ChildProcess, text: string, timeout = 2
   });
 }
 
+async function waitForCoordinatorState(
+  coordinator: M5DemoCoordinator,
+  predicate: (state: M5JudgeState) => boolean,
+): Promise<M5JudgeState> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const state = coordinator.state();
+    if (predicate(state)) return state;
+    await new Promise<void>((resolveTurn) => setTimeout(resolveTurn, 10));
+  }
+  throw new Error("M5 coordinator did not reach the expected bounded state");
+}
+
 async function waitForChildExit(child: ChildProcess, timeout = 20_000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
   if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
   return await new Promise((resolveExit, rejectExit) => {
@@ -603,6 +800,12 @@ function findOwnedM5Roots(parent: string): readonly string[] {
   return readdirSync(parent)
     .map((entry) => join(parent, entry))
     .filter((path) => existsSync(join(path, ".flakebrake-m5-owned-v1")));
+}
+
+function portableTemporaryEnvironment(directory: string): NodeJS.ProcessEnv {
+  const absolute = resolve(directory);
+  if (!isAbsolute(absolute)) throw new TypeError("M5 temporary fixture directory must be absolute");
+  return { ...process.env, TMPDIR: absolute, TMP: absolute, TEMP: absolute };
 }
 
 function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {

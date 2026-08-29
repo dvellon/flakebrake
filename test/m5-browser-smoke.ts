@@ -40,8 +40,17 @@ try {
     await browser.executeScript("return document.activeElement === document.getElementById('start-button');"),
     true,
   );
+  const controlledFailurePath = join(root, "trueforge.sqlite");
+  writeFileSync(controlledFailurePath, "controlled invalid SQLite fixture\n");
   await start.click();
   smokeStage = "start_clicked";
+  await waitText(browser, By.id("outcome"), "Stopped safely", 60_000);
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    rmSync(`${controlledFailurePath}${suffix}`, { force: true });
+  }
+  await waitText(browser, By.id("start-button"), "Resume safely");
+  await browser.findElement(By.id("start-button")).click();
+  smokeStage = "recovery_clicked";
 
   const actionDigests = new Set<string>();
   for (let ownerCall = 1; ownerCall <= 4; ownerCall += 1) {

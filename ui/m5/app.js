@@ -45,10 +45,10 @@ async function api(path, options = {}) {
 }
 
 async function refresh() {
-  const token = responseToken();
+  const token = responseToken("poll");
   try {
     const candidate = await api("/api/state");
-    if (applyState(candidate, token, false)) {
+    if (applyState(candidate, token)) {
       nodes["connection-dot"].classList.add("connected");
     }
   } catch (error) {
@@ -70,7 +70,10 @@ async function mutate(path, body) {
     missionMutationInFlight = true;
   }
   invalidateResponses();
-  const token = responseToken();
+  const intent = path === "/api/mission"
+    ? body.operation === "reset" ? "mission_reset" : "mission_start"
+    : "approval";
+  const token = responseToken(intent);
   render();
   try {
     const response = await api(path, {
@@ -78,7 +81,7 @@ async function mutate(path, body) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    applyState(response.state, token, path === "/api/mission" && body.operation === "reset");
+    applyState(response.state, token);
   } catch (error) {
     showError(error instanceof Error ? error.message : "Request failed safely");
     await refresh();
@@ -89,9 +92,17 @@ async function mutate(path, body) {
   }
 }
 
-function responseToken() {
+function responseToken(intent) {
   responseSequence += 1;
-  return { generation: responseGeneration, sequence: responseSequence };
+  return {
+    generation: responseGeneration,
+    sequence: responseSequence,
+    intent,
+    sourceRevision: state?.revision ?? null,
+    sourceRunGeneration: state?.run.generation ?? null,
+    sourceMissionId: state?.mission.missionId ?? null,
+    sourceSessionId: state?.mission.sessionId ?? null,
+  };
 }
 
 function invalidateResponses() {
@@ -103,24 +114,50 @@ function isCurrentResponse(token) {
   return token.generation === responseGeneration && token.sequence >= latestAppliedSequence;
 }
 
-function applyState(candidate, token, allowTerminalReset) {
+function applyState(candidate, token) {
   if (!isCurrentResponse(token)) return false;
   if (state !== null) {
-    const currentTerminal = state.run.status === "verified" || state.run.status === "failed";
-    const candidateTerminal = candidate.run.status === "verified" || candidate.run.status === "failed";
-    if (currentTerminal && !candidateTerminal && !allowTerminalReset) return false;
     if (candidate.run.generation < state.run.generation) return false;
     if (
       candidate.run.generation === state.run.generation &&
       candidate.revision < state.revision
     ) return false;
+    if (candidate.mission.missionId !== state.mission.missionId) return false;
+
+    const newerDurableGeneration =
+      candidate.run.generation > state.run.generation && candidate.revision > state.revision;
+    const tokenMatchesCurrentFailure =
+      token.intent === "mission_start" &&
+      token.sourceRevision === state.revision &&
+      token.sourceRunGeneration === state.run.generation &&
+      token.sourceMissionId === state.mission.missionId &&
+      token.sourceSessionId === state.mission.sessionId;
+    const recoverySessionMatches =
+      state.mission.sessionId === null || candidate.mission.sessionId === state.mission.sessionId;
+    const explicitRecovery =
+      state.run.status === "failed" &&
+      tokenMatchesCurrentFailure &&
+      newerDurableGeneration &&
+      recoverySessionMatches;
+    const explicitReset =
+      token.intent === "mission_reset" &&
+      token.sourceRevision === state.revision &&
+      token.sourceRunGeneration === state.run.generation &&
+      token.sourceMissionId === state.mission.missionId &&
+      newerDurableGeneration;
+
+    if (state.run.status === "verified" && candidate.run.status !== "verified" && !explicitReset) {
+      return false;
+    }
+    if (state.run.status === "failed" && candidate.run.status !== "failed" && !explicitRecovery && !explicitReset) {
+      return false;
+    }
     if (
       state.mission.sessionId !== null &&
       candidate.mission.sessionId !== null &&
       candidate.mission.sessionId !== state.mission.sessionId &&
-      !allowTerminalReset
+      !explicitReset
     ) return false;
-    if (candidate.mission.missionId !== state.mission.missionId && !allowTerminalReset) return false;
   }
   latestAppliedSequence = token.sequence;
   state = candidate;

@@ -271,6 +271,9 @@ export class M5DemoCoordinator {
     if (this.#runPromise !== null || this.#status === "verified") {
       return this.state();
     }
+    if (this.#status === "failed") {
+      this.#generation += 1;
+    }
     this.#status = "running";
     this.#replayedTerminal =
       this.#readExecution().terminalStatus === "terminal_verified";
@@ -842,6 +845,11 @@ export interface StartM5JudgeServerOptions extends M5DemoCoordinatorOptions {
   readonly port?: number;
   readonly assetRoot?: string;
   readonly requestDrainTimeoutMs?: number;
+  /** Deterministic lifecycle barrier used to verify bounded shutdown ownership. */
+  readonly beforeHandlerSettlement?: (request: {
+    readonly method: string;
+    readonly pathname: string;
+  }) => Promise<void>;
 }
 
 export interface RunningM5JudgeServer {
@@ -849,6 +857,12 @@ export interface RunningM5JudgeServer {
   readonly port: number;
   readonly coordinator: M5DemoCoordinator;
   close(): Promise<void>;
+}
+
+interface ActiveM5RequestLifecycle {
+  readonly request: IncomingMessage;
+  readonly response: ServerResponse;
+  readonly settled: Promise<void>;
 }
 
 export async function startM5JudgeServer(
@@ -872,41 +886,73 @@ export async function startM5JudgeServer(
   >();
   let publicOrigin = "";
   let closing: Promise<void> | null = null;
+  let closed = false;
+  let serverClose: Promise<void> | null = null;
   let acceptingRequests = true;
-  const activeRequests = new Map<IncomingMessage, ServerResponse>();
+  const activeRequests = new Map<IncomingMessage, ActiveM5RequestLifecycle>();
   const sockets = new Set<Socket>();
   const drainWaiters = new Set<() => void>();
   const server = createServer((request, response) => {
-    activeRequests.set(request, response);
-    let settled = false;
-    const settleRequest = (): void => {
-      if (settled) return;
-      settled = true;
+    let resolveHandlerSettled!: () => void;
+    const handlerSettled = new Promise<void>((resolveSettled) => {
+      resolveHandlerSettled = resolveSettled;
+    });
+    activeRequests.set(request, { request, response, settled: handlerSettled });
+    let handlerLifecycleSettled = false;
+    const settleHandlerLifecycle = (): void => {
+      if (handlerLifecycleSettled) return;
+      handlerLifecycleSettled = true;
       activeRequests.delete(request);
+      resolveHandlerSettled();
       if (activeRequests.size === 0) {
         for (const resolveDrain of drainWaiters) resolveDrain();
         drainWaiters.clear();
       }
     };
-    response.once("finish", settleRequest);
-    response.once("close", settleRequest);
-    if (!acceptingRequests) {
-      sendJson(response, 503, { error: "server_closing", message: "The judge UI is closing" });
-      request.destroy();
-      return;
-    }
-    void handleRequest(request, response).catch((error: unknown) => {
-      const requestError =
-        error instanceof M5RequestError
-          ? error
-          : new M5RequestError(500, "internal_error", "The request failed safely");
-      if (!response.destroyed && !response.writableEnded) {
-        sendJson(response, requestError.statusCode, {
-          error: requestError.code,
-          message: requestError.message,
-        });
-      }
+    const responseSettled = new Promise<void>((resolveResponse) => {
+      let done = false;
+      const settleResponse = (): void => {
+        if (done) return;
+        done = true;
+        resolveResponse();
+      };
+      response.once("finish", settleResponse);
+      response.once("close", settleResponse);
     });
+    const pathname = request.url === undefined
+      ? "/"
+      : new URL(request.url, "http://127.0.0.1").pathname;
+    const handlerLifecycle = (async (): Promise<void> => {
+      try {
+        if (!acceptingRequests) {
+          sendJson(response, 503, { error: "server_closing", message: "The judge UI is closing" });
+          request.destroy();
+        } else {
+          await handleRequest(request, response);
+        }
+      } catch (error: unknown) {
+        const requestError =
+          error instanceof M5RequestError
+            ? error
+            : new M5RequestError(500, "internal_error", "The request failed safely");
+        if (!response.destroyed && !response.writableEnded) {
+          sendJson(response, requestError.statusCode, {
+            error: requestError.code,
+            message: requestError.message,
+          });
+        }
+      } finally {
+        try {
+          await options.beforeHandlerSettlement?.({
+            method: request.method ?? "UNKNOWN",
+            pathname,
+          });
+        } finally {
+          await responseSettled;
+        }
+      }
+    })();
+    void handlerLifecycle.then(settleHandlerLifecycle, settleHandlerLifecycle);
   });
   server.on("connection", (socket: Socket) => {
     sockets.add(socket);
@@ -1046,21 +1092,41 @@ export async function startM5JudgeServer(
     throw error;
   }
   publicOrigin = `http://${LOOPBACK_HOST}:${address.port}`;
+  const beginServerClose = (): Promise<void> => {
+    if (serverClose !== null) return serverClose;
+    serverClose = new Promise<void>((resolveClose, rejectClose) => {
+      server.close((error) => {
+        if (error === undefined) resolveClose();
+        else rejectClose(error);
+      });
+      server.closeIdleConnections();
+    });
+    return serverClose;
+  };
   return {
     url: publicOrigin,
     port: address.port,
     coordinator,
     async close(): Promise<void> {
+      if (closed) return;
       if (closing !== null) return closing;
       acceptingRequests = false;
-      closing = closeServer(
+      const closeAttempt = closeServer(
         server,
+        beginServerClose(),
         coordinator,
         activeRequests,
         sockets,
         drainWaiters,
         requestDrainTimeoutMs,
-      );
+      )
+        .then(() => {
+          closed = true;
+        })
+        .finally(() => {
+          if (!closed) closing = null;
+        });
+      closing = closeAttempt;
       return closing;
     },
   };
@@ -1068,29 +1134,35 @@ export async function startM5JudgeServer(
 
 async function closeServer(
   server: Server,
+  serverClose: Promise<void>,
   coordinator: M5DemoCoordinator,
-  activeRequests: ReadonlyMap<IncomingMessage, ServerResponse>,
+  activeRequests: ReadonlyMap<IncomingMessage, ActiveM5RequestLifecycle>,
   sockets: ReadonlySet<Socket>,
   drainWaiters: Set<() => void>,
   requestDrainTimeoutMs: number,
 ): Promise<void> {
-  const serverClose = new Promise<void>((resolveClose, rejectClose) => {
-    server.close((error) => {
-      if (error === undefined) resolveClose();
-      else rejectClose(error);
-    });
-    server.closeIdleConnections();
-  });
-  const coordinatorClose = coordinator.close();
   const drained = await waitForRequestDrain(activeRequests, drainWaiters, requestDrainTimeoutMs);
   if (!drained) {
-    for (const [request, response] of activeRequests) {
+    for (const { request, response } of activeRequests.values()) {
       request.destroy(new Error("M5 request aborted during bounded shutdown"));
       response.destroy(new Error("M5 response aborted during bounded shutdown"));
     }
     for (const socket of sockets) socket.destroy();
     server.closeAllConnections();
   }
+  const handlersSettled =
+    drained || await waitForRequestDrain(activeRequests, drainWaiters, requestDrainTimeoutMs);
+  if (!handlersSettled) {
+    const errors: unknown[] = [
+      new Error(`M5 shutdown retained ${String(activeRequests.size)} unsettled handler(s)`),
+    ];
+    const serverResult = await Promise.allSettled([serverClose]);
+    if (serverResult[0]?.status === "rejected") errors.push(serverResult[0].reason as unknown);
+    throw new AggregateError(errors, "M5 handler shutdown did not settle safely");
+  }
+  for (const socket of sockets) socket.destroy();
+  server.closeAllConnections();
+  const coordinatorClose = coordinator.close();
   const results = await Promise.allSettled([serverClose, coordinatorClose]);
   const errors = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -1101,7 +1173,7 @@ async function closeServer(
 }
 
 async function waitForRequestDrain(
-  activeRequests: ReadonlyMap<IncomingMessage, ServerResponse>,
+  activeRequests: ReadonlyMap<IncomingMessage, ActiveM5RequestLifecycle>,
   drainWaiters: Set<() => void>,
   timeoutMs: number,
 ): Promise<boolean> {
@@ -1110,6 +1182,9 @@ async function waitForRequestDrain(
   let resolveDrain!: () => void;
   const drained = new Promise<void>((resolveValue) => { resolveDrain = resolveValue; });
   drainWaiters.add(resolveDrain);
+  void Promise.all([...activeRequests.values()].map((handler) => handler.settled)).then(() => {
+    if (activeRequests.size === 0) resolveDrain();
+  });
   const timeout = new Promise<"timeout">((resolveTimeout) => {
     timer = setTimeout(() => resolveTimeout("timeout"), timeoutMs);
     timer.unref();
