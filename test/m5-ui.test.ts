@@ -202,6 +202,194 @@ describe("Qodo Round 2: executable session error-capture arming", () => {
   });
 });
 
+describe("M5 live review regressions", { concurrency: false }, () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const stylesheet = readFileSync(join(process.cwd(), "ui/m5/styles.css"), "utf8");
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-live-review-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const denialApproval = {
+    toolName: "create_schedule_reservation",
+    decision: "deny",
+    source: "owner",
+    ownerSourceIdentity: "owner/judge-ui",
+    actionIdentity: `sha256:${"c".repeat(64)}`,
+    effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+    reason: "The primary interval conflicts with protected production commitments",
+    denialId: null,
+  } as const;
+  const mechanicalApproval = {
+    toolName: "submit_schedule_change",
+    decision: "deny",
+    source: "active_m2_denial",
+    ownerSourceIdentity: null,
+    actionIdentity: `sha256:${"d".repeat(64)}`,
+    effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+    reason: "Equivalent representation of the denied action",
+    denialId: "m4-denial/live-review",
+  } as const;
+
+  test("static safeguards for the live-review corrections", () => {
+    assert.match(document, /<link rel="icon" href="data:image\/svg\+xml/u);
+    assert.match(document, /id="capacity-grid"[^>]*role="group"/u);
+    assert.match(document, /id="basis-note"/u);
+    assert.match(stylesheet, /\.policy-decision strong[^}]*display:\s*block/u);
+    assert.match(stylesheet, /\.policy-decision span[^}]*display:\s*block/u);
+    assert.match(stylesheet, /\.candidate > div strong, \.candidate > div span/u);
+    assert.match(stylesheet, /\.action-name\.is-status[^}]*text-transform:\s*none/u);
+    assert.match(stylesheet, /\.topbar[^}]*rgb\(9 16 12 \/ 96%\)/u);
+    assert.match(stylesheet, /\.capacity-item header[^}]*min-height/u);
+  });
+
+  test("status sentences and captions are status-aware at idle", async () => {
+    const harness = await createPollingHarness(idle, []);
+    assert.equal(harness.hasClass("approval-tool", "is-status"), true);
+    assert.equal(harness.text("approval-guidance"), "This region activates at the first owner decision.");
+    assert.match(harness.evaluate("document.getElementById('basis-note').innerHTML"), /Before you start:/u);
+  });
+
+  test("tool names keep their label styling while announcements use human verbs", async () => {
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const harness = await createPollingHarness(idle, [Promise.resolve(pending)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.hasClass("approval-tool", "is-status"), false);
+    assert.equal(harness.text("approval-tool"), "create schedule reservation");
+    assert.match(harness.text("decision-announcer"), /Deny is recommended\.$/u);
+  });
+
+  test("the appended denial rationale ends with terminal punctuation", async () => {
+    const base = uiProjection(idle, 2, "awaiting_approval");
+    const withDenial: M5JudgeState = {
+      ...base,
+      approvals: [denialApproval],
+      pendingApproval: {
+        ...(base.pendingApproval as NonNullable<M5JudgeState["pendingApproval"]>),
+        recommendedDecision: "allow",
+      },
+    };
+    const harness = await createPollingHarness(idle, [Promise.resolve(withDenial)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.match(harness.text("approval-guidance"), /protected production commitments\.$/u);
+    assert.match(
+      harness.evaluate<string>("document.getElementById('policy-decision').innerHTML"),
+      /commitments\.<\/span>/u,
+    );
+  });
+
+  test("terminal presentation reports completion rather than pending or mechanical captions", async () => {
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const verifiedBase = uiProjection(idle, 3, "verified");
+    const terminal: M5JudgeState = {
+      ...verifiedBase,
+      approvals: [denialApproval, mechanicalApproval],
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const harness = await createPollingHarness(idle, [Promise.resolve(pending), Promise.resolve(terminal)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    await harness.evaluate<Promise<void>>("refresh()");
+    const proofStages = harness.evaluate<string>("document.getElementById('proof-stages').innerHTML");
+    assert.match(proofStages, /Independent read-back observed/u);
+    assert.doesNotMatch(proofStages, /Independent read-back pending/u);
+    assert.equal(
+      harness.text("approval-guidance"),
+      "All decisions and evidence above are durable; the mission is complete.",
+    );
+    assert.match(harness.text("decision-announcer"), /Mission complete and independently verified\.$/u);
+    const agentTree = harness.evaluate<string>("document.getElementById('agent-tree').innerHTML");
+    assert.match(agentTree, /status-chip status-complete">Complete/u);
+    assert.doesNotMatch(agentTree, /status-chip">Complete/u);
+    assert.match(harness.evaluate<string>("document.getElementById('basis-note').innerHTML"), /verified mission/u);
+  });
+
+  test("the active verification stage stays labeled pending until read-back is observed", async () => {
+    const verifying: M5JudgeState = {
+      ...idle,
+      revision: 2,
+      run: { ...idle.run, status: "running" },
+      execution: { ...idle.execution, acceptanceCount: 1, attemptCount: 1, mutationCount: 1, receiptCount: 1 },
+    };
+    const harness = await createPollingHarness(idle, [Promise.resolve(verifying)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    const proofStages = harness.evaluate<string>("document.getElementById('proof-stages').innerHTML");
+    assert.match(proofStages, /proof-active/u);
+    assert.match(proofStages, /Independent read-back pending/u);
+  });
+
+  test("a transient poll failure recovers its label on the next successful poll", async () => {
+    const failure = deferred<unknown>();
+    const recovery = deferred<unknown>();
+    const harness = await createPollingHarness(idle, [failure.promise, recovery.promise]);
+    const failedPoll = harness.evaluate<Promise<void>>("refresh()");
+    failure.reject(new Error("controlled transient failure"));
+    await failedPoll;
+    assert.equal(harness.text("connection-label"), "Reconnecting…");
+    const recoveredPoll = harness.evaluate<Promise<void>>("refresh()");
+    recovery.resolve({ ...idle });
+    await recoveredPoll;
+    assert.equal(harness.text("connection-label"), "Ready on loopback");
+  });
+
+  test("the durable-replay label does not survive a reset into a live rerun", async () => {
+    const verifiedBase = uiProjection(idle, 2, "verified");
+    const replayed: M5JudgeState = {
+      ...verifiedBase,
+      run: { ...verifiedBase.run, connection: "replayed" },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const afterReset: M5JudgeState = {
+      ...idle,
+      revision: 3,
+      run: { ...idle.run, generation: replayed.run.generation + 1 },
+    };
+    const liveVerified = uiProjection(idle, 4, "verified");
+    const liveTerminal: M5JudgeState = {
+      ...liveVerified,
+      run: { ...liveVerified.run, generation: afterReset.run.generation },
+      execution: { ...liveVerified.execution, independentReadBackObserved: true },
+    };
+    const harness = await createPollingHarness(replayed, [
+      Promise.resolve({ state: afterReset }),
+      Promise.resolve(liveTerminal),
+    ]);
+    assert.equal(harness.text("connection-label"), "Durable replay restored");
+    await harness.evaluate<Promise<void>>(
+      'mutate("/api/mission", {operation: "reset", requestId: "live-review-reset"})',
+    );
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("connection-label"), "Mission complete");
+  });
+
+  test("a back-forward cache restore restarts polling", async () => {
+    const harness = await createPollingHarness(idle, [Promise.resolve({ ...idle })]);
+    assert.equal(harness.counters.setIntervalCalls, 1);
+    harness.fireWindow("pagehide", {});
+    harness.fireWindow("pageshow", { persisted: true });
+    assert.equal(harness.counters.setIntervalCalls, 2);
+    harness.fireWindow("pageshow", { persisted: false });
+    assert.equal(harness.counters.setIntervalCalls, 2);
+  });
+
+  test("error toasts do not inherit stale hide timers", async () => {
+    const harness = await createPollingHarness(idle, []);
+    harness.evaluate("showError('first controlled error')");
+    harness.evaluate("showError('second controlled error')");
+    assert.equal(harness.counters.clearedTimeouts.length >= 1, true);
+    assert.equal(harness.hasClass("toast", "visible"), true);
+    assert.equal(harness.text("toast"), "second controlled error");
+  });
+});
+
 const EXPECTED_APPROVAL_ROUTE = [
   ["select_portfolio_modification", "allow", "owner"],
   ["accept_promise", "allow", "owner"],
@@ -1261,19 +1449,36 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
   enqueue(...responses: readonly Promise<unknown>[]): void;
   text(id: string): string;
   hasClass(id: string, className: string): boolean;
+  counters: { setIntervalCalls: number; readonly clearedTimeouts: number[] };
+  fireWindow(name: string, event?: unknown): void;
 }> {
   const nodeMap = new Map<string, FakeNode>();
   const responseQueue = [Promise.resolve(initial), ...responses];
+  const counters = { setIntervalCalls: 0, clearedTimeouts: [] as number[] };
+  const windowListeners = new Map<string, ((event: unknown) => void)[]>();
+  let timerSequence = 100;
   const context = createContext({
     console,
     Date,
     document: { getElementById: (id: string) => fakeNode(nodeMap, id) },
     fetch: async () => ({ ok: true, json: async () => await (responseQueue.shift() as Promise<unknown>) }),
-    setInterval: () => 1,
+    setInterval: () => {
+      counters.setIntervalCalls += 1;
+      return 1;
+    },
     clearInterval: () => undefined,
-    setTimeout,
-    clearTimeout,
-    addEventListener: () => undefined,
+    setTimeout: () => {
+      timerSequence += 1;
+      return timerSequence;
+    },
+    clearTimeout: (id: number) => {
+      counters.clearedTimeouts.push(id);
+    },
+    addEventListener: (name: string, listener: (event: unknown) => void) => {
+      const existing = windowListeners.get(name) ?? [];
+      existing.push(listener);
+      windowListeners.set(name, existing);
+    },
   });
   (context as Record<string, unknown>)["window"] = context;
   runInContext(readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8"), context);
@@ -1283,6 +1488,10 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
     enqueue: (...items): void => { responseQueue.push(...items); },
     text: (id: string): string => fakeNode(nodeMap, id).textContent,
     hasClass: (id: string, className: string): boolean => fakeNode(nodeMap, id).classList.values.has(className),
+    counters,
+    fireWindow: (name, event): void => {
+      for (const listener of windowListeners.get(name) ?? []) listener(event);
+    },
   };
 }
 

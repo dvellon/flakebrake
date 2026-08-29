@@ -5,7 +5,7 @@ const nodes = Object.fromEntries(
     "approval-tool", "approval-effect", "approval-mission", "approval-digest", "approval-source",
     "approval-subject", "approval-subject-row", "approval-details", "allow-button", "deny-button",
     "approval-guidance", "decision-announcer", "policy-decision", "capacity-grid", "obligations",
-    "proposal", "basis-resolution", "winning-change", "candidate-list", "model-requests",
+    "proposal", "basis-note", "basis-resolution", "winning-change", "candidate-list", "model-requests",
     "agent-tree", "runtime-chips", "timeline", "verification-pill", "result-metrics",
     "actual-facts", "proof-stages", "readback-note", "toast",
   ].map((id) => [id, document.getElementById(id)]),
@@ -22,6 +22,7 @@ let latestAppliedSequence = 0;
 let lastApprovalIdentity = null;
 let timelinePinned = true;
 let reattachedTerminal = false;
+let toastTimer = null;
 const navigationWasReload = typeof performance !== "undefined" &&
   performance.getEntriesByType?.("navigation")?.[0]?.type === "reload";
 
@@ -38,6 +39,14 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function assignPreservingDisclosure(node, html) {
+  const openStates = Array.from(node.querySelectorAll?.("details") ?? [], (item) => item.open);
+  node.innerHTML = html;
+  Array.from(node.querySelectorAll?.("details") ?? []).forEach((item, index) => {
+    if (openStates[index] === true) item.open = true;
+  });
 }
 
 function shortIdentity(value) {
@@ -61,7 +70,10 @@ async function refresh() {
   const token = responseToken("poll");
   try {
     const candidate = await api("/api/state");
-    if (applyState(candidate, token)) nodes["connection-dot"].classList.add("connected");
+    const applied = applyState(candidate, token);
+    if (!isCurrentResponse(token)) return;
+    nodes["connection-dot"].classList.add("connected");
+    if (!applied && state !== null) renderHeader();
   } catch (error) {
     if (!isCurrentResponse(token)) return;
     invalidateResponses();
@@ -160,6 +172,7 @@ function applyState(candidate, token) {
       return false;
     }
   }
+  if (candidate.run.status !== "verified") reattachedTerminal = false;
   latestAppliedSequence = token.sequence;
   state = candidate;
   render();
@@ -204,6 +217,13 @@ function renderHeader() {
   nodes["start-button"].classList.toggle("button-primary", state.run.canStart && !missionMutationInFlight);
   nodes["start-button"].classList.toggle("button-quiet", !state.run.canStart || missionMutationInFlight);
   nodes["reset-button"].disabled = missionMutationInFlight || !state.run.canReset;
+  nodes["basis-note"].innerHTML = state.run.status === "idle"
+    ? "<strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores."
+    : state.run.status === "verified"
+      ? "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence for the verified mission."
+      : state.run.status === "failed"
+        ? "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence. Resume safely continues against the same invocation-owned stores."
+        : "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence while the live mission runs against invocation-owned stores.";
 }
 
 function setRecommendedAction(recommendedDecision) {
@@ -219,12 +239,13 @@ function renderApproval() {
   const approval = state.pendingApproval;
   const previousIdentity = lastApprovalIdentity;
   nodes["approval-panel"].classList.toggle("is-continuing", approval === null);
+  nodes["approval-tool"].classList.toggle("is-status", approval === null);
   nodes["policy-decision"].hidden = true;
   const primaryDenial = state.approvals.find((item) => item.source === "owner" && item.decision === "deny");
   const mechanical = [...state.approvals].reverse().find((item) => item.source === "active_m2_denial");
   if (primaryDenial || mechanical) {
     nodes["policy-decision"].hidden = false;
-    nodes["policy-decision"].innerHTML = `${primaryDenial ? `<div><strong>Owner denied primary interval</strong><span>Primary denial rationale: ${escapeHtml(primaryDenial.reason)}</span></div>` : ""}${mechanical ? `<div><strong>Auto-blocked · active policy</strong><span>${escapeHtml(mechanical.effect)}. Equivalent scheduling representations cannot bypass the active denial.</span></div>` : ""}`;
+    nodes["policy-decision"].innerHTML = `${primaryDenial ? `<div><strong>Owner denied primary interval</strong><span>Primary denial rationale: ${escapeHtml(primaryDenial.reason)}.</span></div>` : ""}${mechanical ? `<div><strong>Auto-blocked · active policy</strong><span>${escapeHtml(mechanical.effect)}. Equivalent scheduling representations cannot bypass the active denial.</span></div>` : ""}`;
   }
   if (approval === null) {
     const verified = state.run.status === "verified";
@@ -242,10 +263,22 @@ function renderApproval() {
     nodes["allow-button"].disabled = true;
     nodes["deny-button"].disabled = true;
     setRecommendedAction(null);
-    nodes["approval-guidance"].textContent = mechanical
-      ? "The mechanical denial required no extra owner call and caused no mutation."
-      : "This region remains stable while orchestration continues.";
-    if (previousIdentity !== null) nodes["decision-announcer"].textContent = "Decision recorded. Orchestration continuing safely.";
+    nodes["approval-guidance"].textContent = verified
+      ? "All decisions and evidence above are durable; the mission is complete."
+      : failed
+        ? "Recorded decisions stay durable. Resume safely to continue the mission."
+        : state.run.status === "idle"
+          ? "This region activates at the first owner decision."
+          : mechanical
+            ? "The mechanical denial required no extra owner call and caused no mutation."
+            : "This region remains stable while orchestration continues.";
+    if (previousIdentity !== null) {
+      nodes["decision-announcer"].textContent = verified
+        ? "Decision recorded. Mission complete and independently verified."
+        : failed
+          ? "Decision recorded. Mission stopped safely."
+          : "Decision recorded. Orchestration continuing safely.";
+    }
     lastApprovalIdentity = null;
     return;
   }
@@ -263,14 +296,14 @@ function renderApproval() {
   nodes["approval-guidance"].textContent = approval.recommendedDecision === "deny"
     ? "Recommended: Deny — 09:10–09:40 overlaps protected production work."
     : approval.phase === "consequential_effect"
-      ? `Recommended: Approve — 09:40–10:10 starts after the protected interval and fits the bound grant.${primaryDenial ? ` Primary denial rationale: ${primaryDenial.reason}` : ""}`
+      ? `Recommended: Approve — 09:40–10:10 starts after the protected interval and fits the bound grant.${primaryDenial ? ` Primary denial rationale: ${primaryDenial.reason}.` : ""}`
       : "Recommended: Approve — this bounded step preserves the canonical promise basis.";
   setRecommendedAction(approval.recommendedDecision);
   const decisionPending = approvalMutationInFlight === approval.actionIdentity;
   nodes["allow-button"].disabled = decisionPending;
   nodes["deny-button"].disabled = decisionPending;
   if (approval.actionIdentity !== previousIdentity) {
-    nodes["decision-announcer"].textContent = `New approval required. ${approval.expectedEffect}. ${approval.recommendedDecision} is recommended.`;
+    nodes["decision-announcer"].textContent = `New approval required. ${approval.expectedEffect}. ${approval.recommendedDecision === "deny" ? "Deny" : "Approve"} is recommended.`;
     Promise.resolve().then(() => nodes["approval-title"].focus?.({ preventScroll: true }));
   }
   lastApprovalIdentity = approval.actionIdentity;
@@ -306,7 +339,7 @@ function renderActivity() {
   const activity = state.activity;
   nodes["model-requests"].textContent = `${activity.modelRequests} model request${activity.modelRequests === 1 ? "" : "s"}`;
   const rootName = activity.rootAgent?.name ?? "TrueForge root agent";
-  const root = `<div class="agent-node"><span class="agent-icon root-icon" aria-hidden="true">R</span><div class="agent-copy"><strong class="agent-name">${escapeHtml(rootName)}</strong><span class="agent-role">Root mission agent</span></div><span class="agent-status status-chip">${escapeHtml(truthfulAgentStatus())}</span></div>`;
+  const root = `<div class="agent-node"><span class="agent-icon root-icon" aria-hidden="true">R</span><div class="agent-copy"><strong class="agent-name">${escapeHtml(rootName)}</strong><span class="agent-role">Root mission agent</span></div><span class="agent-status status-chip${state.run.status === "verified" ? " status-complete" : ""}">${escapeHtml(truthfulAgentStatus())}</span></div>`;
   const children = activity.subagents.map((item) => `<div class="agent-node child"><span class="agent-icon subagent-icon" aria-hidden="true">A</span><div class="agent-copy"><strong class="agent-name">${escapeHtml(item.title)}</strong><span class="agent-role">TrueForge subagent</span></div><span class="agent-status status-chip status-complete">Complete</span></div>`).join("");
   nodes["agent-tree"].innerHTML = root + children;
   const chips = [
@@ -326,7 +359,7 @@ function isTimelineNearLatest() {
 
 function renderTimeline() {
   const shouldPin = timelinePinned;
-  nodes.timeline.innerHTML = state.evidenceTimeline.map((item) => `<li class="${escapeHtml(item.status)}"><span class="timeline-marker" aria-hidden="true"></span><div class="timeline-copy"><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)}</p>${item.technicalIdentity ? `<details class="evidence-details"><summary>Durable evidence</summary><code>${escapeHtml(item.technicalIdentity)}</code></details>` : ""}</div><span class="timeline-status">${escapeHtml(item.status === "informational" ? "recorded" : item.status)}</span></li>`).join("");
+  assignPreservingDisclosure(nodes.timeline, state.evidenceTimeline.map((item) => `<li class="${escapeHtml(item.status)}"><span class="timeline-marker" aria-hidden="true"></span><div class="timeline-copy"><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)}</p>${item.technicalIdentity ? `<details class="evidence-details"><summary>Durable evidence</summary><code>${escapeHtml(item.technicalIdentity)}</code></details>` : ""}</div><span class="timeline-status">${escapeHtml(item.status === "informational" ? "recorded" : item.status)}</span></li>`).join(""));
   if (shouldPin && typeof nodes.timeline.scrollTo === "function") {
     nodes.timeline.scrollTo({ top: nodes.timeline.scrollHeight, behavior: "auto" });
   }
@@ -350,12 +383,15 @@ function renderExecution() {
     [result.receiptCount, "Mutation receipt", "Durable command evidence"],
   ];
   nodes["result-metrics"].innerHTML = metrics.map(([value, label, subtitle]) => `<div class="metric"><strong>${value}</strong><span>${label}</span><small>${subtitle}</small></div>`).join("");
-  nodes["actual-facts"].innerHTML = result.actualFacts.length
+  assignPreservingDisclosure(nodes["actual-facts"], result.actualFacts.length
     ? `<h3>Actual consumption facts</h3>${result.actualFacts.map((item) => { const presentation = resourcePresentation[item.resourceKey] ?? [item.resourceKey, item.workClassKey]; return `<div class="actual-fact"><span><b>${escapeHtml(presentation[0])}</b><small class="fact-subtitle">${escapeHtml(presentation[1])} · ${escapeHtml(item.workClassKey.replaceAll("_", " "))}</small><details class="fact-details"><summary>Technical fact</summary><code>${escapeHtml(item.resourceKey)} · ${escapeHtml(item.workClassKey)}</code></details></span><strong>${item.value}</strong></div>`; }).join("")}`
-    : "";
+    : "");
   const stages = [
     ["Mutation committed", result.mutationCount === 1 ? "complete" : "waiting"],
-    ["Independent read-back pending", result.mutationCount === 1 && !result.independentReadBackObserved ? "active" : result.independentReadBackObserved ? "complete" : "waiting"],
+    [
+      result.independentReadBackObserved ? "Independent read-back observed" : "Independent read-back pending",
+      result.mutationCount === 1 && !result.independentReadBackObserved ? "active" : result.independentReadBackObserved ? "complete" : "waiting",
+    ],
     ["Read-back matched · verified", verified && result.independentReadBackObserved ? "complete" : "waiting"],
   ];
   nodes["proof-stages"].innerHTML = stages.map(([label, status], index) => `<li class="proof-${status}"><span>${index + 1}</span><strong>${label}</strong><small>${status === "complete" ? "Durable evidence present" : status === "active" ? "Verification in progress" : "Awaiting prior stage"}</small></li>`).join("");
@@ -367,21 +403,39 @@ function renderExecution() {
 function showError(message) {
   nodes.toast.textContent = message;
   nodes.toast.classList.add("visible");
-  window.setTimeout(() => nodes.toast.classList.remove("visible"), 5000);
+  if (toastTimer !== null) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toastTimer = null;
+    nodes.toast.classList.remove("visible");
+  }, 5000);
 }
 
 nodes["timeline"].addEventListener("scroll", () => { timelinePinned = isTimelineNearLatest(); }, { passive: true });
-nodes["start-button"].addEventListener("click", () => void mutate("/api/mission", { operation: "start", requestId: requestId("start") }));
-nodes["reset-button"].addEventListener("click", () => void mutate("/api/mission", { operation: "reset", requestId: requestId("reset") }));
+nodes["start-button"].addEventListener("click", () => {
+  nodes["approval-title"].focus?.({ preventScroll: true });
+  void mutate("/api/mission", { operation: "start", requestId: requestId("start") });
+});
+nodes["reset-button"].addEventListener("click", () => {
+  nodes["approval-title"].focus?.({ preventScroll: true });
+  void mutate("/api/mission", { operation: "reset", requestId: requestId("reset") });
+});
 nodes["allow-button"].addEventListener("click", () => {
   if (!state?.pendingApproval) return;
+  nodes["approval-title"].focus?.({ preventScroll: true });
   void mutate("/api/approval", { missionId: state.pendingApproval.missionId, actionIdentity: state.pendingApproval.actionIdentity, decision: "allow", reason: null, requestId: requestId("allow") });
 });
 nodes["deny-button"].addEventListener("click", () => {
   if (!state?.pendingApproval) return;
+  nodes["approval-title"].focus?.({ preventScroll: true });
   void mutate("/api/approval", { missionId: state.pendingApproval.missionId, actionIdentity: state.pendingApproval.actionIdentity, decision: "deny", reason: "The primary interval conflicts with protected production commitments", requestId: requestId("deny") });
 });
 
 void refresh();
 poll = window.setInterval(() => void refresh(), 300);
-window.addEventListener("pagehide", () => window.clearInterval(poll), { once: true });
+window.addEventListener("pagehide", () => window.clearInterval(poll));
+window.addEventListener("pageshow", (event) => {
+  if (event?.persisted !== true) return;
+  window.clearInterval(poll);
+  poll = window.setInterval(() => void refresh(), 300);
+  void refresh();
+});

@@ -56,6 +56,28 @@ try {
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
   assert.equal((await browser.findElements(By.css("progress.capacity-baseline"))).length, 3);
   assert.equal((await browser.findElements(By.css("[style]"))).length, 0, "CSP-safe UI has no inline style attributes");
+  assert.equal(
+    await browser.executeScript("return getComputedStyle(document.querySelector('.candidate .pill-approved')).color;"),
+    "rgb(201, 244, 91)",
+    "the winning candidate pill keeps its status color",
+  );
+  assert.equal(
+    await browser.executeScript("return getComputedStyle(document.querySelector('.candidate-number')).display;"),
+    "grid",
+    "candidate ordinals render as centered badges",
+  );
+  assert.equal(
+    await browser.executeScript(
+      "return new Set([...document.querySelectorAll('.capacity-item .remaining')].map((item) => Math.round(item.getBoundingClientRect().top))).size;",
+    ),
+    1,
+    "capacity remaining values align across cards",
+  );
+  assert.equal(
+    await browser.executeScript("return getComputedStyle(document.querySelector('.topbar')).backgroundColor;"),
+    "rgba(9, 16, 12, 0.96)",
+    "the sticky topbar keeps scrolled content from reading through",
+  );
   await screenshot(browser, join(screenshots, "01-initial.png"));
   await browser.manage().window().setRect({ width: 1024, height: 768 });
   assert.equal(await hasHorizontalOverflow(browser), false);
@@ -121,8 +143,18 @@ try {
     );
     assert.equal(await recommendedButtons[0]?.getAttribute("id"), await button.getAttribute("id"));
     assert.equal(await button.isEnabled(), true);
+    if (ownerCall === 3) {
+      await browser.executeScript("document.querySelector('#timeline .evidence-details').open = true;");
+    }
     if (ownerCall === 1) await button.sendKeys(Key.ENTER);
     else await button.click();
+    if (ownerCall === 1) {
+      assert.equal(
+        await browser.executeScript("return document.activeElement === document.getElementById('approval-title');"),
+        true,
+        "keyboard focus returns to the approval heading after activating a decision",
+      );
+    }
     smokeStage = `owner_${ownerCall}_clicked`;
     await browser.wait(
       async () => {
@@ -139,6 +171,16 @@ try {
     if (ownerCall === 3) {
       await browser.wait(until.elementLocated(By.css(".policy-decision:not([hidden])")), 60_000);
       await waitText(browser, By.id("policy-decision"), "Auto-blocked · active policy", 60_000);
+      assert.equal(
+        await browser.executeScript("return document.querySelector('#timeline .evidence-details').open;"),
+        true,
+        "open durable-evidence disclosures survive state re-renders",
+      );
+      assert.equal(
+        await browser.executeScript("return getComputedStyle(document.querySelector('#policy-decision strong')).display;"),
+        "block",
+        "policy decision titles render as stacked rows rather than run-on text",
+      );
       await screenshot(browser, join(screenshots, "04-owner-and-mechanical-denial.png"));
     }
   }
@@ -154,6 +196,8 @@ try {
   assert.match(documentText, /Resolved through bounded replan/u);
   assert.match(documentText, /Earlier attempt stopped safely · recovered/u);
   assert.doesNotMatch(documentText, /Mission stopped safely/u);
+  assert.match(documentText, /Independent read-back observed/u);
+  assert.doesNotMatch(documentText, /Independent read-back pending/u);
   assert.equal(await browser.findElement(By.id("connection-label")).getText(), "Mission complete");
   assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
   assert.equal((await browser.findElements(By.css("#timeline li.pending"))).length, 0);
@@ -196,6 +240,10 @@ try {
   );
   const browserLogs = await browser.manage().logs().get("browser").catch(() => []);
   assert.deepEqual(browserLogs.filter((item) => item.level.name === "SEVERE"), []);
+  const failedResources = await browser.executeScript<readonly string[]>(
+    "return performance.getEntriesByType('resource').filter((item) => (item.responseStatus ?? 0) >= 400).map((item) => item.name);",
+  );
+  assert.deepEqual(failedResources, [], "no request during the smoke failed");
   process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
 } catch (error: unknown) {
   const durable = await fetch(`${running.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
