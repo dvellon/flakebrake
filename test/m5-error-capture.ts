@@ -16,6 +16,20 @@ export interface SessionErrorCapture {
   dispose(): Promise<void>;
 }
 
+export interface BrowserNetworkObserver {
+  addFailedResponseHandler(callback: (entry: { url: string; status: number }) => void): Promise<void>;
+  removeFailedResponseHandlers(): Promise<void>;
+}
+
+export interface SessionNetworkCapture {
+  failedResponses(): readonly string[];
+  dispose(): Promise<void>;
+}
+
+export function formatFailedResponse(url: string, status: number): string {
+  return `${url} status=${String(status)}`;
+}
+
 export const CONTROLLED_ERROR_PROBE_URL = `data:text/html;charset=utf-8,${encodeURIComponent(
   "<script>throw new Error('m5-controlled-error-capture-probe')</script>",
 )}`;
@@ -51,5 +65,49 @@ export async function armSessionErrorCapture(
     dispose: async (): Promise<void> => {
       await script.removeJavaScriptErrorHandler(handlerId);
     },
+  };
+}
+
+export async function armSessionNetworkCapture(
+  observer: BrowserNetworkObserver,
+  browser: ObserverSessionBrowser,
+  probeUrl: string,
+): Promise<SessionNetworkCapture> {
+  const failed: string[] = [];
+  const probeEntry = formatFailedResponse(probeUrl, 404);
+  await observer.addFailedResponseHandler((entry) => {
+    if (entry.status >= 400) failed.push(formatFailedResponse(entry.url, entry.status));
+  });
+  const probeObservations = (): number => failed.filter((entry) => entry === probeEntry).length;
+  await browser.get(probeUrl);
+  await browser.wait(
+    () => probeObservations() >= 1,
+    5_000,
+    "the session network observer did not observe the controlled missing-resource probe",
+  );
+  await browser.refresh();
+  await browser.wait(
+    () => probeObservations() >= 2,
+    5_000,
+    "the session network observer did not keep observing the missing-resource probe across refresh",
+  );
+  let settledLength = -1;
+  let stableSamples = 0;
+  await browser.wait(
+    () => {
+      if (failed.length === settledLength) stableSamples += 1;
+      else {
+        settledLength = failed.length;
+        stableSamples = 0;
+      }
+      return stableSamples >= 3;
+    },
+    5_000,
+    "network evidence from the probe documents did not settle before clearing",
+  );
+  failed.length = 0;
+  return {
+    failedResponses: () => [...failed],
+    dispose: () => observer.removeFailedResponseHandlers(),
   };
 }

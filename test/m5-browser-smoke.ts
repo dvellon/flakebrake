@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,9 +10,22 @@ import firefox from "selenium-webdriver/firefox.js";
 import { startM5JudgeServer } from "../src/m5-ui.js";
 import {
   armSessionErrorCapture,
+  armSessionNetworkCapture,
+  formatFailedResponse,
   type BrowserScriptErrorObserver,
   type SessionErrorCapture,
+  type SessionNetworkCapture,
 } from "./m5-error-capture.js";
+
+interface BidiNetworkModule {
+  responseCompleted(callback: (event: { response?: { status?: number | string; url?: string } } | null) => void): Promise<void>;
+  close(): Promise<void>;
+}
+
+const requireModule = createRequire(import.meta.url);
+const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/network.js") as {
+  Network(driver: WebDriver): Promise<BidiNetworkModule>;
+};
 
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
@@ -22,6 +36,7 @@ const running = await startM5JudgeServer({
 });
 let driver: WebDriver | null = null;
 let capture: SessionErrorCapture | null = null;
+let networkCapture: SessionNetworkCapture | null = null;
 let smokeStage = "startup";
 let primaryError: unknown = null;
 
@@ -39,17 +54,37 @@ try {
   ).script();
   await browser.manage().setTimeouts({ implicit: 0, pageLoad: 20_000, script: 10_000 });
   await browser.manage().window().setRect({ width: 1440, height: 1000 });
-  capture = await armSessionErrorCapture(browserScript, {
-    get: async (url) => {
+  const sessionBrowser = {
+    get: async (url: string) => {
       await browser.get(url);
     },
     refresh: async () => {
       await browser.navigate().refresh();
     },
-    wait: async (condition, timeoutMs, message) => {
+    wait: async (condition: () => boolean, timeoutMs: number, message: string) => {
       await browser.wait(() => condition(), timeoutMs, message);
     },
-  });
+  };
+  const bidiNetwork = await createBidiNetwork(browser);
+  const networkProbeUrl = `${running.url}/m5-controlled-missing-resource-probe`;
+  networkCapture = await armSessionNetworkCapture(
+    {
+      addFailedResponseHandler: async (callback) => {
+        await bidiNetwork.responseCompleted((event) => {
+          const status = Number(event?.response?.status);
+          if (Number.isFinite(status)) callback({ url: String(event?.response?.url ?? ""), status });
+        });
+      },
+      removeFailedResponseHandlers: async () => {
+        await bidiNetwork.close();
+      },
+    },
+    sessionBrowser,
+    networkProbeUrl,
+  );
+  const armedNetworkCapture = networkCapture;
+  const networkProbeEntry = formatFailedResponse(networkProbeUrl, 404);
+  capture = await armSessionErrorCapture(browserScript, sessionBrowser);
   await capture.openApplication(running.url);
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
   await waitText(browser, By.css(".pill-denied"), "REPLAN");
@@ -126,6 +161,18 @@ try {
     actionDigests.add(digest);
 
     if (ownerCall === 2) {
+      assert.equal(
+        await browser.executeScript<number>(
+          "return fetch('/m5-controlled-missing-resource-probe').then((response) => response.status);",
+        ),
+        404,
+        "the pre-refresh controlled resource-failure probe reached the server",
+      );
+      await browser.wait(
+        () => armedNetworkCapture.failedResponses().includes(networkProbeEntry),
+        5_000,
+        "the session network observer did not record the pre-refresh controlled failure",
+      );
       await screenshot(browser, join(screenshots, "03-pending-approval.png"));
       await browser.navigate().refresh();
       await browser.wait(until.elementLocated(By.id("approval-panel")), 60_000);
@@ -240,10 +287,29 @@ try {
   );
   const browserLogs = await browser.manage().logs().get("browser").catch(() => []);
   assert.deepEqual(browserLogs.filter((item) => item.level.name === "SEVERE"), []);
-  const failedResources = await browser.executeScript<readonly string[]>(
-    "return performance.getEntriesByType('resource').filter((item) => (item.responseStatus ?? 0) >= 400).map((item) => item.name);",
+  assert.equal(
+    await browser.executeScript<number>(
+      "return fetch('/m5-controlled-missing-resource-probe').then((response) => response.status);",
+    ),
+    404,
+    "the end-of-session controlled resource-failure probe reached the server",
   );
-  assert.deepEqual(failedResources, [], "no request during the smoke failed");
+  await browser.wait(
+    () => armedNetworkCapture.failedResponses().filter((entry) => entry === networkProbeEntry).length >= 2,
+    5_000,
+    "the session network observer lost coverage before the end of the smoke",
+  );
+  const sessionFailures = armedNetworkCapture.failedResponses();
+  assert.deepEqual(
+    sessionFailures.filter((entry) => entry !== networkProbeEntry),
+    [],
+    "no unexpected request failed at any point in the browser session",
+  );
+  assert.equal(
+    sessionFailures.filter((entry) => entry === networkProbeEntry).length,
+    2,
+    "controlled resource failures persist in session evidence across refreshes",
+  );
   process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
 } catch (error: unknown) {
   const durable = await fetch(`${running.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
@@ -275,6 +341,14 @@ try {
   if (capture !== null) {
     await capture.dispose();
     capture = null;
+  }
+} catch (error: unknown) {
+  cleanupErrors.push(error);
+}
+try {
+  if (networkCapture !== null) {
+    await networkCapture.dispose();
+    networkCapture = null;
   }
 } catch (error: unknown) {
   cleanupErrors.push(error);

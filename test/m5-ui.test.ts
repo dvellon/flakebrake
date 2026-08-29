@@ -18,7 +18,10 @@ import {
 import { parseM5CliArguments } from "../src/m5-cli.js";
 import {
   armSessionErrorCapture,
+  armSessionNetworkCapture,
   CONTROLLED_ERROR_PROBE_URL,
+  formatFailedResponse,
+  type BrowserNetworkObserver,
   type BrowserScriptErrorObserver,
   type ObserverSessionBrowser,
 } from "./m5-error-capture.js";
@@ -373,11 +376,17 @@ describe("M5 live review regressions", { concurrency: false }, () => {
   test("a back-forward cache restore restarts polling", async () => {
     const harness = await createPollingHarness(idle, [Promise.resolve({ ...idle })]);
     assert.equal(harness.counters.setIntervalCalls, 1);
+    assert.deepEqual(harness.activeIntervalIds(), [1]);
     harness.fireWindow("pagehide", {});
+    assert.deepEqual(harness.activeIntervalIds(), [], "pagehide clears the active poller");
+    assert.deepEqual(harness.counters.clearedIntervals, [1]);
     harness.fireWindow("pageshow", { persisted: true });
     assert.equal(harness.counters.setIntervalCalls, 2);
+    assert.deepEqual(harness.activeIntervalIds(), [2], "exactly one active poller after a persisted restore");
+    assert.deepEqual(harness.counters.clearedIntervals, [1, 1], "the restore defensively clears the prior poller id");
     harness.fireWindow("pageshow", { persisted: false });
     assert.equal(harness.counters.setIntervalCalls, 2);
+    assert.deepEqual(harness.activeIntervalIds(), [2]);
   });
 
   test("error toasts do not inherit stale hide timers", async () => {
@@ -387,6 +396,54 @@ describe("M5 live review regressions", { concurrency: false }, () => {
     assert.equal(harness.counters.clearedTimeouts.length >= 1, true);
     assert.equal(harness.hasClass("toast", "visible"), true);
     assert.equal(harness.text("toast"), "second controlled error");
+  });
+});
+
+describe("Qodo Round 3: executable session network-failure capture", () => {
+  const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+
+  test("arming registers the observer before navigation and clears probe evidence", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL);
+    const capture = await armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL);
+    assert.deepEqual(session.events, ["register", "navigate:probe", "refresh"]);
+    assert.deepEqual(capture.failedResponses(), []);
+  });
+
+  test("a failure recorded before refresh persists across refresh and later navigation", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL);
+    const capture = await armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL);
+    await session.browser.get("http://application.invalid/");
+    assert.equal(session.emitFailedResponse("http://application.invalid/asset.js", 500), 1);
+    await session.browser.refresh();
+    await session.browser.get("http://application.invalid/deep");
+    assert.deepEqual(capture.failedResponses(), [
+      formatFailedResponse("http://application.invalid/asset.js", 500),
+    ]);
+  });
+
+  test("an observer that never observes failures fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, { deliverResponses: false });
+    await assert.rejects(
+      armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL),
+      /did not observe the controlled missing-resource probe/u,
+    );
+  });
+
+  test("a page-scoped observer lost on refresh fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, { dropHandlersOnRefresh: true });
+    await assert.rejects(
+      armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL),
+      /did not keep observing the missing-resource probe across refresh/u,
+    );
+  });
+
+  test("dispose removes the failure observation channel", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL);
+    const capture = await armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL);
+    await capture.dispose();
+    assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.emitFailedResponse("http://application.invalid/late.js", 503), 0);
+    assert.deepEqual(capture.failedResponses(), []);
   });
 });
 
@@ -1449,13 +1506,16 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
   enqueue(...responses: readonly Promise<unknown>[]): void;
   text(id: string): string;
   hasClass(id: string, className: string): boolean;
-  counters: { setIntervalCalls: number; readonly clearedTimeouts: number[] };
+  counters: { setIntervalCalls: number; readonly clearedTimeouts: number[]; readonly clearedIntervals: number[] };
+  activeIntervalIds(): readonly number[];
   fireWindow(name: string, event?: unknown): void;
 }> {
   const nodeMap = new Map<string, FakeNode>();
   const responseQueue = [Promise.resolve(initial), ...responses];
-  const counters = { setIntervalCalls: 0, clearedTimeouts: [] as number[] };
+  const counters = { setIntervalCalls: 0, clearedTimeouts: [] as number[], clearedIntervals: [] as number[] };
   const windowListeners = new Map<string, ((event: unknown) => void)[]>();
+  const activeIntervals = new Set<number>();
+  let intervalSequence = 0;
   let timerSequence = 100;
   const context = createContext({
     console,
@@ -1463,10 +1523,15 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
     document: { getElementById: (id: string) => fakeNode(nodeMap, id) },
     fetch: async () => ({ ok: true, json: async () => await (responseQueue.shift() as Promise<unknown>) }),
     setInterval: () => {
+      intervalSequence += 1;
       counters.setIntervalCalls += 1;
-      return 1;
+      activeIntervals.add(intervalSequence);
+      return intervalSequence;
     },
-    clearInterval: () => undefined,
+    clearInterval: (id: number) => {
+      counters.clearedIntervals.push(id);
+      activeIntervals.delete(id);
+    },
     setTimeout: () => {
       timerSequence += 1;
       return timerSequence;
@@ -1489,6 +1554,7 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
     text: (id: string): string => fakeNode(nodeMap, id).textContent,
     hasClass: (id: string, className: string): boolean => fakeNode(nodeMap, id).classList.values.has(className),
     counters,
+    activeIntervalIds: (): readonly number[] => [...activeIntervals].sort((left, right) => left - right),
     fireWindow: (name, event): void => {
       for (const listener of windowListeners.get(name) ?? []) listener(event);
     },
@@ -1591,5 +1657,66 @@ function createFakeBrowserSession(options?: {
     events,
     registeredHandlerCount: () => handlers.size,
     emitSessionError: deliverToRegisteredHandlers,
+  };
+}
+
+interface FakeNetworkSession {
+  readonly observer: BrowserNetworkObserver;
+  readonly browser: ObserverSessionBrowser;
+  readonly events: readonly string[];
+  registeredHandlerCount(): number;
+  emitFailedResponse(url: string, status: number): number;
+}
+
+function createFakeNetworkSession(probeUrl: string, options?: {
+  readonly deliverResponses?: boolean;
+  readonly dropHandlersOnRefresh?: boolean;
+}): FakeNetworkSession {
+  const deliverResponses = options?.deliverResponses ?? true;
+  const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
+  const events: string[] = [];
+  const handlers = new Set<(entry: { url: string; status: number }) => void>();
+  let currentUrl: string | null = null;
+  const deliverToRegisteredHandlers = (url: string, status: number): number => {
+    const active = [...handlers];
+    for (const handler of active) handler({ url, status });
+    return active.length;
+  };
+  const deliverProbeResponse = (): void => {
+    if (deliverResponses && currentUrl === probeUrl) deliverToRegisteredHandlers(probeUrl, 404);
+  };
+  return {
+    observer: {
+      addFailedResponseHandler: async (callback) => {
+        handlers.add(callback);
+        events.push("register");
+      },
+      removeFailedResponseHandlers: async () => {
+        handlers.clear();
+        events.push("remove");
+      },
+    },
+    browser: {
+      get: async (url) => {
+        currentUrl = url;
+        events.push(url === probeUrl ? "navigate:probe" : `navigate:${url}`);
+        deliverProbeResponse();
+      },
+      refresh: async () => {
+        events.push("refresh");
+        if (dropHandlersOnRefresh) handlers.clear();
+        deliverProbeResponse();
+      },
+      wait: async (condition, _timeoutMs, message) => {
+        for (let turn = 0; turn < 8; turn += 1) {
+          if (condition()) return;
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+        }
+        throw new Error(message);
+      },
+    },
+    events,
+    registeredHandlerCount: () => handlers.size,
+    emitFailedResponse: deliverToRegisteredHandlers,
   };
 }
