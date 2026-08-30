@@ -31,9 +31,13 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
 
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
+const browserPort = Number(process.env["FLAKEBRAKE_M5_BROWSER_PORT"] ?? "0");
+if (!Number.isSafeInteger(browserPort) || browserPort < 0 || browserPort > 65_535) {
+  throw new Error("FLAKEBRAKE_M5_BROWSER_PORT must be an integer from 0 through 65535");
+}
 const running = await startM5JudgeServer({
   dataRoot: root,
-  port: 0,
+  port: browserPort,
   cleanupDataOnClose: true,
 });
 const transportKillServer = createServer((socket) => socket.destroy());
@@ -318,6 +322,17 @@ try {
   assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
   assert.equal((await browser.findElements(By.css("#timeline li.pending"))).length, 0);
   assert.equal((await browser.findElements(By.css(".agent-node.child"))).length, 3);
+  const evidenceDownload = await browser.findElement(By.id("evidence-download"));
+  assert.equal(await evidenceDownload.isDisplayed(), true);
+  assert.equal(await evidenceDownload.getAttribute("aria-disabled"), "false");
+  assert.equal(await evidenceDownload.getAttribute("download"), "flakebrake-mission-evidence.json");
+  assert.equal(
+    await browser.executeScript<boolean>(
+      "return fetch('/api/evidence').then(async (response) => response.status === 200 && response.headers.get('content-type')?.startsWith('application/json') === true && JSON.parse(await response.text()).schemaVersion === 'flakebrake-mission-evidence-bundle/v2');",
+    ),
+    true,
+    "the completed mission exposes inspectable canonical evidence",
+  );
   const metrics = await Promise.all(
     (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
   );
@@ -358,6 +373,11 @@ try {
       (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
     ),
     ["1", "1", "1", "1"],
+  );
+  assert.equal(await browser.findElement(By.id("evidence-download")).isDisplayed(), true);
+  assert.equal(
+    await browser.findElement(By.id("evidence-download")).getAttribute("aria-disabled"),
+    "false",
   );
 
   const viewports = [

@@ -208,6 +208,13 @@
           <div id="actual-facts" class="actual-facts"></div>
           <ol id="proof-stages" class="proof-stages" aria-label="Verification proof stages"></ol>
           <p id="readback-note" class="readback-note">Independent read-back has not yet occurred.</p>
+          <div id="evidence-bundle" class="evidence-bundle" hidden>
+            <div>
+              <strong>Canonical mission evidence</strong>
+              <span>Inspectable JSON with a SHA-256 payload digest and independent local verification.</span>
+            </div>
+            <a id="evidence-download" class="button button-quiet" href="/api/evidence" download="flakebrake-mission-evidence.json" aria-disabled="true">Download evidence JSON</a>
+          </div>
         </section>
       </div>
       <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
