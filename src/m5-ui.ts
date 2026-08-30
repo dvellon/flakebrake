@@ -25,6 +25,13 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { canonicalSerialize } from "./canonical.js";
+import {
+  cleanupAdversarialChallengeLab,
+  readAdversarialChallengeLab,
+  runAdversarialChallengeLab,
+  type AdversarialChallengeLabResult,
+  type AdversarialChallengeResult,
+} from "./challenge-lab.js";
 import type { JsonValue } from "./domain.js";
 import {
   readAuthoritativeFactoryExecution,
@@ -250,6 +257,15 @@ export interface M5JudgeState {
     readonly duplicateEffectCount: number;
     readonly unauthorizedMutationCount: number;
   };
+  readonly challengeLab: {
+    readonly status: "idle" | "running" | "complete" | "failed" | "closed";
+    readonly canRun: boolean;
+    readonly label: "Deterministic assurance demonstration";
+    readonly allPassed: boolean | null;
+    readonly omitted: readonly string[];
+    readonly challenges: readonly AdversarialChallengeResult[];
+    readonly errorCode: string | null;
+  };
   readonly agentTrust: {
     readonly recommendationsRecorded: boolean;
     readonly checks: readonly {
@@ -348,6 +364,10 @@ export class M5DemoCoordinator {
   #revision = 0;
   #ownerCallsThisProcess = 0;
   #replayedTerminal = false;
+  #challengeStatus: M5JudgeState["challengeLab"]["status"] = "idle";
+  #challengeResult: AdversarialChallengeLabResult | null = null;
+  #challengePromise: Promise<void> | null = null;
+  #challengeErrorCode: string | null = null;
   #markerDurability: MarkerPublicationDurability | null = null;
 
   public constructor(options: M5DemoCoordinatorOptions) {
@@ -368,6 +388,16 @@ export class M5DemoCoordinator {
       sandboxEvidence: join(this.#dataRoot, "m5-sandbox-evidence.json"),
     };
     establishOwnedDataRoot(this.#dataRoot);
+    try {
+      const challenge = readAdversarialChallengeLab(this.#dataRoot);
+      if (challenge !== null) {
+        this.#challengeResult = challenge;
+        this.#challengeStatus = "complete";
+      }
+    } catch {
+      this.#challengeStatus = "failed";
+      this.#challengeErrorCode = "challenge_evidence_invalid";
+    }
     this.#restoreDurableSandboxEvidence();
   }
 
@@ -624,6 +654,30 @@ export class M5DemoCoordinator {
     return { replayed: false, state: this.state() };
   }
 
+  public startChallengeLab(): M5JudgeState {
+    this.#assertOpen();
+    if (this.#challengePromise !== null || this.#challengeStatus !== "idle") {
+      return this.state();
+    }
+    this.#challengeStatus = "running";
+    this.#challengeErrorCode = null;
+    this.#challengePromise = runAdversarialChallengeLab(this.#dataRoot)
+      .then((result) => {
+        this.#challengeResult = result;
+        this.#challengeStatus = "complete";
+      })
+      .catch(() => {
+        this.#challengeStatus = this.#closing ? "closed" : "failed";
+        this.#challengeErrorCode = "challenge_failed_closed";
+      })
+      .finally(() => {
+        this.#challengePromise = null;
+        this.#bumpRevision();
+      });
+    this.#bumpRevision();
+    return this.state();
+  }
+
   public state(): M5JudgeState {
     const evaluationInput = createHeroEvaluationInput();
     const direct = evaluateAdmission(evaluationInput);
@@ -793,6 +847,15 @@ export class M5DemoCoordinator {
             ? execution.mutationCount
             : 0,
       },
+      challengeLab: {
+        status: this.#challengeStatus,
+        canRun: this.#challengeStatus === "idle",
+        label: "Deterministic assurance demonstration",
+        allPassed: this.#challengeResult?.allPassed ?? null,
+        omitted: this.#challengeResult?.omitted ?? [],
+        challenges: this.#challengeResult?.challenges ?? [],
+        errorCode: this.#challengeErrorCode,
+      },
       agentTrust: agentTrustProjection({
         approvals,
         approvalEffectText: (approval) => approvalEffect(approval, missionSnapshot),
@@ -871,11 +934,31 @@ export class M5DemoCoordinator {
         }),
       );
     }
-    await this.#runPromise;
-    this.#evidenceLifecycle.close();
+    await Promise.all([this.#runPromise, this.#challengePromise]);
+    const cleanupErrors: unknown[] = [];
+    try {
+      this.#evidenceLifecycle.close();
+    } catch (error: unknown) {
+      cleanupErrors.push(error);
+    }
+    if (this.#cleanupDataOnClose) {
+      for (const cleanup of [
+        () => cleanupAdversarialChallengeLab(this.#dataRoot),
+        () => cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths),
+      ]) {
+        try {
+          cleanup();
+        } catch (error: unknown) {
+          cleanupErrors.push(error);
+        }
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, "M5 invocation cleanup did not complete");
+    }
     this.#status = "closed";
+    this.#challengeStatus = "closed";
     this.#closed = true;
-    if (this.#cleanupDataOnClose) cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths);
     this.#bumpRevision();
   }
 
@@ -1328,6 +1411,28 @@ export async function startM5JudgeServer(
           body: {
             replayed: false,
             state: operation === "start" ? coordinator.start() : coordinator.reset(),
+          },
+        }),
+      );
+      sendJson(response, result.statusCode, result.body);
+      return;
+    }
+    if (url.pathname === "/api/challenge") {
+      requireMethod(request, "POST");
+      const body = await readJsonObject(request);
+      assertAcceptingRequests();
+      validateExactKeys(body, ["operation", "requestId"]);
+      requireEnum(body["operation"], ["run"], "operation");
+      const requestId = requireRequestId(body["requestId"]);
+      const result = idempotentMutation(
+        idempotency,
+        requestId,
+        { route: url.pathname, body },
+        () => ({
+          statusCode: 200,
+          body: {
+            replayed: false,
+            state: coordinator.startChallengeLab(),
           },
         }),
       );

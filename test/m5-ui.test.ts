@@ -3163,6 +3163,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
   let ownerCalls = 0;
   let sessionId = "";
   let projectionDigest = "";
+  let evidenceBundleText = "";
 
   before(async () => {
     running = await startM5JudgeServer({
@@ -3199,6 +3200,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
 
   test("initial projection is canonical REPLAN evidence rather than presentation fixtures", () => {
     assert.equal(initial.run.status, "idle");
+    assert.equal(initial.challengeLab.status, "idle");
     assert.equal(initial.hero.directDecision, "REPLAN");
     assert.deepEqual(
       initial.hero.capacity.map((item) => [
@@ -3246,6 +3248,74 @@ describe("M5 judge UI", { concurrency: false }, () => {
       { resourceKey: "production_cell_minutes", value: 20 },
     ]);
     assert.equal(initial.hero.protectedWorkUnchanged, true);
+  });
+
+  test("challenge endpoint runs once and projects complete zero-effect evidence", async () => {
+    const heroBeforeChallenge = structuredClone(initial) as unknown as Record<string, unknown>;
+    delete heroBeforeChallenge["revision"];
+    delete heroBeforeChallenge["challengeLab"];
+    assert.equal(
+      (await fetch(`${running.url}/api/evidence`)).status,
+      409,
+      "the optional lab cannot make canonical hero evidence ready",
+    );
+    const requestId = "judge-challenge-idempotency-0001";
+    await postJson(running, "/api/challenge", { operation: "run", requestId });
+    const replayed = await postJson(running, "/api/challenge", {
+      operation: "run",
+      requestId,
+    });
+    assert.equal(replayed["replayed"], true);
+    const state = await waitForState(
+      running,
+      (candidate) =>
+        candidate.challengeLab.status === "complete" ||
+        candidate.challengeLab.status === "failed",
+    );
+    assert.equal(state.challengeLab.status, "complete");
+    assert.equal(state.challengeLab.allPassed, true);
+    assert.equal(state.challengeLab.challenges.length, 6);
+    assert.equal(
+      state.challengeLab.challenges.every(
+        (challenge) => challenge.snapshotEqual && challenge.zeroUnauthorizedEffects,
+      ),
+      true,
+    );
+    const replay = state.challengeLab.challenges.find(
+      (challenge) => challenge.id === "valid-idempotent-replay",
+    );
+    assert.ok(replay);
+    assert.deepEqual(replay.replayProof, {
+      replayed: true,
+      originalResultReturned: true,
+      originalReceiptReturned: true,
+      noSecondMutation: true,
+      noDuplicateFacts: true,
+    });
+    assert.deepEqual(
+      [
+        replay.before.counts.mutations,
+        replay.before.counts.receipts,
+        replay.before.counts.terminalEvents,
+        replay.before.counts.actualFacts,
+      ],
+      [1, 1, 1, 2],
+    );
+    assert.deepEqual(replay.after.counts, replay.before.counts);
+    const heroAfterChallenge = structuredClone(state) as unknown as Record<string, unknown>;
+    delete heroAfterChallenge["revision"];
+    delete heroAfterChallenge["challengeLab"];
+    assert.deepEqual(
+      heroAfterChallenge,
+      heroBeforeChallenge,
+      "running the optional lab changes no hero, Guided, Trust, Proof, ribbon, mission, or durable projection",
+    );
+    assert.equal(state.revision > initial.revision, true);
+    assert.equal(
+      (await fetch(`${running.url}/api/evidence`)).status,
+      409,
+      "viewing completed lab evidence cannot create a hero Mission Evidence Bundle",
+    );
   });
 
   test("complete hero flow binds four owner calls and mechanically denies the alternate adapter", async () => {
@@ -3410,7 +3480,13 @@ describe("M5 judge UI", { concurrency: false }, () => {
     const response = await fetch(`${running.url}/api/evidence`);
     assert.equal(response.status, 200, "the canonical evidence bundle downloads only at the verified terminal");
     assert.match(response.headers.get("content-disposition") ?? "", /flakebrake-mission-evidence\.json/u);
-    const bundle = (await response.json()) as {
+    evidenceBundleText = await response.text();
+    assert.doesNotMatch(
+      evidenceBundleText,
+      /challenge-lab|identity-substitution|valid-idempotent-replay/u,
+      "the canonical hero bundle contains no optional Challenge Lab records",
+    );
+    const bundle = JSON.parse(evidenceBundleText) as {
       readonly payloadDigest: string;
       readonly payload: {
         readonly mission: { readonly missionId: string; readonly trueforgeSessionId: string };
@@ -3495,6 +3571,15 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(replay.execution.receiptCount, 1);
     assert.equal(replay.execution.terminalEventCount, 1);
     assert.equal(replay.execution.attemptCount, 1);
+    assert.equal(replay.challengeLab.status, "complete");
+    assert.equal(replay.challengeLab.allPassed, true);
+    const replayedEvidence = await fetch(`${running.url}/api/evidence`);
+    assert.equal(replayedEvidence.status, 200);
+    assert.equal(
+      await replayedEvidence.text(),
+      evidenceBundleText,
+      "reconnect returns the byte-identical canonical hero bundle after the Challenge Lab ran",
+    );
   });
 
   test("reset removes only invocation-owned durable state", async () => {
@@ -3505,6 +3590,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
     const reset = await getState(running);
     assert.equal(reset.run.status, "idle");
     assert.equal(reset.execution.mutationCount, 0);
+    assert.equal(reset.challengeLab.status, "complete");
     for (const file of ["m2.sqlite", "factory.sqlite", "mission.sqlite", "trueforge.sqlite"]){
       assert.equal(existsSync(join(directory, file)), false);
     }
@@ -3513,12 +3599,21 @@ describe("M5 judge UI", { concurrency: false }, () => {
 
   test("critical controls and responsive document landmarks are accessible", () => {
     const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+    const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
     assert.match(document, /<meta name="viewport"/u);
     assert.match(document, /<main id="main">/u);
     assert.match(document, /aria-live="polite"/u);
     assert.match(document, /id="start-button"[^>]*type="button"/u);
     assert.match(document, /id="allow-button"[^>]*type="button"/u);
     assert.match(document, /id="deny-button"[^>]*type="button"/u);
+    assert.match(document, /id="challenge-button"[^>]*type="button"/u);
+    assert.match(document, /Optional · deterministic assurance demonstration/u);
+    assert.match(document, /never part of the canonical hero Mission Evidence Bundle/u);
+    assert.match(application, /What was attempted · redacted/u);
+    assert.match(application, /Why it was blocked/u);
+    assert.match(application, /Did any effect occur\?/u);
+    assert.match(application, /Authoritative boundary/u);
+    assert.match(application, /Inspect technical adapter path/u);
     assert.match(document, /aria-labelledby="approval-title"/u);
     const stylesheet = readFileSync(join(process.cwd(), "ui/m5/styles.css"), "utf8");
     assert.match(stylesheet, /@media \(max-width: 980px\)/u);

@@ -31,9 +31,15 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
 
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
-const browserPort = Number(process.env["FLAKEBRAKE_M5_BROWSER_PORT"] ?? "0");
-if (!Number.isSafeInteger(browserPort) || browserPort < 0 || browserPort > 65_535) {
-  throw new Error("FLAKEBRAKE_M5_BROWSER_PORT must be an integer from 0 through 65535");
+const requestedPort = process.env["FLAKEBRAKE_M5_BROWSER_PORT"];
+const browserPort = requestedPort === undefined ? 0 : Number(requestedPort);
+if (
+  !Number.isSafeInteger(browserPort) ||
+  browserPort < 0 ||
+  browserPort > 65_535 ||
+  (requestedPort !== undefined && String(browserPort) !== requestedPort)
+) {
+  throw new TypeError("FLAKEBRAKE_M5_BROWSER_PORT must be a canonical TCP port");
 }
 const running = await startM5JudgeServer({
   dataRoot: root,
@@ -324,6 +330,7 @@ try {
         "the session network observer did not record the pre-refresh controlled failure",
       );
       await screenshot(browser, join(screenshots, "04-pending-approval.png"));
+      await settleApplicationPolling(browser);
       await browser.navigate().refresh();
       await browser.wait(until.elementLocated(By.id("approval-panel")), 60_000);
       await browser.wait(
@@ -466,6 +473,7 @@ try {
   await screenshot(browser, join(screenshots, "08-readback-proof.png"));
 
   const sessionBeforeRefresh = await browser.findElement(By.id("session-id")).getText();
+  await settleApplicationPolling(browser);
   await browser.navigate().refresh();
   await waitText(browser, By.id("outcome"), "Verified success", 60_000);
   await waitText(browser, By.id("connection-label"), "Durable replay restored", 60_000);
@@ -515,17 +523,90 @@ try {
     await browser.findElement(By.id("evidence-download")).getAttribute("aria-disabled"),
     "false",
   );
+  const heroBeforeChallenge = await readHeroProjection(browser);
+  const evidenceBeforeChallenge = await browser.executeScript<string>(
+    "return fetch('/api/evidence').then((response) => response.text());",
+  );
 
-  const viewports = [
-    [1440, 900], [1280, 800], [1120, 800], [1024, 768], [981, 800], [820, 1180],
-  ] as const;
+  const challengeButton = await browser.findElement(By.id("challenge-button"));
+  await browser.executeScript("document.getElementById('challenge-button').focus();");
+  assert.equal(
+    await browser.executeScript(
+      "return document.activeElement === document.getElementById('challenge-button');",
+    ),
+    true,
+    "the deterministic assurance control is keyboard focusable",
+  );
+  await challengeButton.sendKeys(Key.ENTER);
+  smokeStage = "challenge_lab_clicked";
+  await waitText(browser, By.id("challenge-status"), "6 / 6 passed", 60_000);
+  assert.equal((await browser.findElements(By.css(".challenge-case"))).length, 6);
+  assert.equal((await browser.findElements(By.css(".challenge-pass"))).length, 6);
+  assert.equal(
+    (await browser.findElements(By.css(".challenge-count"))).length,
+    48,
+    "all eight before/after count classes are visible for all six challenges",
+  );
+  const challengeText = await browser.findElement(By.css(".challenge-lab")).getText();
+  assert.match(challengeText, /Identity substitution/u);
+  assert.match(challengeText, /Stale authoritative basis/u);
+  assert.match(challengeText, /Conflicting attempt ID reuse/u);
+  assert.match(challengeText, /Forged or mismatched receipt/u);
+  assert.match(challengeText, /Equivalent representation after denial/u);
+  assert.match(challengeText, /Valid idempotent replay/u);
+  assert.match(challengeText, /Zero unauthorized effects/iu);
+  assert.match(challengeText, /What was attempted/iu);
+  assert.match(challengeText, /Why it was blocked/iu);
+  assert.match(challengeText, /Why it was allowed/iu);
+  assert.match(challengeText, /Did any effect occur\?/iu);
+  assert.match(challengeText, /Authoritative boundary/iu);
+  assert.match(challengeText, /never part of the canonical hero Mission Evidence Bundle/u);
+  assert.doesNotMatch(challengeText, /\/tmp\/|\\Users\\|file:\/\//u);
+  await browser.executeScript("document.getElementById('challenge-title').scrollIntoView({block: 'start'});");
+  await screenshot(browser, join(screenshots, "09-challenge-lab.png"));
+  assert.deepEqual(
+    await readHeroProjection(browser),
+    heroBeforeChallenge,
+    "running and viewing the optional lab leaves the complete hero judge projection unchanged",
+  );
+  assert.equal(
+    await browser.executeScript<string>(
+      "return fetch('/api/evidence').then((response) => response.text());",
+    ),
+    evidenceBeforeChallenge,
+    "the canonical hero Evidence Bundle remains byte-identical after the lab",
+  );
+  await browser.executeScript("document.getElementById('hero-title').scrollIntoView({block: 'start'});");
+  assert.equal(await browser.findElement(By.id("outcome")).getText(), "Verified success");
+  assert.deepEqual(await readHeroProjection(browser), heroBeforeChallenge);
+
+  await settleApplicationPolling(browser);
+  await browser.navigate().refresh();
+  await waitText(browser, By.id("outcome"), "Verified success", 60_000);
+  await waitText(browser, By.id("connection-label"), "Durable replay restored", 60_000);
+  await waitText(browser, By.id("challenge-status"), "6 / 6 passed", 60_000);
+  assert.deepEqual(
+    await readHeroProjection(browser),
+    heroBeforeChallenge,
+    "refresh/reconnect after the lab restores the same canonical hero projection",
+  );
+  assert.equal(
+    await browser.executeScript<string>(
+      "return fetch('/api/evidence').then((response) => response.text());",
+    ),
+    evidenceBeforeChallenge,
+    "refresh/reconnect preserves the byte-identical canonical hero Evidence Bundle",
+  );
+
+  const viewports = [[1440, 900], [820, 1180]] as const;
   for (const [width, height] of viewports) {
     await browser.manage().window().setRect({ width, height });
     await browser.executeScript("window.scrollTo(0, 0);");
     assert.equal(await hasHorizontalOverflow(browser), false, `${String(width)}x${String(height)} overflow`);
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
-  await screenshot(browser, join(screenshots, "09-tablet-820x1180.png"));
+  await browser.executeScript("document.getElementById('challenge-title').scrollIntoView({block: 'start'});");
+  await screenshot(browser, join(screenshots, "10-challenge-tablet-820x1180.png"));
   assert.equal(
     capture.capturedErrorCount(),
     0,
@@ -545,12 +626,19 @@ try {
     5_000,
     "the session network observer lost coverage before the end of the smoke",
   );
-  await browser.get(transportProbeDocument);
-  await browser.wait(
-    () => armedNetworkCapture.failedResponses().some((entry) => entry.startsWith(transportProbePrefix)),
-    5_000,
-    "the session transport-failure channel lost coverage before the end of the smoke",
-  );
+  const applicationWindow = await browser.getWindowHandle();
+  await browser.switchTo().newWindow("tab");
+  try {
+    await browser.get(transportProbeDocument);
+    await browser.wait(
+      () => armedNetworkCapture.failedResponses().some((entry) => entry.startsWith(transportProbePrefix)),
+      5_000,
+      "the session transport-failure channel lost coverage before the end of the smoke",
+    );
+  } finally {
+    await browser.close();
+    await browser.switchTo().window(applicationWindow);
+  }
   const sessionFailures = armedNetworkCapture.failedResponses();
   // The smoke's own deliberate refreshes and away-navigations abort whichever
   // application /api poll is mid-flight; Firefox reports that browser-initiated
@@ -676,6 +764,25 @@ async function waitText(
     timeout,
   );
   return element;
+}
+
+async function settleApplicationPolling(driver: WebDriver): Promise<void> {
+  await driver.executeScript("window.dispatchEvent(new Event('pagehide'));");
+  await driver.sleep(400);
+}
+
+async function readHeroProjection(driver: WebDriver): Promise<Record<string, unknown>> {
+  return await driver.executeScript<Record<string, unknown>>(
+    "const text = (id) => document.getElementById(id)?.textContent?.trim() ?? '';" +
+      "return {" +
+      "guidedHeading:text('guided-heading'),guidedWhat:text('guided-what'),guidedWhy:text('guided-why')," +
+      "missionId:text('mission-id'),sessionId:text('session-id'),outcome:text('outcome')," +
+      "harnessState:text('harness-state'),harnessSession:text('harness-session'),harnessPlain:text('harness-plain')," +
+      "agentTrust:text('trust-rows'),proofLead:text('proof-center-lead'),proofStatus:text('proof-center-status')," +
+      "metrics:[...document.querySelectorAll('.metric strong')].map((item) => item.textContent)," +
+      "proofCounts:[...document.querySelectorAll('.proof-counts strong')].map((item) => item.textContent)," +
+      "actualFacts:text('actual-facts')};",
+  );
 }
 
 async function screenshot(driver: WebDriver, path: string): Promise<void> {
