@@ -80,6 +80,9 @@ try {
       throw new Error("injected Selenium shutdown failure");
     }
   });
+  if (process.env["FLAKEBRAKE_M5_CLEANUP_PROBE_ONLY"] === "1") {
+    throw new Error("controlled browser cleanup probe before the merged journey");
+  }
   const browserScript = (
     browser as WebDriver & { script(): BrowserScriptErrorObserver }
   ).script();

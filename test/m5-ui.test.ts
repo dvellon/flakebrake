@@ -3822,6 +3822,7 @@ test("M5 Round 1 reproduction: a driver quit failure cannot skip server and data
     env: {
       ...portableTemporaryEnvironment(parent),
       FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE: "1",
+      FLAKEBRAKE_M5_CLEANUP_PROBE_ONLY: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
