@@ -14,6 +14,7 @@ import {
   withEvidenceHandleOwnership,
   withEvidenceLifecycleShutdown,
   type EvidenceHandleRequest,
+  type EvidenceHandleLifecycleSnapshot,
   type EvidenceHandleScope,
   type EvidenceOwnedHandle,
 } from "../src/mission-evidence-lifecycle.js";
@@ -24,6 +25,18 @@ const FOUR_DATABASES = [
   { key: "factory", path: "/redacted/factory", label: "factory" },
   { key: "trueforge", path: "/redacted/trueforge", label: "TrueForge" },
 ] as const satisfies readonly EvidenceHandleRequest[];
+
+const ZERO_LIFECYCLE_SNAPSHOT: EvidenceHandleLifecycleSnapshot = Object.freeze({
+  activeOperationCount: 0,
+  retainedOperationCount: 0,
+  ownedHandleCount: 0,
+  closed: false,
+});
+const LIFECYCLE_COUNTER_FIELDS = [
+  "activeOperationCount",
+  "retainedOperationCount",
+  "ownedHandleCount",
+] as const;
 
 class CountingHandle implements EvidenceOwnedHandle {
   closeAttempts = 0;
@@ -321,6 +334,114 @@ describe("mission evidence database-handle lifecycle", () => {
     assertBalanced(factory);
   });
 
+  test("valid lifecycle counters preserve clean, incomplete, and descriptor proofs", () => {
+    assert.deepEqual(evaluateEvidenceCleanup(ZERO_LIFECYCLE_SNAPSHOT, null), {
+      status: "verified_clean",
+      proof: "lifecycle_ownership",
+      lifecycle: ZERO_LIFECYCLE_SNAPSHOT,
+      descriptorCount: null,
+    });
+    assert.deepEqual(evaluateEvidenceCleanup(ZERO_LIFECYCLE_SNAPSHOT, 0), {
+      status: "verified_clean",
+      proof: "lifecycle_and_descriptor",
+      lifecycle: ZERO_LIFECYCLE_SNAPSHOT,
+      descriptorCount: 0,
+    });
+    assert.deepEqual(evaluateEvidenceCleanup(null, 0), {
+      status: "verified_clean",
+      proof: "descriptor_count",
+      lifecycle: null,
+      descriptorCount: 0,
+    });
+
+    for (const field of LIFECYCLE_COUNTER_FIELDS) {
+      const snapshot = { ...ZERO_LIFECYCLE_SNAPSHOT, [field]: 1 };
+      assert.deepEqual(evaluateEvidenceCleanup(snapshot, null), {
+        status: "cleanup_incomplete",
+        lifecycle: snapshot,
+        descriptorCount: null,
+      });
+    }
+    assert.deepEqual(
+      evaluateRuntimeLifecycle(
+        { ...ZERO_LIFECYCLE_SNAPSHOT, activeOperationCount: -1 },
+        1,
+      ),
+      {
+        status: "cleanup_incomplete",
+        lifecycle: null,
+        descriptorCount: 1,
+      },
+      "a positive descriptor count remains authoritative even beside a malformed snapshot",
+    );
+  });
+
+  test("every malformed runtime lifecycle counter fails closed without coercion", () => {
+    const malformedValues: readonly (readonly [string, unknown])[] = [
+      ["negative", -1],
+      ["fractional", 0.5],
+      ["NaN", Number.NaN],
+      ["positive infinity", Number.POSITIVE_INFINITY],
+      ["negative infinity", Number.NEGATIVE_INFINITY],
+      ["string", "0"],
+      ["boolean", false],
+      ["null", null],
+      ["object", {}],
+      ["unsafe positive integer", Number.MAX_SAFE_INTEGER + 1],
+      ["unsafe negative integer", Number.MIN_SAFE_INTEGER - 1],
+    ];
+
+    for (const field of LIFECYCLE_COUNTER_FIELDS) {
+      for (const [label, value] of malformedValues) {
+        const snapshot: Record<string, unknown> = {
+          ...ZERO_LIFECYCLE_SNAPSHOT,
+          [field]: value,
+        };
+        assert.deepEqual(
+          evaluateRuntimeLifecycle(snapshot),
+          {
+            status: "verification_unavailable",
+            lifecycle: null,
+            descriptorCount: null,
+          },
+          `${field}: ${label}`,
+        );
+      }
+
+      const missing: Record<string, unknown> = { ...ZERO_LIFECYCLE_SNAPSHOT };
+      delete missing[field];
+      assert.equal(
+        evaluateRuntimeLifecycle(missing).status,
+        "verification_unavailable",
+        `${field}: missing`,
+      );
+    }
+
+    for (const closed of [undefined, 0, "false", null, {}]) {
+      const snapshot: Record<string, unknown> = {
+        ...ZERO_LIFECYCLE_SNAPSHOT,
+        closed,
+      };
+      if (closed === undefined) delete snapshot["closed"];
+      assert.equal(
+        evaluateRuntimeLifecycle(snapshot).status,
+        "verification_unavailable",
+        `closed: ${String(closed)}`,
+      );
+    }
+
+    const accessorSnapshot = { ...ZERO_LIFECYCLE_SNAPSHOT };
+    Object.defineProperty(accessorSnapshot, "activeOperationCount", {
+      enumerable: true,
+      get: () => 0,
+    });
+    assert.equal(
+      evaluateRuntimeLifecycle(accessorSnapshot).status,
+      "verification_unavailable",
+      "accessor-backed counters cannot certify cleanup",
+    );
+  });
+
   test("unavailable preferred verification distinguishes live, clean, and unverified ownership", () => {
     const factory = new CountingFactory();
     const manager = lifecycle(factory);
@@ -500,3 +621,13 @@ describe("mission evidence database-handle lifecycle", () => {
     assertBalanced(factory);
   });
 });
+
+function evaluateRuntimeLifecycle(
+  snapshot: unknown,
+  descriptorCount: number | null = null,
+) {
+  return evaluateEvidenceCleanup(
+    snapshot as EvidenceHandleLifecycleSnapshot,
+    descriptorCount,
+  );
+}

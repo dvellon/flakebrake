@@ -22,6 +22,15 @@ export interface EvidenceHandleLifecycleSnapshot {
   readonly closed: boolean;
 }
 
+const EVIDENCE_HANDLE_LIFECYCLE_FIELD_KINDS = Object.freeze({
+  activeOperationCount: "counter",
+  retainedOperationCount: "counter",
+  ownedHandleCount: "counter",
+  closed: "boolean",
+} as const satisfies Readonly<
+  Record<keyof EvidenceHandleLifecycleSnapshot, "counter" | "boolean">
+>);
+
 export type EvidenceCleanupVerification =
   | {
       readonly status: "verified_clean";
@@ -212,26 +221,43 @@ export function evaluateEvidenceCleanup(
     throw new TypeError("evidence descriptor count must be a nonnegative integer or null");
   }
 
-  const lifecycleIncomplete =
-    lifecycle !== null &&
-    (lifecycle.activeOperationCount > 0 ||
-      lifecycle.retainedOperationCount > 0 ||
-      lifecycle.ownedHandleCount > 0);
-  if (lifecycleIncomplete || (descriptorCount !== null && descriptorCount > 0)) {
+  const validatedLifecycle =
+    lifecycle === null ? null : validateEvidenceHandleLifecycleSnapshot(lifecycle);
+  if (descriptorCount !== null && descriptorCount > 0) {
     return Object.freeze({
       status: "cleanup_incomplete",
-      lifecycle,
+      lifecycle: validatedLifecycle,
       descriptorCount,
     });
   }
-  if (lifecycle !== null) {
+  if (lifecycle !== null && validatedLifecycle === null) {
+    return Object.freeze({
+      status: "verification_unavailable",
+      lifecycle: null,
+      descriptorCount: null,
+    });
+  }
+
+  const lifecycleIncomplete =
+    validatedLifecycle !== null &&
+    (validatedLifecycle.activeOperationCount > 0 ||
+      validatedLifecycle.retainedOperationCount > 0 ||
+      validatedLifecycle.ownedHandleCount > 0);
+  if (lifecycleIncomplete) {
+    return Object.freeze({
+      status: "cleanup_incomplete",
+      lifecycle: validatedLifecycle,
+      descriptorCount,
+    });
+  }
+  if (validatedLifecycle !== null) {
     return Object.freeze({
       status: "verified_clean",
       proof:
         descriptorCount === null
           ? "lifecycle_ownership"
           : "lifecycle_and_descriptor",
-      lifecycle,
+      lifecycle: validatedLifecycle,
       descriptorCount,
     });
   }
@@ -248,6 +274,46 @@ export function evaluateEvidenceCleanup(
     lifecycle: null,
     descriptorCount: null,
   });
+}
+
+/** Validate and snapshot untrusted runtime input without coercion or repeat reads. */
+function validateEvidenceHandleLifecycleSnapshot(
+  value: unknown,
+): EvidenceHandleLifecycleSnapshot | null {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return null;
+    }
+    const record = value as Record<string, unknown>;
+    const validated: Record<string, number | boolean> = {};
+    for (const [field, kind] of Object.entries(
+      EVIDENCE_HANDLE_LIFECYCLE_FIELD_KINDS,
+    )) {
+      const descriptor = Object.getOwnPropertyDescriptor(record, field);
+      if (descriptor === undefined || !("value" in descriptor)) return null;
+      const fieldValue: unknown = descriptor.value;
+      if (kind === "counter") {
+        if (
+          typeof fieldValue !== "number" ||
+          !Number.isSafeInteger(fieldValue) ||
+          fieldValue < 0
+        ) {
+          return null;
+        }
+      } else if (typeof fieldValue !== "boolean") {
+        return null;
+      }
+      validated[field] = fieldValue;
+    }
+    return Object.freeze({
+      activeOperationCount: validated["activeOperationCount"] as number,
+      retainedOperationCount: validated["retainedOperationCount"] as number,
+      ownedHandleCount: validated["ownedHandleCount"] as number,
+      closed: validated["closed"] as boolean,
+    });
+  } catch {
+    return null;
+  }
 }
 
 /** Fail closed unless cleanup has at least one complete independent proof. */
