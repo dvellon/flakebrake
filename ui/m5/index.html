@@ -23,50 +23,6 @@
     </header>
 
     <main id="main">
-      <section id="guided-story" class="guided-story" aria-labelledby="guided-heading">
-        <div class="guided-copy">
-          <p class="eyebrow">The story so far</p>
-          <h1 id="guided-heading">A rush order is waiting</h1>
-          <p id="guided-what" class="guided-what">Loading the mission story…</p>
-          <p id="guided-why" class="guided-why"></p>
-          <p id="guided-mechanical" class="guided-mechanical" hidden>The same unsafe request was blocked automatically — FlakeBrake recognized the denied action in another technical representation, and no additional owner decision was used.</p>
-          <p class="guided-next"><strong>Next:</strong> <span id="guided-next">Start the mission.</span></p>
-        </div>
-        <dl class="guided-numbers" aria-label="Three key numbers">
-          <div><dt>Display order</dt><dd id="guided-number-display">—</dd><dd class="guided-number-note">lower priority</dd></div>
-          <div><dt>Protected medical order</dt><dd id="guided-number-protected">—</dd><dd class="guided-number-note">unchanged</dd></div>
-          <div><dt>Factory changes</dt><dd id="guided-number-mutations">—</dd><dd class="guided-number-note" id="guided-number-mutations-note">none yet</dd></div>
-        </dl>
-      </section>
-
-      <section id="approval-panel" class="approval-panel is-continuing" aria-labelledby="approval-title">
-        <div class="approval-heading">
-          <div>
-            <p class="eyebrow">Your decision</p>
-            <h2 id="approval-title" tabindex="-1">Mission controls ready</h2>
-          </div>
-          <span id="approval-phase" class="pill pill-neutral">Standing by</span>
-        </div>
-        <p id="approval-tool" class="action-name">No consequential action is waiting</p>
-        <p id="approval-effect" class="approval-effect">Start the mission to reach the first owner decision.</p>
-        <details id="approval-details">
-          <summary>Durable action identity</summary>
-          <dl class="identity-grid technical-identity">
-            <div><dt>Mission</dt><dd id="approval-mission"></dd></div>
-            <div><dt>Action digest</dt><dd id="approval-digest"></dd></div>
-            <div><dt>Owner source</dt><dd id="approval-source"></dd></div>
-            <div id="approval-subject-row"><dt>Bound record</dt><dd id="approval-subject"></dd></div>
-          </dl>
-        </details>
-        <div class="approval-actions">
-          <button id="deny-button" class="button button-quiet" type="button" disabled>Deny action</button>
-          <button id="allow-button" class="button button-quiet" type="button" disabled>Approve action</button>
-        </div>
-        <p id="approval-guidance" class="guidance"></p>
-        <div id="policy-decision" class="policy-decision" hidden></div>
-        <p id="decision-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
-      </section>
-
       <section id="harness-ribbon" class="harness-ribbon" aria-labelledby="harness-title">
         <div class="harness-lockup">
           <span class="harness-mark" aria-hidden="true">TF</span>
@@ -76,7 +32,6 @@
           </div>
           <span id="harness-state" class="pill pill-neutral harness-state" role="status">Ready</span>
         </div>
-        <p id="harness-plain" class="harness-plain">TrueForge is ready to coordinate specialist agents, connect 4 factory tools, run a sandbox check, and pause for your decisions.</p>
         <ol class="harness-chain" aria-label="TrueForge action chain">
           <li><span>Mission</span><small id="chain-mission">Configured</small></li>
           <li><span>3 specialist agents</span><small id="chain-agents">Configured</small></li>
@@ -86,73 +41,93 @@
           <li><span>Same-session resume</span><small id="chain-resume">Configured</small></li>
           <li><span>Verified result</span><small id="chain-verified">—</small></li>
         </ol>
+        <p id="harness-plain" class="harness-plain">TrueForge is ready to coordinate specialist agents, connect 4 factory tools, run a sandbox check, and pause for your decisions.</p>
         <p id="harness-pause" class="harness-pause" hidden>TrueForge paused this turn for your decision.</p>
-        <details class="harness-technical">
-          <summary>Show TrueForge technical evidence</summary>
-          <dl class="harness-facts">
-            <div><dt>Session</dt><dd id="harness-session">Not started</dd></div>
-            <div><dt>Turn</dt><dd id="harness-turn">—</dd></div>
-            <div><dt>Runtime</dt><dd id="harness-runtime">—</dd></div>
-            <div><dt>MCP</dt><dd id="harness-mcp">—</dd></div>
-            <div><dt>Sandbox</dt><dd id="harness-sandbox">—</dd></div>
-            <div><dt>Subagents</dt><dd id="harness-subagents">—</dd></div>
-            <div><dt>Approval gate</dt><dd id="harness-gate">—</dd></div>
-            <div id="harness-replay-row" hidden><dt>Replay</dt><dd id="harness-replay">—</dd></div>
+        <div class="harness-disclosures">
+          <details class="harness-technical">
+            <summary>Show TrueForge technical evidence</summary>
+            <dl class="harness-facts">
+              <div><dt>Session</dt><dd id="harness-session">Not started</dd></div>
+              <div><dt>Turn</dt><dd id="harness-turn">—</dd></div>
+              <div><dt>Runtime</dt><dd id="harness-runtime">—</dd></div>
+              <div><dt>MCP</dt><dd id="harness-mcp">—</dd></div>
+              <div><dt>Sandbox</dt><dd id="harness-sandbox">—</dd></div>
+              <div><dt>Subagents</dt><dd id="harness-subagents">—</dd></div>
+              <div><dt>Approval gate</dt><dd id="harness-gate">—</dd></div>
+              <div id="harness-replay-row" hidden><dt>Replay</dt><dd id="harness-replay">—</dd></div>
+            </dl>
+          </details>
+          <details class="harness-why">
+            <summary>Why TrueForge matters</summary>
+            <p>TrueForge owns sessions and turns, MCP routing, sandbox execution, subagents, approval pauses, and reconnect. FlakeBrake owns admission policy, exact authorization, mechanical alternate-representation denial, fenced mutation, and independent verification.</p>
+          </details>
+        </div>
+      </section>
+
+      <section class="mission-stage" aria-label="Active scenario, mission story, and decisions">
+        <div class="stage-bar">
+          <div class="stage-copy">
+            <p id="hero-eyebrow" class="eyebrow">Deterministic TrueForge mission</p>
+            <p id="hero-title" class="hero-title"><span id="hero-lead">A rush order.</span> <span id="hero-result" class="hero-line">One safe promise.</span></p>
+            <p id="hero-copy" class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
+            <p id="scenario-transition" class="scenario-transition" hidden></p>
+          </div>
+          <div class="hero-actions">
+            <label class="scenario-selector" for="scenario-select">
+              <span>Scenario</span>
+              <select id="scenario-select" name="scenario">
+                <option value="rush-order" selected>Rush order · hero</option>
+                <option value="capacity-shock">Capacity shock · second scenario</option>
+              </select>
+            </label>
+            <button id="start-button" class="button button-primary" type="button">Start hero mission</button>
+            <button id="reset-button" class="button button-quiet" type="button">Reset demo</button>
+          </div>
+        </div>
+
+        <section id="guided-story" class="guided-story" aria-labelledby="guided-heading">
+          <div class="guided-copy">
+            <p class="eyebrow">The story so far</p>
+            <h1 id="guided-heading">A rush order is waiting</h1>
+            <p id="guided-what" class="guided-what">Loading the mission story…</p>
+            <p id="guided-why" class="guided-why"></p>
+            <p id="guided-mechanical" class="guided-mechanical" hidden>The same unsafe request was blocked automatically — FlakeBrake recognized the denied action in another technical representation, and no additional owner decision was used.</p>
+            <p class="guided-next"><strong>Next:</strong> <span id="guided-next">Start the mission.</span></p>
+          </div>
+          <dl class="guided-numbers" aria-label="Three key numbers">
+            <div><dt>Display order</dt><dd id="guided-number-display">—</dd><dd class="guided-number-note">lower priority</dd></div>
+            <div><dt>Protected medical order</dt><dd id="guided-number-protected">—</dd><dd class="guided-number-note">unchanged</dd></div>
+            <div><dt>Factory changes</dt><dd id="guided-number-mutations">—</dd><dd class="guided-number-note" id="guided-number-mutations-note">none yet</dd></div>
           </dl>
-        </details>
-        <details class="harness-why">
-          <summary>Why TrueForge matters</summary>
-          <p>TrueForge owns sessions and turns, MCP routing, sandbox execution, subagents, approval pauses, and reconnect. FlakeBrake owns admission policy, exact authorization, mechanical alternate-representation denial, fenced mutation, and independent verification.</p>
-        </details>
-      </section>
+        </section>
 
-      <section id="agent-trust" class="agent-trust" aria-labelledby="trust-heading">
-        <p class="eyebrow">Agents checking agents</p>
-        <h2 id="trust-heading">No agent’s claim is trusted on its own word</h2>
-        <p class="trust-primary">Agents can propose anything; they cannot make it true. Every consequential effect must pass current-state checks, authorization, fenced execution, and independent verification.</p>
-        <p id="trust-recheck" class="trust-recheck" hidden>Specialist recommendations are recorded with TrueForge thread provenance — recorded, not semantically verified. Only the root agent’s exact, checked actions can change factory state.</p>
-        <ol class="trust-chain" aria-label="Agent trust sequence">
-          <li>Specialist recommendation recorded</li>
-          <li>Root proposes exact action</li>
-          <li>FlakeBrake checks authoritative state</li>
-          <li>Human approval when required</li>
-          <li>Fenced execution</li>
-          <li>Independent read-back</li>
-        </ol>
-        <p id="trust-empty" class="trust-empty">No consequential claims yet — a row appears only when durable evidence records a claim and its authoritative check.</p>
-        <ol id="trust-rows" class="trust-rows"></ol>
-        <details class="trust-technical">
-          <summary>Show agent-trust technical identifiers</summary>
-          <ol id="trust-technical-list" class="trust-technical-list"></ol>
-        </details>
-      </section>
-
-      <section class="hero" aria-labelledby="hero-title">
-        <div>
-          <p id="hero-eyebrow" class="eyebrow">Deterministic TrueForge mission</p>
-          <p id="hero-title" class="hero-title"><span id="hero-lead">A rush order.</span> <span id="hero-result" class="hero-line">One safe promise.</span></p>
-          <p id="hero-copy" class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
-          <p id="basis-note" class="basis-note"><strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores.</p>
-          <p id="scenario-transition" class="scenario-transition" hidden></p>
-        </div>
-        <div class="hero-actions">
-          <label class="scenario-selector" for="scenario-select">
-            <span>Scenario</span>
-            <select id="scenario-select" name="scenario">
-              <option value="rush-order" selected>Rush order · hero</option>
-              <option value="capacity-shock">Capacity shock · second scenario</option>
-            </select>
-          </label>
-          <button id="start-button" class="button button-primary" type="button">Start hero mission</button>
-          <button id="reset-button" class="button button-quiet" type="button">Reset demo</button>
-        </div>
-      </section>
-
-      <section class="mission-strip" aria-label="Mission identity and status">
-        <div><span>Mission</span><strong id="mission-id">—</strong></div>
-        <div><span>Session</span><strong id="session-id">Not started</strong></div>
-        <div><span>Current turn</span><strong id="turn-id">—</strong></div>
-        <div><span>Outcome</span><strong id="outcome" class="tone-neutral">Waiting</strong></div>
+        <section id="approval-panel" class="approval-panel is-continuing" aria-labelledby="approval-title">
+          <div class="approval-heading">
+            <div>
+              <p class="eyebrow">Your decision</p>
+              <h2 id="approval-title" tabindex="-1">Mission controls ready</h2>
+            </div>
+            <span id="approval-phase" class="pill pill-neutral">Standing by</span>
+          </div>
+          <p id="approval-tool" class="action-name">No consequential action is waiting</p>
+          <p id="approval-effect" class="approval-effect">Start the mission to reach the first owner decision.</p>
+          <details id="approval-details">
+            <summary>Durable action identity</summary>
+            <dl class="identity-grid technical-identity">
+              <div><dt>Mission</dt><dd id="approval-mission"></dd></div>
+              <div><dt>Action digest</dt><dd id="approval-digest"></dd></div>
+              <div><dt>Owner source</dt><dd id="approval-source"></dd></div>
+              <div id="approval-subject-row"><dt>Bound record</dt><dd id="approval-subject"></dd></div>
+            </dl>
+          </details>
+          <div id="approval-actions" class="approval-actions" hidden>
+            <button id="deny-button" class="button button-quiet" type="button" disabled>Deny action</button>
+            <button id="allow-button" class="button button-quiet" type="button" disabled>Approve action</button>
+          </div>
+          <p id="approval-guidance" class="guidance"></p>
+          <div id="policy-decision" class="policy-decision" hidden></div>
+          <p id="decision-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+        </section>
       </section>
 
       <section id="proof-center" class="proof-center" aria-labelledby="proof-center-title">
@@ -216,12 +191,44 @@
         </aside>
       </section>
 
+      <section id="agent-trust" class="agent-trust" aria-labelledby="trust-heading">
+        <p class="eyebrow">Agents checking agents</p>
+        <h2 id="trust-heading">No agent’s claim is trusted on its own word</h2>
+        <p class="trust-primary">Agents can propose anything; they cannot make it true. Every consequential effect must pass current-state checks, authorization, fenced execution, and independent verification.</p>
+        <p id="trust-recheck" class="trust-recheck" hidden>Specialist recommendations are recorded with TrueForge thread provenance — recorded, not semantically verified. Only the root agent’s exact, checked actions can change factory state.</p>
+        <details class="trust-ledger">
+          <summary>Show the full agent trust ledger</summary>
+          <ol class="trust-chain" aria-label="Agent trust sequence">
+            <li>Specialist recommendation recorded</li>
+            <li>Root proposes exact action</li>
+            <li>FlakeBrake checks authoritative state</li>
+            <li>Human approval when required</li>
+            <li>Fenced execution</li>
+            <li>Independent read-back</li>
+          </ol>
+          <p id="trust-empty" class="trust-empty">No consequential claims yet — a row appears only when durable evidence records a claim and its authoritative check.</p>
+          <ol id="trust-rows" class="trust-rows"></ol>
+          <details class="trust-technical">
+            <summary>Show agent-trust technical identifiers</summary>
+            <ol id="trust-technical-list" class="trust-technical-list"></ol>
+          </details>
+        </details>
+      </section>
+
+      <section class="mission-strip" aria-label="Mission identity and status">
+        <div><span>Mission</span><strong id="mission-id">—</strong></div>
+        <div><span>Session</span><strong id="session-id">Not started</strong></div>
+        <div><span>Current turn</span><strong id="turn-id">—</strong></div>
+        <div><span>Outcome</span><strong id="outcome" class="tone-neutral">Waiting</strong></div>
+      </section>
+
       <div class="dashboard">
         <section class="card story-card" aria-labelledby="promise-title">
           <div class="card-heading">
             <div><p class="eyebrow">01 · Original promise basis</p><h2 id="promise-title">Capacity before commitment</h2></div>
             <span class="pill pill-denied">Doesn’t fit yet · <code class="tech-tag">REPLAN</code></span>
           </div>
+          <p id="basis-note" class="basis-note"><strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores.</p>
           <p id="basis-context" class="context-note">The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.</p>
           <p id="basis-resolution" class="basis-resolution">The original rush basis needs the safest workable plan (a bounded replan) before any promise can be accepted.</p>
           <div id="capacity-grid" class="capacity-grid" role="group" aria-label="Capacity evaluation"></div>
@@ -259,7 +266,7 @@
 
         <section class="card result-card" aria-labelledby="result-title">
           <div class="card-heading">
-            <div><p class="eyebrow">05 · Verified outcome</p><h2 id="result-title">Execution ledger</h2></div>
+            <div><p class="eyebrow">05 · Verified outcome</p><h2 id="result-title">Factory change ledger</h2></div>
             <span id="verification-pill" class="pill pill-neutral">Not executed</span>
           </div>
           <div id="result-metrics" class="result-metrics"></div>

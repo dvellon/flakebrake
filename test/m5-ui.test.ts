@@ -203,6 +203,139 @@ describe("M5 operator proof center", () => {
   });
 });
 
+describe("Phase B: final UI structure and business terminology", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-phaseb-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  test("the compact TrueForge harness strip leads and stays evidence-backed", () => {
+    const ribbon = document.indexOf('id="harness-ribbon"');
+    const stage = document.indexOf('class="mission-stage"');
+    assert.ok(ribbon >= 0 && stage > ribbon, "the harness strip precedes the mission stage");
+    for (const station of ["chain-mission", "chain-agents", "chain-tools", "chain-sandbox", "chain-pause", "chain-resume", "chain-verified"]) {
+      assert.ok(document.includes(`id="${station}"`), `station ${station} remains present`);
+    }
+    assert.match(application, /setChain\("chain-sandbox", sandboxObserved/u, "stations stay driven by authoritative evidence");
+  });
+
+  test("the business scenario and guided story precede the detailed agent trust ledger", () => {
+    const stage = document.indexOf('class="mission-stage"');
+    const guided = document.indexOf('id="guided-story"');
+    const approval = document.indexOf('id="approval-panel"');
+    const trust = document.indexOf('id="agent-trust"');
+    assert.ok(stage >= 0 && guided > stage && approval > guided && trust > approval);
+  });
+
+  test("the duplicated large hero introduction is absent", () => {
+    assert.doesNotMatch(document, /<section class="hero"/u);
+    assert.equal(document.split('id="hero-title"').length - 1, 1, "exactly one hero title remains");
+    assert.equal(document.split('id="guided-heading"').length - 1, 1);
+  });
+
+  test("the guided story and decision area share the primary mission-stage container", () => {
+    assert.match(
+      document,
+      /<section class="mission-stage"[\s\S]*id="guided-story"[\s\S]*id="approval-panel"[\s\S]*<\/section>\s*<\/section>/u,
+    );
+  });
+
+  test("the full agent trust ledger is collapsed by default and keyboard accessible", () => {
+    assert.match(document, /<details class="trust-ledger">\s*<summary>Show the full agent trust ledger<\/summary>/u);
+    assert.doesNotMatch(document, /<details class="trust-ledger" open/u);
+    assert.match(
+      document,
+      /<details class="trust-ledger">[\s\S]*trust-chain[\s\S]*id="trust-rows"[\s\S]*trust-technical[\s\S]*<\/details>/u,
+      "chain, rows, and technical identifiers all live inside the native disclosure",
+    );
+    const trustSection = document.slice(document.indexOf('id="agent-trust"'), document.indexOf('class="mission-strip"'));
+    assert.ok(trustSection.indexOf("trust-primary") < trustSection.indexOf("trust-ledger"), "the primary claim stays visible outside the ledger");
+  });
+
+  test("approval actions appear only while an owner decision is pending", async () => {
+    const idleHarness = await createPollingHarness(idle, []);
+    assert.equal(idleHarness.evaluate("document.getElementById('approval-actions').hidden"), true);
+    const pending = uiProjection(idle, 4, "awaiting_approval");
+    const pendingHarness = await createPollingHarness(pending, []);
+    assert.equal(pendingHarness.evaluate("document.getElementById('approval-actions').hidden"), false);
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const settled: M5JudgeState = {
+      ...verifiedBase,
+      approvals: [
+        {
+          toolName: "create_schedule_reservation",
+          decision: "deny",
+          source: "owner",
+          ownerSourceIdentity: "owner/judge-ui",
+          actionIdentity: "sha256:settled-denial",
+          effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+          reason: "The primary interval conflicts with protected production commitments",
+          denialId: "m4-denial/primary",
+        },
+        {
+          toolName: "submit_schedule_change",
+          decision: "deny",
+          source: "active_m2_denial",
+          ownerSourceIdentity: null,
+          actionIdentity: "sha256:settled-equivalent",
+          effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+          reason: "canonically equivalent to the active denial",
+          denialId: "m4-denial/primary",
+        },
+      ],
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const settledHarness = await createPollingHarness(settled, []);
+    assert.equal(
+      settledHarness.evaluate("document.getElementById('approval-actions').hidden"),
+      true,
+      "the action row is hidden again after decisions settle and at terminal",
+    );
+    assert.equal(
+      settledHarness.evaluate("document.getElementById('policy-decision').hidden"),
+      false,
+      "settled decision records remain visible after their buttons disappear",
+    );
+    assert.match(settledHarness.evaluate<string>("document.getElementById('policy-decision').innerHTML"), /Blocked automatically — same denied action/u);
+  });
+
+  test("business-facing terminology replaces internal jargon without touching durable names", () => {
+    assert.match(application, /factory resource reallocation/u);
+    assert.match(application, /factory change · verified/u);
+    assert.match(application, /Factory change record/u);
+    assert.match(application, /One-time execution lock/u);
+    assert.match(application, /independently verified|Independently verified/u);
+    assert.match(document, /Factory change ledger/u);
+    assert.match(application, /"terminal_verified"/u, "the durable discriminant name is unchanged");
+    assert.match(application, /mutationCount/u, "internal projection field names are unchanged");
+    assert.match(application, /receiptCount/u);
+  });
+
+  test("both scenarios stay available in the same application", () => {
+    assert.match(document, /value="rush-order"/u);
+    assert.match(document, /value="capacity-shock"/u);
+  });
+
+  test("assurance wording claims neither prose verification nor signatures", () => {
+    assert.match(document, /recorded, not semantically verified/u);
+    assert.doesNotMatch(document, /semantically certif/iu);
+    assert.doesNotMatch(document, /signature/iu);
+    assert.doesNotMatch(application, /signature/iu);
+    assert.doesNotMatch(application, /producer.authenticat/iu);
+  });
+});
+
 describe("M5 plain-language guided story", () => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-guided-"));
   let coordinator!: M5DemoCoordinator;
@@ -334,7 +467,7 @@ describe("M5 plain-language guided story", () => {
     const done = await createPollingHarness(verified, []);
     assert.equal(done.text("guided-heading"), "Done—and independently verified");
     assert.match(done.text("guided-what"), /display order changed 10 → 8/u);
-    assert.match(done.text("guided-what"), /exactly one factory mutation/u);
+    assert.match(done.text("guided-what"), /exactly one factory change/u);
     assert.match(done.text("guided-why"), /will not repeat owner decisions or factory effects/u);
 
     const replayed: M5JudgeState = {

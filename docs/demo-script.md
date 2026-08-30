@@ -49,8 +49,8 @@ grant commit atomically; the old v1 `REPLAN` can never be accepted.”
 
 At the primary 09:10–09:40 reservation, choose **Deny action**.
 
-**Show:** The denial in the timeline, followed by “Auto-blocked · active
-policy.”
+**Show:** The denial in the timeline, followed by “Blocked automatically —
+same denied action.”
 
 **Say:** “The planner tried the same material effect through another MCP adapter.
 Typed effect normalization recognized it, so the active denial blocked it
@@ -100,8 +100,8 @@ corrections.”
 - Primary reservation is owner-denied.
 - Equivalent alternate is mechanically denied.
 - One distinct alternative is owner-approved.
-- Acceptance, attempt, mutation, and receipt counts are each one.
-- Actual facts are exactly two.
+- Acceptance, attempt, factory-change, and change-record counts are each one.
+- Measured resource facts are exactly two.
 - Terminal verification precedes root completion.
 - Refresh changes none of those counts.
 - Press `Ctrl+C` after the demo and confirm clean shutdown.

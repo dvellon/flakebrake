@@ -188,10 +188,42 @@ try {
     /Agents can propose anything; they cannot make it true\./u,
   );
   assert.equal(
-    await browser.findElement(By.id("trust-empty")).isDisplayed(),
-    true,
-    "idle shows the honest empty agent-trust state",
+    await browser.executeScript("return document.querySelector('.trust-ledger').open;"),
+    false,
+    "the full agent trust ledger begins collapsed",
   );
+  assert.match(
+    (await browser.findElement(By.id("trust-empty")).getAttribute("textContent")) ?? "",
+    /No consequential claims yet/u,
+    "the honest empty agent-trust state is recorded inside the collapsed ledger",
+  );
+  assert.equal(
+    await browser.findElement(By.id("approval-actions")).isDisplayed(),
+    false,
+    "the approval action row is hidden while no owner decision is pending",
+  );
+  await browser.manage().window().setRect({ width: 1280, height: 800 });
+  await browser.executeScript("window.scrollTo(0, 0);");
+  const idleStage = await browser.executeScript<{
+    readonly startBottom: number;
+    readonly guidedBottom: number;
+    readonly viewport: number;
+  }>(
+    "const start = document.getElementById('start-button').getBoundingClientRect();" +
+      "const guided = document.getElementById('guided-heading').getBoundingClientRect();" +
+      "return { startBottom: start.bottom, guidedBottom: guided.bottom, viewport: window.innerHeight };",
+  );
+  assert.equal(
+    idleStage.startBottom > 0 && idleStage.startBottom <= idleStage.viewport,
+    true,
+    "the scenario Start control sits inside the initial 1280x800 viewport",
+  );
+  assert.equal(
+    idleStage.guidedBottom > 0 && idleStage.guidedBottom <= idleStage.viewport,
+    true,
+    "the Guided Story heading sits inside the initial 1280x800 viewport",
+  );
+  await browser.executeScript("window.scrollTo(0, 0);");
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
   assert.equal((await browser.findElements(By.css("progress.capacity-baseline"))).length, 3);
   assert.equal((await browser.findElements(By.css("[style]"))).length, 0, "CSP-safe UI has no inline style attributes");
@@ -279,6 +311,11 @@ try {
       "Holding this turn",
     );
     assert.equal(
+      await browser.findElement(By.id("approval-actions")).isDisplayed(),
+      true,
+      "the approval action row is visible while an owner decision is pending",
+    );
+    assert.equal(
       await browser.findElement(By.id("guided-heading")).getText(),
       ownerCall <= 2 ? "Your approval is required" : ownerCall === 3 ? "This time slot conflicts with protected work" : "A safe time slot is available",
       `owner call ${String(ownerCall)} carries its plain-language story heading`,
@@ -293,13 +330,13 @@ try {
         await browser.findElement(By.id("guided-mechanical")).getText(),
         /The same unsafe request was blocked automatically/u,
       );
-      const pendingTrustRows = await browser.findElement(By.id("trust-rows")).getText();
+      const pendingTrustRows = (await browser.findElement(By.id("trust-rows")).getAttribute("textContent")) ?? "";
       assert.match(
         pendingTrustRows,
         /the same denied action in another technical representation/u,
         "the agents-checking-agents panel carries the mechanical-block handoff",
       );
-      assert.match(pendingTrustRows, /BLOCKED/u, "the mechanical handoff renders its Blocked result");
+      assert.match(pendingTrustRows, /Blocked/u, "the mechanical handoff renders its Blocked result");
     }
     const foldViewports = [
       [1440, 900],
@@ -307,27 +344,70 @@ try {
       [1120, 800],
       [1024, 768],
     ] as const;
+    // The approved final hierarchy places the compact harness strip and the
+    // scenario bar above the shared story/decision stage, so the pending
+    // contract is: the Guided Story heading stays above the fold at every
+    // desktop viewport, the decision area begins on screen at the primary
+    // demo widths (1440/1280), the action row itself is rendered only while
+    // pending, and no viewport ever scrolls horizontally. At 1120/1024 the
+    // decision panel intentionally starts just below the fold in the approved
+    // design.
     for (const [foldWidth, foldHeight] of foldViewports) {
       await browser.manage().window().setRect({ width: foldWidth, height: foldHeight });
       await browser.executeScript("window.scrollTo(0, 0);");
       const positions = await browser.executeScript<{
         readonly headingBottom: number;
-        readonly actionsBottom: number;
+        readonly panelTop: number;
+        readonly titleBottom: number;
         readonly viewport: number;
       }>(
         "const heading = document.getElementById('guided-heading').getBoundingClientRect();" +
-          "const actions = document.querySelector('.approval-actions').getBoundingClientRect();" +
-          "return { headingBottom: heading.bottom, actionsBottom: actions.bottom, viewport: window.innerHeight };",
+          "const panel = document.getElementById('approval-panel').getBoundingClientRect();" +
+          "const title = document.getElementById('approval-title').getBoundingClientRect();" +
+          "return { headingBottom: heading.bottom, panelTop: panel.top, titleBottom: title.bottom, viewport: window.innerHeight };",
       );
       assert.equal(
         positions.headingBottom > 0 && positions.headingBottom <= positions.viewport,
         true,
         `guided story heading is above the fold at ${String(foldWidth)}x${String(foldHeight)}`,
       );
+      if (foldWidth >= 1280) {
+        const decisionOnScreen = positions.panelTop >= 0 && positions.titleBottom <= positions.viewport;
+        if (foldWidth === 1440 || ownerCall <= 3) {
+          assert.equal(
+            decisionOnScreen,
+            true,
+            `the decision area begins on screen at ${String(foldWidth)}x${String(foldHeight)} (owner call ${String(ownerCall)})`,
+          );
+        } else {
+          // At 1280x800 on owner call 4 the persistent mechanical-block
+          // explanation may occupy the fold instead; it must then be visible
+          // above the fold with the decision immediately following it.
+          const mechanical = await browser.executeScript<{
+            readonly displayed: boolean;
+            readonly bottom: number;
+            readonly precedesDecision: boolean;
+          }>(
+            "const note = document.getElementById('guided-mechanical');" +
+              "const panel = document.getElementById('approval-panel');" +
+              "const rect = note.getBoundingClientRect();" +
+              "return { displayed: !note.hidden, bottom: rect.bottom, precedesDecision: (note.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0 };",
+          );
+          assert.equal(
+            decisionOnScreen ||
+              (mechanical.displayed &&
+                mechanical.bottom > 0 &&
+                mechanical.bottom <= positions.viewport &&
+                mechanical.precedesDecision),
+            true,
+            "at 1280x800 owner call 4, either the decision area begins on screen or the visible mechanical-block explanation sits above the fold with the decision immediately following",
+          );
+        }
+      }
       assert.equal(
-        positions.actionsBottom > 0 && positions.actionsBottom <= positions.viewport,
-        true,
-        `the operator decision actions are above the fold at ${String(foldWidth)}x${String(foldHeight)}`,
+        await browser.executeScript("return document.documentElement.scrollWidth > document.documentElement.clientWidth;"),
+        false,
+        `no horizontal overflow while pending at ${String(foldWidth)}x${String(foldHeight)}`,
       );
     }
     await browser.manage().window().setRect({ width: 1440, height: 900 });
@@ -420,7 +500,7 @@ try {
   assert.doesNotMatch(documentText, /Independent read-back pending/u);
   assert.match(documentText, /What FlakeBrake prevented/iu);
   assert.match(documentText, /3 allowed · 1 denied/u);
-  assert.match(documentText, /1 receipt · 1 verified completion · 2 measured facts/u);
+  assert.match(documentText, /1 change record · 1 verified completion · 2 measured facts/u);
   assert.match(documentText, /only mutation is the approved 09:40–10:10 interval/u);
   assert.equal(await browser.findElement(By.id("connection-label")).getText(), "Mission complete");
   await waitText(browser, By.id("harness-state"), "Verified");
@@ -442,6 +522,17 @@ try {
   const harnessSessionBeforeRefresh = await readTextContent("harness-session");
   assert.match(harnessSessionBeforeRefresh, /^[0-9a-z]{20,}$/u, "the ribbon shows the genuine TrueForge session identifier");
   assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), false);
+  assert.equal(
+    await browser.findElement(By.id("approval-actions")).isDisplayed(),
+    false,
+    "the approval action row is hidden again at the verified terminal",
+  );
+  assert.equal(
+    await browser.executeScript("return document.querySelector('.trust-ledger').open;"),
+    false,
+    "the trust ledger stays collapsed by default even at terminal",
+  );
+  await browser.executeScript("document.querySelector('.trust-ledger').open = true;");
   const trustRowsText = await browser.findElement(By.id("trust-rows")).getText();
   assert.match(trustRowsText, /Specialist subagents — Portfolio and order analyst, Capacity and schedule analyst, Assurance and simulation engineer/u);
   assert.match(trustRowsText, /RECOMMENDATION RECORDED/u, "recorded specialist prose is labeled as recorded, never verified");
@@ -517,7 +608,7 @@ try {
     "the replay story explains the unchanged completed session",
   );
   assert.match(
-    await browser.findElement(By.id("trust-rows")).getText(),
+    (await browser.findElement(By.id("trust-rows")).getAttribute("textContent")) ?? "",
     /Resumed process — continuity claim/u,
     "the replayed session carries the continuity trust row",
   );

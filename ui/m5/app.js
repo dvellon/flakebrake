@@ -3,7 +3,7 @@ const nodes = Object.fromEntries(
     "connection-dot", "connection-label", "start-button", "reset-button", "mission-id",
     "session-id", "turn-id", "outcome", "approval-panel", "approval-title", "approval-phase",
     "approval-tool", "approval-effect", "approval-mission", "approval-digest", "approval-source",
-    "approval-subject", "approval-subject-row", "approval-details", "allow-button", "deny-button",
+    "approval-subject", "approval-subject-row", "approval-details", "approval-actions", "allow-button", "deny-button",
     "approval-guidance", "decision-announcer", "policy-decision", "capacity-grid", "obligations",
     "proposal", "basis-note", "basis-resolution", "winning-change", "candidate-list", "model-requests",
     "agent-tree", "runtime-chips", "timeline", "verification-pill", "result-metrics",
@@ -310,7 +310,7 @@ function renderGuidedStory() {
   let next;
   if (phase === "verified") {
     heading = "Done—and independently verified";
-    what = `The lower-priority display order changed ${winner.fromQuantity} → ${winner.toQuantity}; the protected medical and rush work stayed intact; exactly one factory mutation occurred and was independently read back.`;
+    what = `The lower-priority display order changed ${winner.fromQuantity} → ${winner.toQuantity}; the protected medical and rush work stayed intact; exactly one factory change occurred and was independently read back.`;
     why = replayEvidence
       ? "You are viewing the same completed TrueForge session — no decisions, owner calls, or factory effects were repeated."
       : "Refresh or restart will not repeat owner decisions or factory effects.";
@@ -502,7 +502,7 @@ function renderProofCenter() {
   nodes["proof-center-status"].className = `pill ${verified ? "pill-verified" : state.execution.mutationCount > 0 ? "pill-pending" : "pill-neutral"}`;
   nodes["proof-center-status"].textContent = verified ? "Verified record" : state.execution.mutationCount > 0 ? "Read-back pending" : "Canonical basis";
   nodes["proof-center-lead"].textContent = verified
-    ? `The direct promise stayed blocked, the bounded ${winner.fromQuantity}→${winner.toQuantity} change to “${winnerObjective}” was authorized, and exactly ${state.execution.mutationCount} factory mutation was independently verified.`
+    ? `The direct promise stayed blocked, the bounded ${winner.fromQuantity}→${winner.toQuantity} change to “${winnerObjective}” was authorized, and exactly ${state.execution.mutationCount} factory resource reallocation was independently verified.`
     : `The direct rush plan is blocked on ${directViolations.length} finite capacity limits. The safe basis changes “${winnerObjective}” from ${winner.fromQuantity} to ${winner.toQuantity} and leaves protected work unchanged.`;
 
   nodes["proof-direct-result"].textContent =
@@ -517,9 +517,9 @@ function renderProofCenter() {
     ? `${mechanicalDenials.length} equivalent action mechanically blocked`
     : state.pendingApproval ? actionLabel(state.pendingApproval.toolName) : "Exact action ledger populates during the mission";
   nodes["proof-outcome-result"].textContent = verified
-    ? `${state.execution.mutationCount} mutation · verified`
-    : state.execution.mutationCount > 0 ? `${state.execution.mutationCount} mutation · not yet success` : "No factory effect";
-  nodes["proof-outcome-note"].textContent = `${state.execution.receiptCount} receipt · ${state.execution.terminalEventCount} ${verifiedCompletionEvidence() ? "verified completion" : "terminal event"} · ${state.execution.actualFactCount} measured facts`;
+    ? `${state.execution.mutationCount} factory change · verified`
+    : state.execution.mutationCount > 0 ? `${state.execution.mutationCount} factory change · not yet success` : "No factory effect";
+  nodes["proof-outcome-note"].textContent = `${state.execution.receiptCount} change record · ${state.execution.terminalEventCount} ${verifiedCompletionEvidence() ? "verified completion" : "terminal event"} · ${state.execution.actualFactCount} measured facts`;
 
   renderProofDecisions(ownerDecisions, mechanicalDenials);
   renderProofCapacity(winnerCandidate, directViolations);
@@ -559,14 +559,14 @@ function renderProofCapacity(winnerCandidate, directViolations) {
 function renderDurableProof(verified, replayed) {
   const result = state.execution;
   nodes["proof-durable-summary"].textContent = verified
-    ? `${result.mutationCount} mutation · ${result.receiptCount} receipt · ${result.terminalEventCount} ${verifiedCompletionEvidence() ? "verified completion" : "terminal event"} · ${result.actualFactCount} measured facts`
-    : result.receiptCount > 0 ? "Receipt present · independent verification still required" : "Mutation is not verified success";
+    ? `${result.mutationCount} factory change · ${result.receiptCount} change record · ${result.terminalEventCount} ${verifiedCompletionEvidence() ? "verified completion" : "terminal event"} · ${result.actualFactCount} measured facts`
+    : result.receiptCount > 0 ? "Change record present · independent verification still required" : "A recorded change is not verified success";
   const readBackStatus = result.independentReadBackObserved ? "Observed before terminal completion" : "Not yet observed";
-  const terminalStatus = result.terminalStatus === "terminal_verified" ? "terminal_verified recorded" : "Not recorded";
+  const terminalStatus = result.terminalStatus === "terminal_verified" ? "Independently verified — recorded as terminal_verified" : "Not recorded";
   const replayCopy = verified
     ? `${replayed ? "This browser is attached to a durable replay." : "The verified projection is durable across refresh and restart."} This process made ${state.run.ownerCallsThisProcess} owner call${state.run.ownerCallsThisProcess === 1 ? "" : "s"}; the durable effect count remains ${result.mutationCount}.`
     : "Refresh and recovery read the same durable records; neither may turn a receipt into success or repeat an effect.";
-  nodes["proof-durable-proof"].innerHTML = `<div class="proof-counts"><div><strong>${result.mutationCount}</strong><span>Mutation</span></div><div><strong>${result.receiptCount}</strong><span>Receipt</span></div><div><strong>${result.terminalEventCount}</strong><span>${verifiedCompletionEvidence() ? "Verified completion" : "Terminal event"}</span></div><div><strong>${result.actualFactCount}</strong><span>Measured facts</span></div></div><ol class="durable-chain"><li class="${result.receiptCount ? "complete" : "waiting"}"><span>1</span><div><strong>Mutation receipt</strong><p>A receipt proves the fenced factory command committed. By itself, it is not verified success.</p></div></li><li class="${result.independentReadBackObserved ? "complete" : result.receiptCount ? "active" : "waiting"}"><span>2</span><div><strong>Independent read-back</strong><p>${readBackStatus}${result.approvedInterval ? ` · ${escapeHtml(formatFriendlyInterval(result.approvedInterval))}` : ""}</p></div></li><li class="${verified ? "complete" : "waiting"}"><span>3</span><div><strong>Verified completion</strong><p>${terminalStatus}. Only this state is presented as success.</p></div></li></ol><p class="replay-proof">${escapeHtml(replayCopy)}</p>`;
+  nodes["proof-durable-proof"].innerHTML = `<div class="proof-counts"><div><strong>${result.mutationCount}</strong><span>Factory change</span></div><div><strong>${result.receiptCount}</strong><span>Change record</span></div><div><strong>${result.terminalEventCount}</strong><span>${verifiedCompletionEvidence() ? "Verified completion" : "Terminal event"}</span></div><div><strong>${result.actualFactCount}</strong><span>Measured facts</span></div></div><ol class="durable-chain"><li class="${result.receiptCount ? "complete" : "waiting"}"><span>1</span><div><strong>Factory change record</strong><p>This record proves the one-time-locked factory command committed. By itself, it is not verified success.</p></div></li><li class="${result.independentReadBackObserved ? "complete" : result.receiptCount ? "active" : "waiting"}"><span>2</span><div><strong>Independent read-back</strong><p>${readBackStatus}${result.approvedInterval ? ` · ${escapeHtml(formatFriendlyInterval(result.approvedInterval))}` : ""}</p></div></li><li class="${verified ? "complete" : "waiting"}"><span>3</span><div><strong>Verified completion</strong><p>${terminalStatus}. Only this state is presented as success.</p></div></li></ol><p class="replay-proof">${escapeHtml(replayCopy)}</p>`;
 }
 
 function renderTechnicalProof(winnerCandidate) {
@@ -690,6 +690,7 @@ function renderApproval() {
         : state.run.status === "idle" ? "Start the mission to reach the first owner decision."
           : "The recorded decision is durable; the mission is advancing to its next bounded phase.";
     nodes["approval-details"].hidden = true;
+    nodes["approval-actions"].hidden = true;
     nodes["allow-button"].disabled = true;
     nodes["deny-button"].disabled = true;
     setRecommendedAction(null);
@@ -729,6 +730,7 @@ function renderApproval() {
       ? `${state.scenario.scenarioId === "rush-order" ? originalHeroPresentation.alternativeGuidance : state.scenario.alternativeGuidance}${primaryDenial ? ` Primary denial rationale: ${primaryDenial.reason}.` : ""}`
       : "Recommended: Approve — this bounded step preserves the canonical promise basis.";
   setRecommendedAction(approval.recommendedDecision);
+  nodes["approval-actions"].hidden = false;
   const decisionPending = approvalMutationInFlight === approval.actionIdentity;
   nodes["allow-button"].disabled = decisionPending;
   nodes["deny-button"].disabled = decisionPending;
@@ -813,16 +815,16 @@ function renderExecution() {
   nodes["verification-pill"].textContent = verified ? "Verified" : result.mutationCount ? "Read-back pending" : "Not executed";
   const metrics = [
     [result.acceptanceCount, "Promise accepted", "Fresh capacity-safe basis"],
-    [result.attemptCount, "Execution attempt", "One fenced factory command"],
-    [result.mutationCount, "Factory mutation", "Authorized schedule effect"],
-    [result.receiptCount, "Mutation receipt", "Durable command evidence"],
+    [result.attemptCount, "Execution attempt", "One-time execution lock"],
+    [result.mutationCount, "Factory reallocation", "Authorized schedule change"],
+    [result.receiptCount, "Factory change record", "Durable command evidence"],
   ];
   nodes["result-metrics"].innerHTML = metrics.map(([value, label, subtitle]) => `<div class="metric"><strong>${value}</strong><span>${label}</span><small>${subtitle}</small></div>`).join("");
   assignPreservingDisclosure(nodes["actual-facts"], result.actualFacts.length
     ? `<h3>Measured resource use</h3>${result.actualFacts.map((item) => { const presentation = resourcePresentation[item.resourceKey] ?? [item.resourceKey, item.workClassKey]; return `<div class="actual-fact"><span><b>${escapeHtml(presentation[0])}</b><small class="fact-subtitle">${escapeHtml(presentation[1])} · ${escapeHtml(item.workClassKey.replaceAll("_", " "))}</small><details class="fact-details"><summary>Technical fact</summary><code>${escapeHtml(item.resourceKey)} · ${escapeHtml(item.workClassKey)}</code></details></span><strong>${item.value}</strong></div>`; }).join("")}`
     : "");
   const stages = [
-    ["Mutation committed", result.mutationCount === 1 ? "complete" : "waiting"],
+    ["Factory change committed", result.mutationCount === 1 ? "complete" : "waiting"],
     [
       result.independentReadBackObserved ? "Independent read-back observed" : "Independent read-back pending",
       result.mutationCount === 1 && !result.independentReadBackObserved ? "active" : result.independentReadBackObserved ? "complete" : "waiting",
