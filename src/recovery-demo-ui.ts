@@ -14,6 +14,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import type { Socket } from "node:net";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,6 +37,7 @@ const RECOVERY_STATE_SCHEMA = "flakebrake-recovery-demo-state/v1";
 const RECOVERY_SCENARIO_ID = "deterministic_exact_once_recovery";
 const OWNERSHIP_MARKER = ".flakebrake-recovery-demo-owned-v1";
 const MAX_BODY_BYTES = 8 * 1024;
+const DEFAULT_REQUEST_DRAIN_TIMEOUT_MS = 500;
 
 export type RecoveryDemoStage =
   | "idle"
@@ -300,12 +302,12 @@ export class RecoveryDemoCoordinator {
 
   public close(): void {
     if (this.#stage === "closed") return;
-    this.#stage = "closed";
-    this.#bump();
     if (this.#cleanupDataOnClose) {
       requireOwnershipMarker(this.#dataRoot);
       rmSync(this.#dataRoot, { recursive: true, force: true });
     }
+    this.#stage = "closed";
+    this.#bump();
   }
 
   #record(
@@ -355,13 +357,21 @@ export class RecoveryDemoCoordinator {
 export interface StartRecoveryDemoServerOptions extends RecoveryDemoCoordinatorOptions {
   readonly port?: number;
   readonly assetRoot?: string;
+  readonly requestDrainTimeoutMs?: number;
 }
 
 export interface RunningRecoveryDemoServer {
   readonly url: string;
   readonly port: number;
   readonly coordinator: RecoveryDemoCoordinator;
+  activeRequestCount(): number;
   close(): Promise<void>;
+}
+
+interface ActiveRecoveryDemoRequest {
+  readonly request: IncomingMessage;
+  readonly response: ServerResponse;
+  readonly settled: Promise<void>;
 }
 
 interface RecoveryDemoApiResult {
@@ -376,6 +386,11 @@ export async function startRecoveryDemoServer(
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
     throw new TypeError("Recovery demonstration port must be between 0 and 65535");
   }
+  const requestDrainTimeoutMs =
+    options.requestDrainTimeoutMs ?? DEFAULT_REQUEST_DRAIN_TIMEOUT_MS;
+  if (!Number.isSafeInteger(requestDrainTimeoutMs) || requestDrainTimeoutMs < 1) {
+    throw new TypeError("Recovery request drain timeout must be a positive integer");
+  }
   const coordinator = new RecoveryDemoCoordinator(options);
   const assetRoot =
     options.assetRoot ?? fileURLToPath(new URL("../ui/recovery/", import.meta.url));
@@ -384,18 +399,74 @@ export async function startRecoveryDemoServer(
     { readonly digest: string; readonly response: RecoveryDemoApiResult }
   >();
   let origin = "";
-  let closePromise: Promise<void> | null = null;
+  let closeAttempt: Promise<void> | null = null;
+  let serverClose: Promise<void> | null = null;
+  let acceptingRequests = true;
+  let closed = false;
+  const activeRequests = new Map<IncomingMessage, ActiveRecoveryDemoRequest>();
+  const sockets = new Set<Socket>();
+  const drainWaiters = new Set<() => void>();
   const server = createServer((request, response) => {
-    void handle(request, response).catch((error: unknown) => {
-      const failure = error instanceof RecoveryDemoRequestError
-        ? error
-        : new RecoveryDemoRequestError(500, "internal_error", "The recovery demonstration failed safely");
-      sendJson(response, failure.statusCode, {
-        error: failure.code,
-        message: failure.message,
-      });
+    let resolveHandlerSettled!: () => void;
+    const handlerSettled = new Promise<void>((resolveSettled) => {
+      resolveHandlerSettled = resolveSettled;
     });
+    activeRequests.set(request, { request, response, settled: handlerSettled });
+    let handlerLifecycleSettled = false;
+    const settleHandlerLifecycle = (): void => {
+      if (handlerLifecycleSettled) return;
+      handlerLifecycleSettled = true;
+      activeRequests.delete(request);
+      resolveHandlerSettled();
+      if (activeRequests.size === 0) {
+        for (const resolveDrain of drainWaiters) resolveDrain();
+        drainWaiters.clear();
+      }
+    };
+    const responseSettled = new Promise<void>((resolveResponse) => {
+      let settled = false;
+      const settleResponse = (): void => {
+        if (settled) return;
+        settled = true;
+        resolveResponse();
+      };
+      response.once("finish", settleResponse);
+      response.once("close", settleResponse);
+    });
+    const handlerLifecycle = (async (): Promise<void> => {
+      try {
+        assertAcceptingRequests();
+        await handle(request, response);
+      } catch (error: unknown) {
+        const failure = error instanceof RecoveryDemoRequestError
+          ? error
+          : new RecoveryDemoRequestError(500, "internal_error", "The recovery demonstration failed safely");
+        if (!response.destroyed && !response.writableEnded) {
+          sendJson(response, failure.statusCode, {
+            error: failure.code,
+            message: failure.message,
+          });
+        }
+      } finally {
+        await responseSettled;
+      }
+    })();
+    void handlerLifecycle.then(settleHandlerLifecycle, settleHandlerLifecycle);
   });
+  server.on("connection", (socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+
+  const assertAcceptingRequests = (): void => {
+    if (!acceptingRequests) {
+      throw new RecoveryDemoRequestError(
+        503,
+        "server_closing",
+        "The recovery demonstration is closing",
+      );
+    }
+  };
 
   async function handle(
     request: IncomingMessage,
@@ -413,6 +484,7 @@ export async function startRecoveryDemoServer(
         throw new RecoveryDemoRequestError(405, "method_not_allowed", "Only GET and POST are allowed");
       }
       const body = await readJsonObject(request);
+      assertAcceptingRequests();
       validateExactKeys(body, ["operation", "boundary", "requestId"]);
       const operation = requireEnum(
         body["operation"],
@@ -476,8 +548,12 @@ export async function startRecoveryDemoServer(
 
   try {
     await new Promise<void>((resolveListen, rejectListen) => {
-      server.once("error", rejectListen);
-      server.listen(port, LOOPBACK_HOST, resolveListen);
+      const onError = (error: Error): void => rejectListen(error);
+      server.once("error", onError);
+      server.listen(port, LOOPBACK_HOST, () => {
+        server.off("error", onError);
+        resolveListen();
+      });
     });
   } catch (error: unknown) {
     return await failRecoveryDemoStartup(server, coordinator, error);
@@ -491,39 +567,132 @@ export async function startRecoveryDemoServer(
     );
   }
   origin = `http://${LOOPBACK_HOST}:${String(address.port)}`;
+  const beginServerClose = (): Promise<void> => {
+    if (serverClose !== null) return serverClose;
+    if (!server.listening) return Promise.resolve();
+    const attempt = new Promise<void>((resolveClose, rejectClose) => {
+      server.close((error) => {
+        if (error === undefined) resolveClose();
+        else rejectClose(error);
+      });
+      server.closeIdleConnections();
+    });
+    serverClose = attempt.catch((error: unknown) => {
+      serverClose = null;
+      throw error;
+    });
+    return serverClose;
+  };
   return {
     url: origin,
     port: address.port,
     coordinator,
+    activeRequestCount: () => activeRequests.size,
     close(): Promise<void> {
-      if (closePromise !== null) return closePromise;
-      closePromise = closeRecoveryDemoServer(server, coordinator);
-      return closePromise;
+      if (closed) return Promise.resolve();
+      if (closeAttempt !== null) return closeAttempt;
+      acceptingRequests = false;
+      const attempt = closeRecoveryDemoServer(
+        server,
+        beginServerClose(),
+        coordinator,
+        activeRequests,
+        sockets,
+        drainWaiters,
+        requestDrainTimeoutMs,
+      )
+        .then(() => {
+          closed = true;
+        })
+        .finally(() => {
+          if (!closed) closeAttempt = null;
+        });
+      closeAttempt = attempt;
+      return attempt;
     },
   };
 }
 
 async function closeRecoveryDemoServer(
   server: ReturnType<typeof createServer>,
+  serverClose: Promise<void>,
   coordinator: RecoveryDemoCoordinator,
+  activeRequests: ReadonlyMap<IncomingMessage, ActiveRecoveryDemoRequest>,
+  sockets: ReadonlySet<Socket>,
+  drainWaiters: Set<() => void>,
+  requestDrainTimeoutMs: number,
 ): Promise<void> {
-  const serverClose = new Promise<void>((resolveClose, rejectClose) => {
-    server.close((error) => {
-      if (error === undefined) resolveClose();
-      else rejectClose(error);
-    });
+  const drained = await waitForRequestDrain(
+    activeRequests,
+    drainWaiters,
+    requestDrainTimeoutMs,
+  );
+  if (!drained) {
+    for (const { request, response } of activeRequests.values()) {
+      request.destroy(new Error("Recovery request aborted during bounded shutdown"));
+      response.destroy(new Error("Recovery response aborted during bounded shutdown"));
+    }
+    for (const socket of sockets) socket.destroy();
     server.closeAllConnections();
-  });
-  const serverResult = await Promise.allSettled([serverClose]);
-  const coordinatorResult = await Promise.allSettled([
+  }
+  const handlersSettled = drained || await waitForRequestDrain(
+    activeRequests,
+    drainWaiters,
+    requestDrainTimeoutMs,
+  );
+  if (!handlersSettled) {
+    const errors: unknown[] = [
+      new Error(
+        `Recovery shutdown retained ${String(activeRequests.size)} unsettled handler(s)`,
+      ),
+    ];
+    const serverResult = await Promise.allSettled([serverClose]);
+    if (serverResult[0]?.status === "rejected") {
+      errors.push(serverResult[0].reason as unknown);
+    }
+    throw new AggregateError(
+      errors,
+      "Recovery handler shutdown did not settle safely",
+    );
+  }
+  for (const socket of sockets) socket.destroy();
+  server.closeAllConnections();
+  const results = await Promise.allSettled([
+    serverClose,
     Promise.resolve().then(() => coordinator.close()),
   ]);
-  const errors = [...serverResult, ...coordinatorResult]
+  const errors = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map((result) => result.reason as unknown);
   if (errors.length > 0) {
     throw new AggregateError(errors, "Recovery demonstration server cleanup failed");
   }
+}
+
+async function waitForRequestDrain(
+  activeRequests: ReadonlyMap<IncomingMessage, ActiveRecoveryDemoRequest>,
+  drainWaiters: Set<() => void>,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (activeRequests.size === 0) return true;
+  let timer: NodeJS.Timeout | null = null;
+  let resolveDrain!: () => void;
+  const drained = new Promise<void>((resolveValue) => { resolveDrain = resolveValue; });
+  drainWaiters.add(resolveDrain);
+  void Promise.all([...activeRequests.values()].map((handler) => handler.settled)).then(() => {
+    if (activeRequests.size === 0) resolveDrain();
+  });
+  const timeout = new Promise<"timeout">((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout("timeout"), timeoutMs);
+    timer.unref();
+  });
+  const result = await Promise.race([
+    drained.then(() => "drained" as const),
+    timeout,
+  ]);
+  drainWaiters.delete(resolveDrain);
+  if (timer !== null) clearTimeout(timer);
+  return result === "drained";
 }
 
 async function failRecoveryDemoStartup(
