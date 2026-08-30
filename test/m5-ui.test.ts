@@ -789,6 +789,117 @@ describe("Qodo Round 5: cleanup-stack lifecycle state machine", () => {
   });
 });
 
+describe("Qodo Round 6: reentrant release safety", () => {
+  test("synchronous callback reentry does not duplicate cleanup", async () => {
+    const stack = sessionCleanupStack();
+    let firstCalls = 0;
+    let reentrantCalls = 0;
+    let reentrantError: unknown = null;
+    stack.own(async () => {
+      firstCalls += 1;
+    });
+    stack.own(async () => {
+      reentrantCalls += 1;
+      if (reentrantCalls === 1) {
+        stack.release().catch((error: unknown) => {
+          reentrantError = error;
+        });
+      }
+    });
+    await stack.release();
+    assert.equal(firstCalls, 1, "callbacks execute exactly once despite synchronous reentry");
+    assert.equal(reentrantCalls, 1);
+    assert.match(String(reentrantError), /release cannot be requested from within a cleanup callback/u);
+    await stack.release();
+    assert.equal(firstCalls, 1, "the released stack stays idempotent");
+    assert.equal(reentrantCalls, 1);
+  });
+
+  test("a callback that returns a reentrant release fails closed without deadlock", async () => {
+    const stack = sessionCleanupStack();
+    let survivorCalls = 0;
+    let reentrantCalls = 0;
+    stack.own(async () => {
+      survivorCalls += 1;
+    });
+    stack.own(() => {
+      reentrantCalls += 1;
+      if (reentrantCalls === 1) return stack.release();
+      return Promise.resolve();
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(
+        String((error as AggregateError).errors[0]),
+        /release cannot be requested from within a cleanup callback/u,
+      );
+      return true;
+    });
+    assert.equal(survivorCalls, 1, "the other callback still ran exactly once");
+    assert.equal(reentrantCalls, 1);
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "the failed callback stays owned and the retry reruns only it");
+    assert.equal(survivorCalls, 1, "successful callbacks are not rerun during retry");
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "a successful final release remains idempotent");
+  });
+
+  test("an external concurrent release during callback execution joins the active operation", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    let runs = 0;
+    stack.own(async () => {
+      runs += 1;
+      await gate.promise;
+    });
+    let firstSettled = false;
+    let secondSettled = false;
+    const first = stack.release().then(() => {
+      firstSettled = true;
+    });
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(runs, 1, "the callback is already executing");
+    const second = stack.release().then(() => {
+      secondSettled = true;
+    });
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(runs, 1, "the external caller joins rather than starting a second pass");
+    assert.equal(firstSettled || secondSettled, false, "neither caller settles before the cleanup finishes");
+    gate.resolve();
+    await first;
+    await second;
+    assert.equal(firstSettled && secondSettled, true);
+  });
+
+  test("reentry combined with cleanup failure retains failed ownership for retry", async () => {
+    const stack = sessionCleanupStack();
+    let stableCalls = 0;
+    let faultyCalls = 0;
+    let reentrantError: unknown = null;
+    stack.own(async () => {
+      stableCalls += 1;
+    });
+    stack.own(async () => {
+      faultyCalls += 1;
+      if (faultyCalls === 1) {
+        stack.release().catch((error: unknown) => {
+          reentrantError = error;
+        });
+        throw new Error("controlled faulty release failure");
+      }
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.match(String((error as AggregateError).errors[0]), /controlled faulty release failure/u);
+      return true;
+    });
+    assert.match(String(reentrantError), /within a cleanup callback/u);
+    assert.equal(stableCalls, 1);
+    await stack.release();
+    assert.equal(faultyCalls, 2, "only the failed callback is retried");
+    assert.equal(stableCalls, 1, "successful callbacks are not rerun during retry");
+  });
+});
+
 const EXPECTED_APPROVAL_ROUTE = [
   ["select_portfolio_modification", "allow", "owner"],
   ["accept_promise", "allow", "owner"],

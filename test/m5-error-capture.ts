@@ -49,6 +49,7 @@ export function sessionCleanupStack(): SessionCleanupStack {
   let state: "open" | "releasing" | "failed" | "released" = "open";
   let pending: (() => Promise<void>)[] = [];
   let inFlight: Promise<void> | null = null;
+  let insideCallbackSynchronousWindow = false;
   const runRelease = async (): Promise<void> => {
     const attempt = [...pending];
     const survivors: (() => Promise<void>)[] = [];
@@ -56,7 +57,17 @@ export function sessionCleanupStack(): SessionCleanupStack {
     for (let index = attempt.length - 1; index >= 0; index -= 1) {
       const release = attempt[index] as () => Promise<void>;
       try {
-        await release();
+        // Awaiting this stack's own in-flight release from inside one of its
+        // callbacks can never complete, so a release() call made during the
+        // callback's synchronous execution window rejects instead of joining.
+        insideCallbackSynchronousWindow = true;
+        let callbackSettlement: Promise<void>;
+        try {
+          callbackSettlement = release();
+        } finally {
+          insideCallbackSynchronousWindow = false;
+        }
+        await callbackSettlement;
       } catch (error: unknown) {
         failures.push(error);
         survivors.unshift(release);
@@ -77,12 +88,19 @@ export function sessionCleanupStack(): SessionCleanupStack {
       pending.push(release);
     },
     release: () => {
+      if (insideCallbackSynchronousWindow) {
+        return Promise.reject(
+          new Error("release cannot be requested from within a cleanup callback"),
+        );
+      }
       if (state === "released") return Promise.resolve();
       if (state === "releasing" && inFlight !== null) return inFlight;
       state = "releasing";
-      const attemptPromise = runRelease().finally(() => {
-        inFlight = null;
-      });
+      const attemptPromise = Promise.resolve()
+        .then(runRelease)
+        .finally(() => {
+          inFlight = null;
+        });
       inFlight = attemptPromise;
       return attemptPromise;
     },
