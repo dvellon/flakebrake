@@ -16,6 +16,987 @@ import {
   type RunningM5JudgeServer,
 } from "../src/index.js";
 import { parseM5CliArguments } from "../src/m5-cli.js";
+import {
+  armSessionErrorCapture,
+  armSessionNetworkCapture,
+  CONTROLLED_ERROR_PROBE_URL,
+  formatFailedResponse,
+  formatTransportFailure,
+  sessionCleanupStack,
+  type BrowserNetworkObserver,
+  type BrowserScriptErrorObserver,
+  type ObserverSessionBrowser,
+  type SessionTransportProbe,
+} from "./m5-error-capture.js";
+
+describe("M5 judge-readiness audit F-01 through F-26", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+  const stylesheet = readFileSync(join(process.cwd(), "ui/m5/styles.css"), "utf8");
+  const projection = readFileSync(join(process.cwd(), "src/m5-ui.ts"), "utf8");
+
+  test("F-01 exposes exactly one dynamically recommended approval action", () => {
+    assert.match(application, /setRecommendedAction/u);
+    assert.doesNotMatch(document, /id="allow-button"[^>]*button-approve/u);
+  });
+
+  test("F-02 separates agent identity from truthful status chips", () => {
+    assert.match(application, /agent-name/u);
+    assert.match(application, /agent-status status-chip/u);
+  });
+
+  test("F-03 contains capacity cards throughout the intermediate-width range", () => {
+    assert.match(stylesheet, /@media \(max-width: 1120px\)/u);
+    assert.match(stylesheet, /\.capacity-item[^}]*min-width:\s*0/u);
+  });
+
+  test("F-04 labels mechanical denial as an active-policy auto-block", () => {
+    assert.match(application, /Auto-blocked · active policy/u);
+  });
+
+  test("F-05 preserves the ordered mutation, read-back, and verification proof", () => {
+    assert.match(document, /id="proof-stages"/u);
+    assert.match(application, /Independent read-back pending/u);
+    assert.match(application, /Read-back matched · verified/u);
+  });
+
+  test("F-06 pins the timeline only while the judge remains near its latest entry", () => {
+    assert.match(application, /timelinePinned/u);
+    assert.match(application, /isTimelineNearLatest/u);
+  });
+
+  test("F-07 wraps durable identities without horizontal overflow", () => {
+    assert.match(stylesheet, /\.technical-identity[^}]*overflow-wrap:\s*anywhere/u);
+  });
+
+  test("F-08 consolidates correlated approval evidence and settles its status", () => {
+    assert.match(projection, /#upsertEvidence/u);
+    assert.match(application, /evidence-details/u);
+  });
+
+  test("F-09 distinguishes the original REPLAN basis from its bounded resolution", () => {
+    assert.match(document, /Original promise basis/u);
+    assert.match(application, /Resolved through bounded replan/u);
+  });
+
+  test("F-10 keeps judge-facing promise acceptance in human language", () => {
+    assert.match(projection, /Accept the fresh capacity-safe promise/u);
+    assert.doesNotMatch(projection, /return `Accept fresh ADMITTABLE/u);
+  });
+
+  test("F-11 explains the safe alternative and the owner's denial rationale", () => {
+    assert.match(application, /Primary denial rationale/u);
+    assert.match(application, /starts after the protected interval/u);
+  });
+
+  test("F-12 explains that the schedule conflict is interval-specific", () => {
+    assert.match(document, /interval-specific/u);
+  });
+
+  test("F-13 uses one semantic capacity baseline", () => {
+    assert.match(application, /capacity-baseline/u);
+  });
+
+  test("F-14 labels accepted work accurately and resolves proposal duplication", () => {
+    assert.match(document, /Accepted workload after bounded replan/u);
+    assert.match(application, /acceptedProposal/u);
+  });
+
+  test("F-15 distinguishes live completion from a durable browser re-attach", () => {
+    assert.match(application, /Mission complete/u);
+    assert.match(application, /Durable replay restored/u);
+  });
+
+  test("F-16 keeps the approval region mounted between decisions", () => {
+    assert.match(application, /approval-panel.*is-continuing/u);
+    assert.doesNotMatch(application, /approval-panel.*is-hidden/u);
+  });
+
+  test("F-17 moves focus and announces new approval and decision state politely", () => {
+    assert.match(document, /id="decision-announcer"[^>]*aria-live="polite"/u);
+    assert.match(document, /id="approval-title"[^>]*tabindex="-1"/u);
+  });
+
+  test("F-18 formats the verified interval for judges", () => {
+    assert.match(application, /formatFriendlyInterval/u);
+  });
+
+  test("F-19 humanizes ledger facts with explanatory subtitles", () => {
+    assert.match(application, /resourcePresentation/u);
+    assert.match(application, /fact-subtitle/u);
+  });
+
+  test("F-20 keeps the hero promise phrase together", () => {
+    assert.match(document, /class="hero-line">One safe promise\.<\/span>/u);
+  });
+
+  test("F-21 shares one topbar and content gutter", () => {
+    assert.match(stylesheet, /--content-gutter/u);
+  });
+
+  test("F-22 explains the idle canonical basis and the Start action", () => {
+    assert.match(document, /precomputed canonical basis/u);
+  });
+
+  test("F-23 preserves the full turn identity and a working fallback", () => {
+    assert.match(application, /currentTurnId \?\? "Not started"/u);
+  });
+
+  test("F-24 uses restrained dark-theme scrollbars", () => {
+    assert.match(stylesheet, /scrollbar-color/u);
+  });
+
+  test("F-25 exposes only state-backed agent activity with clear status chips", () => {
+    assert.match(application, /truthfulAgentStatus/u);
+    assert.match(stylesheet, /\.status-chip/u);
+  });
+
+  test("F-26 uses CSP-compliant semantic progress with actual values", () => {
+    assert.match(application, /<progress/u);
+    assert.doesNotMatch(application, /style="width:/u);
+  });
+});
+
+describe("Qodo Round 2: executable session error-capture arming", () => {
+  test("arming registers the observer before any navigation and clears the probe", async () => {
+    const session = createFakeBrowserSession();
+    const capture = await armSessionErrorCapture(session.script, session.browser);
+    await capture.openApplication("http://application.invalid/");
+    assert.deepEqual(session.events, [
+      `register:${String(capture.handlerId)}`,
+      "navigate:probe",
+      "refresh",
+      "navigate:http://application.invalid/",
+    ]);
+    assert.equal(capture.capturedErrorCount(), 0, "the controlled probe errors are cleared after arming");
+  });
+
+  test("the same session observer covers later application loads and reloads", async () => {
+    const session = createFakeBrowserSession();
+    const capture = await armSessionErrorCapture(session.script, session.browser);
+    await capture.openApplication("http://application.invalid/");
+    assert.equal(session.registeredHandlerCount(), 1);
+    assert.equal(session.emitSessionError(), 1);
+    await session.browser.refresh();
+    assert.equal(session.emitSessionError(), 1);
+    assert.equal(capture.capturedErrorCount(), 2);
+    await capture.dispose();
+    assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.emitSessionError(), 0);
+    assert.equal(capture.capturedErrorCount(), 2);
+    assert.equal(session.events[session.events.length - 1], `remove:${String(capture.handlerId)}`);
+  });
+
+  test("an observer that never observes errors fails closed before application navigation", async () => {
+    const session = createFakeBrowserSession({ deliverLoadErrors: false });
+    await assert.rejects(
+      armSessionErrorCapture(session.script, session.browser),
+      /did not capture the controlled load-time probe error/u,
+    );
+    assert.deepEqual(
+      session.events.filter((event) => event.startsWith("navigate:")),
+      ["navigate:probe"],
+    );
+  });
+
+  test("a page-scoped observer lost on refresh fails closed", async () => {
+    const session = createFakeBrowserSession({ dropHandlersOnRefresh: true });
+    await assert.rejects(
+      armSessionErrorCapture(session.script, session.browser),
+      /did not keep capturing the probe error across refresh/u,
+    );
+  });
+});
+
+describe("M5 live review regressions", { concurrency: false }, () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const stylesheet = readFileSync(join(process.cwd(), "ui/m5/styles.css"), "utf8");
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-live-review-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const denialApproval = {
+    toolName: "create_schedule_reservation",
+    decision: "deny",
+    source: "owner",
+    ownerSourceIdentity: "owner/judge-ui",
+    actionIdentity: `sha256:${"c".repeat(64)}`,
+    effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+    reason: "The primary interval conflicts with protected production commitments",
+    denialId: null,
+  } as const;
+  const mechanicalApproval = {
+    toolName: "submit_schedule_change",
+    decision: "deny",
+    source: "active_m2_denial",
+    ownerSourceIdentity: null,
+    actionIdentity: `sha256:${"d".repeat(64)}`,
+    effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+    reason: "Equivalent representation of the denied action",
+    denialId: "m4-denial/live-review",
+  } as const;
+
+  test("static safeguards for the live-review corrections", () => {
+    assert.match(document, /<link rel="icon" href="data:image\/svg\+xml/u);
+    assert.match(document, /id="capacity-grid"[^>]*role="group"/u);
+    assert.match(document, /id="basis-note"/u);
+    assert.match(stylesheet, /\.policy-decision strong[^}]*display:\s*block/u);
+    assert.match(stylesheet, /\.policy-decision span[^}]*display:\s*block/u);
+    assert.match(stylesheet, /\.candidate > div strong, \.candidate > div span/u);
+    assert.match(stylesheet, /\.action-name\.is-status[^}]*text-transform:\s*none/u);
+    assert.match(stylesheet, /\.topbar[^}]*rgb\(9 16 12 \/ 96%\)/u);
+    assert.match(stylesheet, /\.capacity-item header[^}]*min-height/u);
+  });
+
+  test("status sentences and captions are status-aware at idle", async () => {
+    const harness = await createPollingHarness(idle, []);
+    assert.equal(harness.hasClass("approval-tool", "is-status"), true);
+    assert.equal(harness.text("approval-guidance"), "This region activates at the first owner decision.");
+    assert.match(harness.evaluate("document.getElementById('basis-note').innerHTML"), /Before you start:/u);
+  });
+
+  test("tool names keep their label styling while announcements use human verbs", async () => {
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const harness = await createPollingHarness(idle, [Promise.resolve(pending)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.hasClass("approval-tool", "is-status"), false);
+    assert.equal(harness.text("approval-tool"), "create schedule reservation");
+    assert.match(harness.text("decision-announcer"), /Deny is recommended\.$/u);
+  });
+
+  test("the appended denial rationale ends with terminal punctuation", async () => {
+    const base = uiProjection(idle, 2, "awaiting_approval");
+    const withDenial: M5JudgeState = {
+      ...base,
+      approvals: [denialApproval],
+      pendingApproval: {
+        ...(base.pendingApproval as NonNullable<M5JudgeState["pendingApproval"]>),
+        recommendedDecision: "allow",
+      },
+    };
+    const harness = await createPollingHarness(idle, [Promise.resolve(withDenial)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.match(harness.text("approval-guidance"), /protected production commitments\.$/u);
+    assert.match(
+      harness.evaluate<string>("document.getElementById('policy-decision').innerHTML"),
+      /commitments\.<\/span>/u,
+    );
+  });
+
+  test("terminal presentation reports completion rather than pending or mechanical captions", async () => {
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const verifiedBase = uiProjection(idle, 3, "verified");
+    const terminal: M5JudgeState = {
+      ...verifiedBase,
+      approvals: [denialApproval, mechanicalApproval],
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const harness = await createPollingHarness(idle, [Promise.resolve(pending), Promise.resolve(terminal)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    await harness.evaluate<Promise<void>>("refresh()");
+    const proofStages = harness.evaluate<string>("document.getElementById('proof-stages').innerHTML");
+    assert.match(proofStages, /Independent read-back observed/u);
+    assert.doesNotMatch(proofStages, /Independent read-back pending/u);
+    assert.equal(
+      harness.text("approval-guidance"),
+      "All decisions and evidence above are durable; the mission is complete.",
+    );
+    assert.match(harness.text("decision-announcer"), /Mission complete and independently verified\.$/u);
+    const agentTree = harness.evaluate<string>("document.getElementById('agent-tree').innerHTML");
+    assert.match(agentTree, /status-chip status-complete">Complete/u);
+    assert.doesNotMatch(agentTree, /status-chip">Complete/u);
+    assert.match(harness.evaluate<string>("document.getElementById('basis-note').innerHTML"), /verified mission/u);
+  });
+
+  test("the active verification stage stays labeled pending until read-back is observed", async () => {
+    const verifying: M5JudgeState = {
+      ...idle,
+      revision: 2,
+      run: { ...idle.run, status: "running" },
+      execution: { ...idle.execution, acceptanceCount: 1, attemptCount: 1, mutationCount: 1, receiptCount: 1 },
+    };
+    const harness = await createPollingHarness(idle, [Promise.resolve(verifying)]);
+    await harness.evaluate<Promise<void>>("refresh()");
+    const proofStages = harness.evaluate<string>("document.getElementById('proof-stages').innerHTML");
+    assert.match(proofStages, /proof-active/u);
+    assert.match(proofStages, /Independent read-back pending/u);
+  });
+
+  test("a transient poll failure recovers its label on the next successful poll", async () => {
+    const failure = deferred<unknown>();
+    const recovery = deferred<unknown>();
+    const harness = await createPollingHarness(idle, [failure.promise, recovery.promise]);
+    const failedPoll = harness.evaluate<Promise<void>>("refresh()");
+    failure.reject(new Error("controlled transient failure"));
+    await failedPoll;
+    assert.equal(harness.text("connection-label"), "Reconnecting…");
+    const recoveredPoll = harness.evaluate<Promise<void>>("refresh()");
+    recovery.resolve({ ...idle });
+    await recoveredPoll;
+    assert.equal(harness.text("connection-label"), "Ready on loopback");
+  });
+
+  test("the durable-replay label does not survive a reset into a live rerun", async () => {
+    const verifiedBase = uiProjection(idle, 2, "verified");
+    const replayed: M5JudgeState = {
+      ...verifiedBase,
+      run: { ...verifiedBase.run, connection: "replayed" },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const afterReset: M5JudgeState = {
+      ...idle,
+      revision: 3,
+      run: { ...idle.run, generation: replayed.run.generation + 1 },
+    };
+    const liveVerified = uiProjection(idle, 4, "verified");
+    const liveTerminal: M5JudgeState = {
+      ...liveVerified,
+      run: { ...liveVerified.run, generation: afterReset.run.generation },
+      execution: { ...liveVerified.execution, independentReadBackObserved: true },
+    };
+    const harness = await createPollingHarness(replayed, [
+      Promise.resolve({ state: afterReset }),
+      Promise.resolve(liveTerminal),
+    ]);
+    assert.equal(harness.text("connection-label"), "Durable replay restored");
+    await harness.evaluate<Promise<void>>(
+      'mutate("/api/mission", {operation: "reset", requestId: "live-review-reset"})',
+    );
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("connection-label"), "Mission complete");
+  });
+
+  test("a back-forward cache restore restarts polling", async () => {
+    const harness = await createPollingHarness(idle, [Promise.resolve({ ...idle })]);
+    assert.equal(harness.counters.setIntervalCalls, 1);
+    assert.deepEqual(harness.activeIntervalIds(), [1]);
+    harness.fireWindow("pagehide", {});
+    assert.deepEqual(harness.activeIntervalIds(), [], "pagehide clears the active poller");
+    assert.deepEqual(harness.counters.clearedIntervals, [1]);
+    harness.fireWindow("pageshow", { persisted: true });
+    assert.equal(harness.counters.setIntervalCalls, 2);
+    assert.deepEqual(harness.activeIntervalIds(), [2], "exactly one active poller after a persisted restore");
+    assert.deepEqual(harness.counters.clearedIntervals, [1, 1], "the restore defensively clears the prior poller id");
+    harness.fireWindow("pageshow", { persisted: false });
+    assert.equal(harness.counters.setIntervalCalls, 2);
+    assert.deepEqual(harness.activeIntervalIds(), [2]);
+  });
+
+  test("error toasts do not inherit stale hide timers", async () => {
+    const harness = await createPollingHarness(idle, []);
+    harness.evaluate("showError('first controlled error')");
+    harness.evaluate("showError('second controlled error')");
+    assert.equal(harness.counters.clearedTimeouts.length >= 1, true);
+    assert.equal(harness.hasClass("toast", "visible"), true);
+    assert.equal(harness.text("toast"), "second controlled error");
+  });
+});
+
+describe("Qodo Round 3: executable session network-failure capture", () => {
+  const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+  const TRANSPORT_PROBE_URL = "http://transport.invalid/m5-controlled-transport-failure-probe";
+
+  const arm = (session: FakeNetworkSession): ReturnType<typeof armSessionNetworkCapture> =>
+    armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL, session.transportProbe);
+
+  test("arming registers both channels before navigation and clears probe evidence", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
+    assert.deepEqual(session.events, [
+      "register-response",
+      "register-fetch-error",
+      "transport-probe",
+      "navigate:probe",
+      "refresh",
+      "transport-probe",
+    ]);
+    assert.deepEqual(capture.failedResponses(), []);
+  });
+
+  test("an HTTP failure recorded before refresh persists across refresh and later navigation", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
+    await session.browser.get("http://application.invalid/");
+    assert.equal(session.emitFailedResponse("http://application.invalid/asset.js", 500), 1);
+    await session.browser.refresh();
+    await session.browser.get("http://application.invalid/deep");
+    assert.deepEqual(capture.failedResponses(), [
+      formatFailedResponse("http://application.invalid/asset.js", 500),
+    ]);
+  });
+
+  test("a transport failure recorded before refresh persists unless cleared as probe evidence", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
+    await session.browser.get("http://application.invalid/");
+    assert.equal(session.emitTransportFailure("http://application.invalid/api/state", "NS_ERROR_NET_RESET"), 1);
+    await session.browser.refresh();
+    await session.browser.get("http://application.invalid/deep");
+    assert.deepEqual(capture.failedResponses(), [
+      formatTransportFailure("http://application.invalid/api/state", "NS_ERROR_NET_RESET"),
+    ]);
+  });
+
+  test("an observer that never observes HTTP failures fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { deliverResponses: false });
+    await assert.rejects(arm(session), /did not observe the controlled missing-resource probe/u);
+  });
+
+  test("an observer that ignores fetchError events fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { deliverTransportEvents: false });
+    await assert.rejects(arm(session), /did not observe the controlled transport-failure probe/u);
+  });
+
+  test("an unavailable fetchError subscription fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { registerFetchError: false });
+    await assert.rejects(arm(session), /did not observe the controlled transport-failure probe/u);
+  });
+
+  test("a page-scoped HTTP observer lost on refresh fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { dropHandlersOnRefresh: true });
+    await assert.rejects(arm(session), /did not keep observing the missing-resource probe across refresh/u);
+  });
+
+  test("fetchError coverage lost on refresh fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, {
+      dropFetchErrorHandlersOnRefresh: true,
+    });
+    await assert.rejects(arm(session), /did not keep observing the transport-failure probe across refresh/u);
+  });
+
+  test("dispose removes both failure observation channels", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
+    await capture.dispose();
+    assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.registeredFetchErrorHandlerCount(), 0);
+    assert.equal(session.emitFailedResponse("http://application.invalid/late.js", 503), 0);
+    assert.equal(session.emitTransportFailure("http://application.invalid/late-poll", "NS_ERROR_NET_RESET"), 0);
+    assert.deepEqual(capture.failedResponses(), []);
+  });
+});
+
+describe("Qodo Round 4: failure-atomic capture arming", () => {
+  const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+  const TRANSPORT_PROBE_URL = "http://transport.invalid/m5-controlled-transport-failure-probe";
+
+  const armNetwork = (session: FakeNetworkSession): ReturnType<typeof armSessionNetworkCapture> =>
+    armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL, session.transportProbe);
+
+  test("the cleanup stack releases in reverse order and a successful release is terminal", async () => {
+    const order: string[] = [];
+    const stack = sessionCleanupStack();
+    stack.own(async () => {
+      order.push("first");
+    });
+    stack.own(async () => {
+      order.push("second");
+    });
+    stack.own(async () => {
+      order.push("third");
+    });
+    await stack.release();
+    assert.deepEqual(order, ["third", "second", "first"]);
+    await stack.release();
+    assert.deepEqual(order, ["third", "second", "first"], "a released stack never reruns callbacks");
+    assert.throws(
+      () => stack.own(async () => undefined),
+      /cannot own a release after cleanup has started/u,
+      "ownership after release fails closed",
+    );
+  });
+
+  test("error-capture arming failures release the observer at every boundary", async () => {
+    const boundaries = [
+      { label: "probe navigation", options: { failNavigationToProbe: true }, message: /controlled probe navigation failure/u },
+      { label: "load observation", options: { deliverLoadErrors: false }, message: /did not capture the controlled load-time probe error/u },
+      { label: "refresh", options: { failRefresh: true }, message: /controlled refresh failure/u },
+      { label: "refresh re-observation", options: { dropHandlersOnRefresh: true }, message: /did not keep capturing the probe error across refresh/u },
+    ];
+    for (const boundary of boundaries) {
+      const session = createFakeBrowserSession(boundary.options);
+      await assert.rejects(armSessionErrorCapture(session.script, session.browser), boundary.message, boundary.label);
+      assert.equal(session.registeredHandlerCount(), 0, `${boundary.label}: observer released`);
+      assert.equal(
+        session.events.filter((event) => event.startsWith("remove:")).length,
+        1,
+        `${boundary.label}: exactly one removal`,
+      );
+    }
+  });
+
+  test("error-capture cleanup failure is preserved alongside the arming failure", async () => {
+    const session = createFakeBrowserSession({ deliverLoadErrors: false, failRemoval: true });
+    await assert.rejects(armSessionErrorCapture(session.script, session.browser), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      const aggregate = error as AggregateError;
+      assert.match(String(aggregate.errors[0]), /did not capture the controlled load-time probe error/u);
+      const cleanupFailure = aggregate.errors[1] as AggregateError;
+      assert.match(String(cleanupFailure.errors[0]), /controlled removal failure/u);
+      assert.match(String((aggregate.cause as Error).message), /did not capture the controlled load-time probe error/u);
+      return true;
+    });
+  });
+
+  test("error-capture dispose is exact-once and idempotent", async () => {
+    const session = createFakeBrowserSession();
+    const capture = await armSessionErrorCapture(session.script, session.browser);
+    await capture.dispose();
+    await capture.dispose();
+    assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.events.filter((event) => event.startsWith("remove:")).length, 1);
+  });
+
+  test("network arming failures release both channels at every boundary", async () => {
+    const boundaries = [
+      { label: "fetch-error registration", options: { failFetchErrorRegistration: true }, message: /controlled fetch-error registration failure/u },
+      { label: "first transport trigger", options: { failTransportTriggerOnCall: 1 }, message: /controlled transport trigger failure/u },
+      { label: "transport observation", options: { deliverTransportEvents: false }, message: /did not observe the controlled transport-failure probe/u },
+      { label: "probe navigation", options: { failNavigation: true }, message: /controlled probe navigation failure/u },
+      { label: "missing-resource observation", options: { deliverResponses: false }, message: /did not observe the controlled missing-resource probe/u },
+      { label: "refresh", options: { failRefresh: true }, message: /controlled refresh failure/u },
+      { label: "missing-resource re-observation", options: { dropHandlersOnRefresh: true }, message: /did not keep observing the missing-resource probe across refresh/u },
+      { label: "transport re-observation", options: { dropFetchErrorHandlersOnRefresh: true }, message: /did not keep observing the transport-failure probe across refresh/u },
+      { label: "second transport trigger", options: { failTransportTriggerOnCall: 2 }, message: /controlled transport trigger failure/u },
+      { label: "evidence settling", options: { rejectWaitMessageMatching: /did not settle/u }, message: /did not settle before clearing/u },
+    ];
+    for (const boundary of boundaries) {
+      const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, boundary.options);
+      await assert.rejects(armNetwork(session), boundary.message, boundary.label);
+      assert.equal(session.registeredHandlerCount(), 0, `${boundary.label}: response channel released`);
+      assert.equal(session.registeredFetchErrorHandlerCount(), 0, `${boundary.label}: fetch-error channel released`);
+      assert.equal(
+        session.events.filter((event) => event === "remove").length,
+        1,
+        `${boundary.label}: exactly one removal`,
+      );
+    }
+  });
+
+  test("network cleanup failure is preserved alongside the arming failure", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, {
+      deliverTransportEvents: false,
+      failRemoval: true,
+    });
+    await assert.rejects(armNetwork(session), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      const aggregate = error as AggregateError;
+      assert.match(String(aggregate.errors[0]), /did not observe the controlled transport-failure probe/u);
+      const cleanupFailure = aggregate.errors[1] as AggregateError;
+      assert.match(String(cleanupFailure.errors[0]), /controlled removal failure/u);
+      assert.match(String((aggregate.cause as Error).message), /did not observe the controlled transport-failure probe/u);
+      return true;
+    });
+  });
+
+  test("network dispose is exact-once and a rejected arming releases exactly once", async () => {
+    const healthy = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await armNetwork(healthy);
+    await capture.dispose();
+    await capture.dispose();
+    assert.equal(healthy.events.filter((event) => event === "remove").length, 1);
+    const failing = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, {
+      deliverTransportEvents: false,
+    });
+    await assert.rejects(armNetwork(failing), /did not observe the controlled transport-failure probe/u);
+    assert.equal(failing.events.filter((event) => event === "remove").length, 1);
+    assert.equal(failing.registeredHandlerCount(), 0);
+    assert.equal(failing.registeredFetchErrorHandlerCount(), 0);
+  });
+});
+
+describe("Qodo Round 5: cleanup-stack lifecycle state machine", () => {
+  const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+  const TRANSPORT_PROBE_URL = "http://transport.invalid/m5-controlled-transport-failure-probe";
+
+  function flakyRelease(log: string[], name: string, failuresBeforeSuccess: number): () => Promise<void> {
+    let remainingFailures = failuresBeforeSuccess;
+    return async () => {
+      log.push(name);
+      if (remainingFailures > 0) {
+        remainingFailures -= 1;
+        throw new Error(`controlled ${name} release failure`);
+      }
+    };
+  }
+
+  test("a failed release keeps failed callbacks owned and a retry runs only those", async () => {
+    const log: string[] = [];
+    const stack = sessionCleanupStack();
+    stack.own(flakyRelease(log, "first", 1));
+    stack.own(flakyRelease(log, "second", 0));
+    stack.own(flakyRelease(log, "third", 0));
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    assert.deepEqual(log, ["third", "second", "first"], "the first attempt is exhaustive and reverse ordered");
+    await stack.release();
+    assert.deepEqual(log, ["third", "second", "first", "first"], "the retry runs only the failed callback");
+    await stack.release();
+    assert.deepEqual(log, ["third", "second", "first", "first"], "a successful release makes later releases no-ops");
+  });
+
+  test("repeated retry failures keep rejecting until every callback succeeds", async () => {
+    const log: string[] = [];
+    const stack = sessionCleanupStack();
+    stack.own(flakyRelease(log, "stubborn", 2));
+    stack.own(flakyRelease(log, "reliable", 0));
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    assert.deepEqual(log, ["reliable", "stubborn"]);
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    assert.deepEqual(log, ["reliable", "stubborn", "stubborn"]);
+    await stack.release();
+    assert.deepEqual(log, ["reliable", "stubborn", "stubborn", "stubborn"]);
+    await stack.release();
+    assert.deepEqual(log, ["reliable", "stubborn", "stubborn", "stubborn"]);
+  });
+
+  test("multiple failures aggregate in execution order and stay owned for retry", async () => {
+    const log: string[] = [];
+    const stack = sessionCleanupStack();
+    const firstFailure = new Error("controlled first release failure", { cause: new Error("first root cause") });
+    const thirdFailure = new Error("controlled third release failure");
+    let firstAttempts = 0;
+    let thirdAttempts = 0;
+    stack.own(async () => {
+      log.push("first");
+      firstAttempts += 1;
+      if (firstAttempts === 1) throw firstFailure;
+    });
+    stack.own(flakyRelease(log, "second", 0));
+    stack.own(async () => {
+      log.push("third");
+      thirdAttempts += 1;
+      if (thirdAttempts === 1) throw thirdFailure;
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      const aggregate = error as AggregateError;
+      assert.equal(aggregate.errors[0], thirdFailure, "failures aggregate in execution order");
+      assert.equal(aggregate.errors[1], firstFailure);
+      assert.equal((aggregate.errors[1] as Error).cause instanceof Error, true, "underlying causes are preserved");
+      return true;
+    });
+    assert.deepEqual(log, ["third", "second", "first"]);
+    await stack.release();
+    assert.deepEqual(log, ["third", "second", "first", "third", "first"], "the retry runs only failed callbacks, reverse ordered");
+  });
+
+  test("concurrent releases share one in-flight cleanup and settle together", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    let runs = 0;
+    stack.own(async () => {
+      runs += 1;
+      await gate.promise;
+    });
+    let firstSettled = false;
+    let secondSettled = false;
+    const first = stack.release().then(() => {
+      firstSettled = true;
+    });
+    const second = stack.release().then(() => {
+      secondSettled = true;
+    });
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(runs, 1, "concurrent callers do not start a second cleanup run");
+    assert.equal(firstSettled, false, "the first caller waits for the in-flight cleanup");
+    assert.equal(secondSettled, false, "the concurrent caller waits for the in-flight cleanup");
+    gate.resolve();
+    await first;
+    await second;
+    assert.equal(firstSettled && secondSettled, true);
+    await stack.release();
+    assert.equal(runs, 1, "a released stack never reruns callbacks");
+  });
+
+  test("concurrent releases reject together when the shared cleanup fails, then retry", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    let runs = 0;
+    stack.own(async () => {
+      runs += 1;
+      if (runs === 1) await gate.promise;
+    });
+    const outcomes: unknown[] = [];
+    const first = stack.release().catch((error: unknown) => {
+      outcomes.push(error);
+    });
+    const second = stack.release().catch((error: unknown) => {
+      outcomes.push(error);
+    });
+    gate.reject(new Error("controlled shared release failure"));
+    await first;
+    await second;
+    assert.equal(outcomes.length, 2, "every concurrent waiter observes the failure");
+    assert.equal(outcomes[0], outcomes[1], "both waiters receive the same cleanup failure");
+    assert.match(String((outcomes[0] as AggregateError).errors[0]), /controlled shared release failure/u);
+    await stack.release();
+    assert.equal(runs, 2, "the failed callback stays owned and the retry reruns it");
+  });
+
+  test("owning a release during an in-flight cleanup fails closed", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    stack.own(async () => {
+      await gate.promise;
+    });
+    const inFlight = stack.release();
+    assert.throws(
+      () => stack.own(async () => undefined),
+      /cannot own a release after cleanup has started/u,
+    );
+    gate.resolve();
+    await inFlight;
+  });
+
+  test("a failed capture dispose retains ownership and a retry completes it", async () => {
+    const networkSession = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { failRemovalTimes: 1 });
+    const networkCapture = await armSessionNetworkCapture(
+      networkSession.observer,
+      networkSession.browser,
+      NETWORK_PROBE_URL,
+      networkSession.transportProbe,
+    );
+    await assert.rejects(networkCapture.dispose(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(String((error as AggregateError).errors[0]), /controlled removal failure/u);
+      return true;
+    });
+    assert.equal(networkSession.registeredHandlerCount(), 1, "a failed dispose leaves the channel owned, not lost");
+    assert.equal(networkSession.registeredFetchErrorHandlerCount(), 1);
+    await networkCapture.dispose();
+    assert.equal(networkSession.registeredHandlerCount(), 0);
+    assert.equal(networkSession.registeredFetchErrorHandlerCount(), 0);
+    assert.equal(networkSession.events.filter((event) => event === "remove").length, 1);
+
+    const errorSession = createFakeBrowserSession({ failRemovalTimes: 1 });
+    const errorCapture = await armSessionErrorCapture(errorSession.script, errorSession.browser);
+    await assert.rejects(errorCapture.dispose(), /session capture cleanup failed/u);
+    assert.equal(errorSession.registeredHandlerCount(), 1);
+    await errorCapture.dispose();
+    assert.equal(errorSession.registeredHandlerCount(), 0);
+    assert.equal(errorSession.events.filter((event) => event.startsWith("remove:")).length, 1);
+  });
+});
+
+describe("Qodo Round 6: reentrant release safety", () => {
+  test("synchronous callback reentry does not duplicate cleanup", async () => {
+    const stack = sessionCleanupStack();
+    let firstCalls = 0;
+    let reentrantCalls = 0;
+    let reentrantError: unknown = null;
+    stack.own(async () => {
+      firstCalls += 1;
+    });
+    stack.own(async () => {
+      reentrantCalls += 1;
+      if (reentrantCalls === 1) {
+        stack.release().catch((error: unknown) => {
+          reentrantError = error;
+        });
+      }
+    });
+    await stack.release();
+    assert.equal(firstCalls, 1, "callbacks execute exactly once despite synchronous reentry");
+    assert.equal(reentrantCalls, 1);
+    assert.match(String(reentrantError), /release cannot be requested from within a cleanup callback/u);
+    await stack.release();
+    assert.equal(firstCalls, 1, "the released stack stays idempotent");
+    assert.equal(reentrantCalls, 1);
+  });
+
+  test("a callback that returns a reentrant release fails closed without deadlock", async () => {
+    const stack = sessionCleanupStack();
+    let survivorCalls = 0;
+    let reentrantCalls = 0;
+    stack.own(async () => {
+      survivorCalls += 1;
+    });
+    stack.own(() => {
+      reentrantCalls += 1;
+      if (reentrantCalls === 1) return stack.release();
+      return Promise.resolve();
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(
+        String((error as AggregateError).errors[0]),
+        /release cannot be requested from within a cleanup callback/u,
+      );
+      return true;
+    });
+    assert.equal(survivorCalls, 1, "the other callback still ran exactly once");
+    assert.equal(reentrantCalls, 1);
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "the failed callback stays owned and the retry reruns only it");
+    assert.equal(survivorCalls, 1, "successful callbacks are not rerun during retry");
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "a successful final release remains idempotent");
+  });
+
+  test("an external concurrent release during callback execution joins the active operation", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    let runs = 0;
+    stack.own(async () => {
+      runs += 1;
+      await gate.promise;
+    });
+    let firstSettled = false;
+    let secondSettled = false;
+    const first = stack.release().then(() => {
+      firstSettled = true;
+    });
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(runs, 1, "the callback is already executing");
+    const second = stack.release().then(() => {
+      secondSettled = true;
+    });
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(runs, 1, "the external caller joins rather than starting a second pass");
+    assert.equal(firstSettled || secondSettled, false, "neither caller settles before the cleanup finishes");
+    gate.resolve();
+    await first;
+    await second;
+    assert.equal(firstSettled && secondSettled, true);
+  });
+
+  test("reentry combined with cleanup failure retains failed ownership for retry", async () => {
+    const stack = sessionCleanupStack();
+    let stableCalls = 0;
+    let faultyCalls = 0;
+    let reentrantError: unknown = null;
+    stack.own(async () => {
+      stableCalls += 1;
+    });
+    stack.own(async () => {
+      faultyCalls += 1;
+      if (faultyCalls === 1) {
+        stack.release().catch((error: unknown) => {
+          reentrantError = error;
+        });
+        throw new Error("controlled faulty release failure");
+      }
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.match(String((error as AggregateError).errors[0]), /controlled faulty release failure/u);
+      return true;
+    });
+    assert.match(String(reentrantError), /within a cleanup callback/u);
+    assert.equal(stableCalls, 1);
+    await stack.release();
+    assert.equal(faultyCalls, 2, "only the failed callback is retried");
+    assert.equal(stableCalls, 1, "successful callbacks are not rerun during retry");
+  });
+});
+
+describe("Qodo Round 7: asynchronous reentry provenance", () => {
+  test("asynchronous self-reentry rejects promptly without deadlock or duplication", async () => {
+    const stack = sessionCleanupStack();
+    let firstCalls = 0;
+    let reentrantCalls = 0;
+    let reentrantError: unknown = null;
+    stack.own(async () => {
+      firstCalls += 1;
+    });
+    stack.own(async () => {
+      reentrantCalls += 1;
+      await Promise.resolve();
+      try {
+        await stack.release();
+      } catch (error: unknown) {
+        reentrantError = error;
+      }
+    });
+    let deadlockTimer!: NodeJS.Timeout;
+    const outcome = await Promise.race([
+      stack.release().then(() => "released"),
+      new Promise<string>((resolveTimeout) => {
+        deadlockTimer = setTimeout(() => resolveTimeout("deadlocked"), 2_000);
+      }),
+    ]);
+    clearTimeout(deadlockTimer);
+    assert.equal(outcome, "released", "the outer release settles promptly despite async self-reentry");
+    assert.match(String(reentrantError), /release cannot be requested from within a cleanup callback/u);
+    assert.equal(firstCalls, 1, "no callback executed twice");
+    assert.equal(reentrantCalls, 1);
+    await stack.release();
+    assert.equal(firstCalls, 1, "the released stack stays idempotent");
+  });
+
+  test("a propagated async self-reentry failure stays owned and retries to success", async () => {
+    const stack = sessionCleanupStack();
+    let survivorCalls = 0;
+    let reentrantCalls = 0;
+    stack.own(async () => {
+      survivorCalls += 1;
+    });
+    stack.own(async () => {
+      reentrantCalls += 1;
+      if (reentrantCalls === 1) {
+        await Promise.resolve();
+        await stack.release();
+      }
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(
+        String((error as AggregateError).errors[0]),
+        /release cannot be requested from within a cleanup callback/u,
+      );
+      return true;
+    });
+    assert.equal(survivorCalls, 1, "the other callback still ran exactly once");
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "the failed callback stays owned and the retry reruns only it");
+    assert.equal(survivorCalls, 1, "successful callbacks are not rerun during retry");
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "a successful final release remains idempotent");
+  });
+
+  test("provenance clears after callbacks so independent releases stay normal", async () => {
+    const stack = sessionCleanupStack();
+    let flakyCalls = 0;
+    stack.own(async () => {
+      flakyCalls += 1;
+      await Promise.resolve();
+      if (flakyCalls === 1) throw new Error("controlled first-pass failure");
+    });
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    await stack.release();
+    assert.equal(flakyCalls, 2, "the independent retry is not misclassified as callback reentry");
+    await stack.release();
+    assert.equal(flakyCalls, 2);
+  });
+
+  test("cleanup activity in one stack does not block releasing another", async () => {
+    const inner = sessionCleanupStack();
+    let innerReleased = false;
+    inner.own(async () => {
+      innerReleased = true;
+    });
+    const outer = sessionCleanupStack();
+    let crossOutcome: string | null = null;
+    outer.own(async () => {
+      await Promise.resolve();
+      await inner.release();
+      crossOutcome = innerReleased ? "inner released from outer callback" : "inner did not run";
+    });
+    await outer.release();
+    assert.equal(crossOutcome, "inner released from outer callback", "provenance is scoped per stack");
+    assert.equal(innerReleased, true);
+  });
+});
 
 const EXPECTED_APPROVAL_ROUTE = [
   ["select_portfolio_modification", "allow", "owner"],
@@ -215,6 +1196,22 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(terminal.activity.subagents.length, 3);
     assert.equal(terminal.activity.sandboxExecutions, 1);
     assert.equal(terminal.activity.mcpServers.length, 4);
+    const decisionEvidence = terminal.evidenceTimeline.filter((item) => item.kind.startsWith("approval:"));
+    assert.equal(decisionEvidence.length, terminal.approvals.length);
+    assert.equal(decisionEvidence.some((item) => item.status === "pending"), false);
+    assert.equal(
+      decisionEvidence.filter((item) => item.title === "Auto-blocked · active policy").length,
+      1,
+    );
+    const receiptIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "receipt");
+    const readBackIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "read-back");
+    const terminalIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "terminal");
+    assert.equal(decisionEvidence.every((item) => item.sequence < (terminal.evidenceTimeline[receiptIndex]?.sequence ?? 0)), true);
+    assert.equal(receiptIndex < readBackIndex && readBackIndex < terminalIndex, true);
+    assert.match(
+      terminal.approvals.find((item) => item.source === "owner" && item.decision === "deny")?.reason ?? "",
+      /protected production commitments/u,
+    );
   });
 
   test("refresh returns the durable projection without repeating effects", async () => {
@@ -431,7 +1428,7 @@ test("M5 Round 1 reproduction: stale poll responses cannot regress newer UI stat
     oldResponse.resolve(pending);
     await oldPoll;
     assert.equal(harness.text("outcome"), "Verified success");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -519,7 +1516,7 @@ test("M5 Round 1: mutation and reset generations discard older responses", async
     stalePoll.resolve(nextApproval);
     await pollBeforeReset;
     assert.equal(harness.text("outcome"), "Waiting");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -544,7 +1541,7 @@ test("M5 Round 1: reconnect generation invalidates responses issued before disco
     stale.resolve(uiProjection(idle, 2, "awaiting_approval"));
     await oldPoll;
     assert.equal(harness.text("outcome"), "Verified success");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -572,7 +1569,7 @@ test("M5 Round 2 reproduction: an authoritative failed mission retry becomes act
       'mutate("/api/mission", {operation: "start", requestId: "judge-recover-0001"})',
     );
     assert.equal(harness.text("outcome"), "Owner decision");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), false);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), false);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -660,7 +1657,7 @@ test("M5 Round 2: stale failures and fake recovery evidence cannot replace resum
     harness.enqueue(Promise.resolve({ ...resumed, revision: 7, run: { ...resumed.run, generation: 3 } }));
     await harness.evaluate<Promise<void>>("refresh()");
     assert.equal(harness.text("outcome"), "Verified success");
-    assert.equal(harness.hasClass("approval-panel", "is-hidden"), true);
+    assert.equal(harness.hasClass("approval-panel", "is-continuing"), true);
   } finally {
     await coordinator.close();
     rmSync(directory, { recursive: true, force: true });
@@ -1047,6 +2044,7 @@ function uiProjection(base: M5JudgeState, revision: number, status: "awaiting_ap
       expectedEffect: "Reserve the primary interval",
       recommendedDecision: "deny",
       ownerSourceIdentity: "owner/judge-ui",
+      technicalSubject: null,
     },
     execution: status === "verified"
       ? { ...base.execution, terminalStatus: "terminal_verified", mutationCount: 1, receiptCount: 1, attemptCount: 1, acceptanceCount: 1, actualFactCount: 2 }
@@ -1059,19 +2057,44 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
   enqueue(...responses: readonly Promise<unknown>[]): void;
   text(id: string): string;
   hasClass(id: string, className: string): boolean;
+  counters: { setIntervalCalls: number; readonly clearedTimeouts: number[]; readonly clearedIntervals: number[] };
+  activeIntervalIds(): readonly number[];
+  fireWindow(name: string, event?: unknown): void;
 }> {
   const nodeMap = new Map<string, FakeNode>();
   const responseQueue = [Promise.resolve(initial), ...responses];
+  const counters = { setIntervalCalls: 0, clearedTimeouts: [] as number[], clearedIntervals: [] as number[] };
+  const windowListeners = new Map<string, ((event: unknown) => void)[]>();
+  const activeIntervals = new Set<number>();
+  let intervalSequence = 0;
+  let timerSequence = 100;
   const context = createContext({
     console,
     Date,
     document: { getElementById: (id: string) => fakeNode(nodeMap, id) },
     fetch: async () => ({ ok: true, json: async () => await (responseQueue.shift() as Promise<unknown>) }),
-    setInterval: () => 1,
-    clearInterval: () => undefined,
-    setTimeout,
-    clearTimeout,
-    addEventListener: () => undefined,
+    setInterval: () => {
+      intervalSequence += 1;
+      counters.setIntervalCalls += 1;
+      activeIntervals.add(intervalSequence);
+      return intervalSequence;
+    },
+    clearInterval: (id: number) => {
+      counters.clearedIntervals.push(id);
+      activeIntervals.delete(id);
+    },
+    setTimeout: () => {
+      timerSequence += 1;
+      return timerSequence;
+    },
+    clearTimeout: (id: number) => {
+      counters.clearedTimeouts.push(id);
+    },
+    addEventListener: (name: string, listener: (event: unknown) => void) => {
+      const existing = windowListeners.get(name) ?? [];
+      existing.push(listener);
+      windowListeners.set(name, existing);
+    },
   });
   (context as Record<string, unknown>)["window"] = context;
   runInContext(readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8"), context);
@@ -1081,6 +2104,11 @@ async function createPollingHarness(initial: M5JudgeState, responses: readonly P
     enqueue: (...items): void => { responseQueue.push(...items); },
     text: (id: string): string => fakeNode(nodeMap, id).textContent,
     hasClass: (id: string, className: string): boolean => fakeNode(nodeMap, id).classList.values.has(className),
+    counters,
+    activeIntervalIds: (): readonly number[] => [...activeIntervals].sort((left, right) => left - right),
+    fireWindow: (name, event): void => {
+      for (const listener of windowListeners.get(name) ?? []) listener(event);
+    },
   };
 }
 
@@ -1116,4 +2144,205 @@ function fakeNode(nodes: Map<string, FakeNode>, id: string): FakeNode {
   };
   nodes.set(id, node);
   return node;
+}
+
+interface FakeBrowserSession {
+  readonly script: BrowserScriptErrorObserver;
+  readonly browser: ObserverSessionBrowser;
+  readonly events: readonly string[];
+  registeredHandlerCount(): number;
+  emitSessionError(): number;
+}
+
+function createFakeBrowserSession(options?: {
+  readonly deliverLoadErrors?: boolean;
+  readonly dropHandlersOnRefresh?: boolean;
+  readonly failNavigationToProbe?: boolean;
+  readonly failRefresh?: boolean;
+  readonly failRemoval?: boolean;
+  readonly failRemovalTimes?: number;
+}): FakeBrowserSession {
+  const deliverLoadErrors = options?.deliverLoadErrors ?? true;
+  const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
+  const failNavigationToProbe = options?.failNavigationToProbe ?? false;
+  const failRefresh = options?.failRefresh ?? false;
+  const failRemoval = options?.failRemoval ?? false;
+  let remainingRemovalFailures = options?.failRemovalTimes ?? 0;
+  const events: string[] = [];
+  const handlers = new Map<number, (entry: unknown) => void>();
+  let nextHandlerId = 41;
+  let currentUrl: string | null = null;
+  const deliverToRegisteredHandlers = (): number => {
+    const active = [...handlers.values()];
+    for (const handler of active) handler({ type: "javascript-error" });
+    return active.length;
+  };
+  const deliverProbeLoadError = (): void => {
+    if (deliverLoadErrors && currentUrl === CONTROLLED_ERROR_PROBE_URL) deliverToRegisteredHandlers();
+  };
+  return {
+    script: {
+      addJavaScriptErrorHandler: async (callback) => {
+        const handlerId = nextHandlerId;
+        nextHandlerId += 1;
+        handlers.set(handlerId, callback);
+        events.push(`register:${String(handlerId)}`);
+        return handlerId;
+      },
+      removeJavaScriptErrorHandler: async (handlerId) => {
+        if (failRemoval) throw new Error("controlled removal failure");
+        if (remainingRemovalFailures > 0) {
+          remainingRemovalFailures -= 1;
+          throw new Error("controlled removal failure");
+        }
+        handlers.delete(handlerId);
+        events.push(`remove:${String(handlerId)}`);
+      },
+    },
+    browser: {
+      get: async (url) => {
+        currentUrl = url;
+        events.push(url === CONTROLLED_ERROR_PROBE_URL ? "navigate:probe" : `navigate:${url}`);
+        if (failNavigationToProbe && url === CONTROLLED_ERROR_PROBE_URL) {
+          throw new Error("controlled probe navigation failure");
+        }
+        deliverProbeLoadError();
+      },
+      refresh: async () => {
+        events.push("refresh");
+        if (failRefresh) throw new Error("controlled refresh failure");
+        if (dropHandlersOnRefresh) handlers.clear();
+        deliverProbeLoadError();
+      },
+      wait: async (condition, _timeoutMs, message) => {
+        for (let turn = 0; turn < 5; turn += 1) {
+          if (condition()) return;
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+        }
+        throw new Error(message);
+      },
+    },
+    events,
+    registeredHandlerCount: () => handlers.size,
+    emitSessionError: deliverToRegisteredHandlers,
+  };
+}
+
+interface FakeNetworkSession {
+  readonly observer: BrowserNetworkObserver;
+  readonly browser: ObserverSessionBrowser;
+  readonly transportProbe: SessionTransportProbe;
+  readonly events: readonly string[];
+  registeredHandlerCount(): number;
+  registeredFetchErrorHandlerCount(): number;
+  emitFailedResponse(url: string, status: number): number;
+  emitTransportFailure(url: string, errorText: string): number;
+}
+
+function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, options?: {
+  readonly deliverResponses?: boolean;
+  readonly deliverTransportEvents?: boolean;
+  readonly registerFetchError?: boolean;
+  readonly dropHandlersOnRefresh?: boolean;
+  readonly dropFetchErrorHandlersOnRefresh?: boolean;
+  readonly failFetchErrorRegistration?: boolean;
+  readonly failTransportTriggerOnCall?: number;
+  readonly failNavigation?: boolean;
+  readonly failRefresh?: boolean;
+  readonly failRemoval?: boolean;
+  readonly failRemovalTimes?: number;
+  readonly rejectWaitMessageMatching?: RegExp;
+}): FakeNetworkSession {
+  const deliverResponses = options?.deliverResponses ?? true;
+  const deliverTransportEvents = options?.deliverTransportEvents ?? true;
+  const registerFetchError = options?.registerFetchError ?? true;
+  const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
+  const dropFetchErrorHandlersOnRefresh = options?.dropFetchErrorHandlersOnRefresh ?? false;
+  const failFetchErrorRegistration = options?.failFetchErrorRegistration ?? false;
+  const failTransportTriggerOnCall = options?.failTransportTriggerOnCall ?? 0;
+  const failNavigation = options?.failNavigation ?? false;
+  const failRefresh = options?.failRefresh ?? false;
+  const failRemoval = options?.failRemoval ?? false;
+  const rejectWaitMessageMatching = options?.rejectWaitMessageMatching ?? null;
+  let remainingRemovalFailures = options?.failRemovalTimes ?? 0;
+  let transportTriggerCalls = 0;
+  const events: string[] = [];
+  const handlers = new Set<(entry: { url: string; status: number }) => void>();
+  const fetchErrorHandlers = new Set<(entry: { url: string; errorText: string }) => void>();
+  let currentUrl: string | null = null;
+  const deliverToRegisteredHandlers = (url: string, status: number): number => {
+    const active = [...handlers];
+    for (const handler of active) handler({ url, status });
+    return active.length;
+  };
+  const deliverToFetchErrorHandlers = (url: string, errorText: string): number => {
+    const active = [...fetchErrorHandlers];
+    for (const handler of active) handler({ url, errorText });
+    return active.length;
+  };
+  const deliverProbeResponse = (): void => {
+    if (deliverResponses && currentUrl === probeUrl) deliverToRegisteredHandlers(probeUrl, 404);
+  };
+  return {
+    observer: {
+      addFailedResponseHandler: async (callback) => {
+        handlers.add(callback);
+        events.push("register-response");
+      },
+      addFetchErrorHandler: async (callback) => {
+        if (failFetchErrorRegistration) throw new Error("controlled fetch-error registration failure");
+        if (registerFetchError) fetchErrorHandlers.add(callback);
+        events.push("register-fetch-error");
+      },
+      removeNetworkHandlers: async () => {
+        if (failRemoval) throw new Error("controlled removal failure");
+        if (remainingRemovalFailures > 0) {
+          remainingRemovalFailures -= 1;
+          throw new Error("controlled removal failure");
+        }
+        handlers.clear();
+        fetchErrorHandlers.clear();
+        events.push("remove");
+      },
+    },
+    browser: {
+      get: async (url) => {
+        currentUrl = url;
+        events.push(url === probeUrl ? "navigate:probe" : `navigate:${url}`);
+        if (failNavigation && url === probeUrl) throw new Error("controlled probe navigation failure");
+        deliverProbeResponse();
+      },
+      refresh: async () => {
+        events.push("refresh");
+        if (failRefresh) throw new Error("controlled refresh failure");
+        if (dropHandlersOnRefresh) handlers.clear();
+        if (dropFetchErrorHandlersOnRefresh) fetchErrorHandlers.clear();
+        deliverProbeResponse();
+      },
+      wait: async (condition, _timeoutMs, message) => {
+        if (rejectWaitMessageMatching?.test(message) === true) throw new Error(message);
+        for (let turn = 0; turn < 8; turn += 1) {
+          if (condition()) return;
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+        }
+        throw new Error(message);
+      },
+    },
+    transportProbe: {
+      url: transportProbeUrl,
+      trigger: async () => {
+        transportTriggerCalls += 1;
+        events.push("transport-probe");
+        if (failTransportTriggerOnCall === transportTriggerCalls) {
+          throw new Error("controlled transport trigger failure");
+        }
+        if (deliverTransportEvents) deliverToFetchErrorHandlers(transportProbeUrl, "NS_ERROR_NET_RESET");
+      },
+    },
+    events,
+    registeredHandlerCount: () => handlers.size,
+    registeredFetchErrorHandlerCount: () => fetchErrorHandlers.size,
+    emitFailedResponse: deliverToRegisteredHandlers,
+    emitTransportFailure: deliverToFetchErrorHandlers,
+  };
 }

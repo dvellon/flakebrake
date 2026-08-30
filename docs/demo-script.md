@@ -39,8 +39,8 @@ At the first approval, point to the exact action digest and effect, then choose
 changes a best-effort quantity from 10 to 8 while protected work remains
 unchanged.
 
-At the second approval, choose **Approve action** for the fresh portfolio-v2
-`ADMITTABLE` Promise Basis.
+At the second approval, choose **Approve action** to accept the fresh
+capacity-safe promise and issue its exact authorization grant.
 
 **Say:** “Portfolio v2 is durable before readmission. Acceptance and its exact
 grant commit atomically; the old v1 `REPLAN` can never be accepted.”
@@ -49,8 +49,8 @@ grant commit atomically; the old v1 `REPLAN` can never be accepted.”
 
 At the primary 09:10–09:40 reservation, choose **Deny action**.
 
-**Show:** The denial in the timeline, followed by “Equivalent representation
-denied mechanically.”
+**Show:** The denial in the timeline, followed by “Auto-blocked · active
+policy.”
 
 **Say:** “The planner tried the same material effect through another MCP adapter.
 Typed effect normalization recognized it, so the active denial blocked it
