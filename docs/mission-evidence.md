@@ -28,7 +28,8 @@ bundle.
 
 The v1 payload contains:
 
-- mission, environment, TrueForge session, and terminal-turn identity;
+- mission, environment, TrueForge session, terminal-turn identity, and the
+  recomputable successor/bridge linkage material behind those identities;
 - the accepted authoritative Promise Basis, calibration digest, and versions;
 - the original REPLAN admission, selected modification, accepted execution
   admission, and pre-execution recomputation, including their durable addenda;
@@ -55,6 +56,10 @@ verified. The response uses `application/json`, a fixed safe download filename,
 the same loopback host/origin controls as the judge UI, and the existing CSP and
 security headers. Export opens SQLite with `readOnly: true` plus
 `PRAGMA query_only = ON` and never calls a mutating store operation.
+Before projecting records, the exporter recomputes the supplied M2 and factory
+database instance identities and requires them to match the mission's durable
+cross-store binding. Those path-derived instance identities are validated but
+not placed in the portable payload.
 
 ## Local verification
 

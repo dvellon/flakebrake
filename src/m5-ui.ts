@@ -32,7 +32,10 @@ import {
   HERO_RESOURCE_KEYS,
 } from "./hero-fixture.js";
 import { evaluateAdmission } from "./kernel.js";
-import { exportMissionEvidenceBundle } from "./mission-evidence.js";
+import {
+  exportMissionEvidenceBundle,
+  isMissionEvidenceReady,
+} from "./mission-evidence.js";
 import {
   m4OwnerDecisionResponse,
   type M4ApprovalRecord,
@@ -585,20 +588,20 @@ export class M5DemoCoordinator {
   /** Canonical completed-mission evidence projected through read-only handles. */
   public evidenceBundle(): string {
     this.#assertOpen();
-    try {
-      return exportMissionEvidenceBundle({
-        missionId: M4_HERO_MISSION_ID,
-        m2DatabasePath: this.#paths.m2,
-        factoryDatabasePath: this.#paths.factory,
-        missionDatabasePath: this.#paths.mission,
-      });
-    } catch {
+    const options = {
+      missionId: M4_HERO_MISSION_ID,
+      m2DatabasePath: this.#paths.m2,
+      factoryDatabasePath: this.#paths.factory,
+      missionDatabasePath: this.#paths.mission,
+    } as const;
+    if (!isMissionEvidenceReady(options)) {
       throw new M5RequestError(
         409,
         "evidence_not_ready",
         "Canonical mission evidence is available only after durable verification completes",
       );
     }
+    return exportMissionEvidenceBundle(options);
   }
 
   public async close(): Promise<void> {

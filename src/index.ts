@@ -115,6 +115,7 @@ export {
   MissionEvidenceError,
   buildMissionEvidenceBundle,
   exportMissionEvidenceBundle,
+  isMissionEvidenceReady,
   missionEvidenceBundleSchema,
   missionEvidencePayloadSchema,
   sanitizeEvidenceValue,

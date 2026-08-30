@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  copyFileSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -100,6 +103,34 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     assert.deepEqual(durableSnapshot(options), beforeVerification);
   });
 
+  test("export rejects a mission combined with a different durable database instance", () => {
+    const mixedRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-mixed-"));
+    const copiedM2 = join(mixedRoot, "m2.sqlite");
+    const copiedFactory = join(mixedRoot, "factory.sqlite");
+    try {
+      copyFileSync(options.m2DatabasePath, copiedM2);
+      copyFileSync(options.factoryDatabasePath, copiedFactory);
+      assert.throws(
+        () =>
+          exportMissionEvidenceBundle({
+            ...options,
+            m2DatabasePath: copiedM2,
+          }),
+        /database instance identities conflict/u,
+      );
+      assert.throws(
+        () =>
+          exportMissionEvidenceBundle({
+            ...options,
+            factoryDatabasePath: copiedFactory,
+          }),
+        /database instance identities conflict/u,
+      );
+    } finally {
+      rmSync(mixedRoot, { recursive: true, force: true });
+    }
+  });
+
   test("local CLI independently verifies the downloaded file without database mutation", () => {
     const bundlePath = join(directory, "mission-evidence.json");
     writeFileSync(bundlePath, canonicalBytes, "utf8");
@@ -160,6 +191,56 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
       () => verifyMissionEvidenceBytes(canonicalSerialize(missingReceipt)),
       /attempt, fence, receipt, read-back, and terminal linkage is inconsistent/u,
     );
+
+    const mismatchedSession = mutableBundle(canonicalBytes);
+    mismatchedSession.payload.mission.trueforgeSessionId = "session/tampered";
+    refreshDigest(mismatchedSession);
+    assert.throws(
+      () => verifyMissionEvidenceBytes(canonicalSerialize(mismatchedSession)),
+      /TrueForge session and terminal-turn linkage is inconsistent/u,
+    );
+
+    const mismatchedTurn = mutableBundle(canonicalBytes);
+    mismatchedTurn.payload.mission.terminalTurnId = "turn/tampered";
+    refreshDigest(mismatchedTurn);
+    assert.throws(
+      () => verifyMissionEvidenceBytes(canonicalSerialize(mismatchedTurn)),
+      /TrueForge session and terminal-turn linkage is inconsistent/u,
+    );
+
+    const missingAcceptanceOwner = mutableBundle(canonicalBytes);
+    missingAcceptanceOwner.payload.promiseAcceptance.body["ownerDecisionId"] =
+      "owner-decision/missing";
+    refreshDigest(missingAcceptanceOwner);
+    assert.throws(
+      () => verifyMissionEvidenceBytes(canonicalSerialize(missingAcceptanceOwner)),
+      /promise acceptance owner decision must occur exactly once; found 0/u,
+    );
+  });
+
+  test("failed read-only database opens release every acquired handle", () => {
+    const corruptRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-corrupt-"));
+    const corruptOptions: MissionEvidenceBuildOptions = {
+      ...options,
+      m2DatabasePath: join(corruptRoot, "m2.sqlite"),
+      factoryDatabasePath: join(corruptRoot, "factory.sqlite"),
+      missionDatabasePath: join(corruptRoot, "mission.sqlite"),
+    };
+    try {
+      copyFileSync(options.m2DatabasePath, corruptOptions.m2DatabasePath);
+      copyFileSync(options.factoryDatabasePath, corruptOptions.factoryDatabasePath);
+      writeFileSync(corruptOptions.missionDatabasePath, "not a SQLite database", "utf8");
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        assert.throws(
+          () => exportMissionEvidenceBundle(corruptOptions),
+          /(?:could not open mission database read-only|file is not a database)/u,
+        );
+      }
+      assert.equal(openDescriptorCount(corruptOptions.m2DatabasePath), 0);
+      assert.equal(openDescriptorCount(corruptOptions.missionDatabasePath), 0);
+    } finally {
+      rmSync(corruptRoot, { recursive: true, force: true });
+    }
   });
 
   test("concurrent read-only HTTP downloads return one canonical bundle", async () => {
@@ -207,6 +288,44 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     }
   });
 
+  test("endpoint reports completed evidence corruption as a safe internal failure", async () => {
+    const corruptRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-http-corrupt-"));
+    const owner = new M5DemoCoordinator({
+      dataRoot: corruptRoot,
+      cleanupDataOnClose: false,
+    });
+    await owner.close();
+    copyFileSync(options.m2DatabasePath, join(corruptRoot, "m2.sqlite"));
+    copyFileSync(options.factoryDatabasePath, join(corruptRoot, "factory.sqlite"));
+    copyFileSync(options.missionDatabasePath, join(corruptRoot, "mission.sqlite"));
+    const mission = new DatabaseSync(join(corruptRoot, "mission.sqlite"));
+    try {
+      mission
+        .prepare(
+          `UPDATE m4_missions SET m2_environment_identity = ? WHERE mission_id = ?`,
+        )
+        .run("database-instance/sha256:tampered", M4_HERO_MISSION_ID);
+    } finally {
+      mission.close();
+    }
+    const running = await startM5JudgeServer({
+      dataRoot: corruptRoot,
+      cleanupDataOnClose: false,
+      port: 0,
+    });
+    try {
+      const response = await fetch(`${running.url}/api/evidence`);
+      assert.equal(response.status, 500);
+      assert.deepEqual(await response.json(), {
+        error: "internal_error",
+        message: "The request failed safely",
+      });
+    } finally {
+      await running.close();
+      rmSync(corruptRoot, { recursive: true, force: true });
+    }
+  });
+
   test("UI exposes a responsive, CSP-compatible completed-mission download control", () => {
     const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
     const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
@@ -232,6 +351,13 @@ interface MutableEvidenceBundle {
     }[];
     counts: Record<string, number>;
     terminalProjection: { receiptId: string };
+    mission: {
+      terminalTurnId: string;
+      trueforgeSessionId: string;
+    };
+    promiseAcceptance: {
+      body: Record<string, unknown>;
+    };
     [key: string]: unknown;
   };
 }
@@ -244,6 +370,16 @@ function refreshDigest(bundle: MutableEvidenceBundle): void {
   bundle.payloadDigest = `sha256:${createHash("sha256")
     .update(canonicalSerialize(bundle.payload), "utf8")
     .digest("hex")}`;
+}
+
+function openDescriptorCount(path: string): number {
+  return readdirSync("/proc/self/fd").filter((descriptor) => {
+    try {
+      return readlinkSync(join("/proc/self/fd", descriptor)) === path;
+    } catch {
+      return false;
+    }
+  }).length;
 }
 
 function durableSnapshot(

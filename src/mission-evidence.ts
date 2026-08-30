@@ -12,6 +12,11 @@ import {
   factoryStateDigest,
   readAuthoritativeFactoryExecution,
 } from "./factory-environment.js";
+import { stableTupleId } from "./identity.js";
+import {
+  canonicalDatabasePath,
+  databaseInstanceIdentityFromHandle,
+} from "./sqlite.js";
 import type { EffectFingerprint } from "./stateful-domain.js";
 
 export const MISSION_EVIDENCE_SCHEMA_VERSION =
@@ -81,6 +86,10 @@ const ownerDecisionSchema = z
 const approvalBindingSchema = z
   .object({
     bridgeKey: digestIdentitySchema("m4-bridge"),
+    trueforgeSessionId: nonEmptyText,
+    trueforgeTurnId: nonEmptyText,
+    trueforgeThreadId: nonEmptyText,
+    trueforgeToolCallId: nonEmptyText,
     actionKind: z.enum(["owner_decision", "consequential_effect"]),
     toolName: nonEmptyText,
     argumentsDigest: digestText,
@@ -122,6 +131,15 @@ export const missionEvidencePayloadSchema = z
         environmentId: nonEmptyText,
         trueforgeSessionId: nonEmptyText,
         terminalTurnId: nonEmptyText,
+        terminalTurnLink: z
+          .object({
+            successorIntentKey: digestIdentitySchema("m4-successor-intent"),
+            previousTurnId: nonEmptyText,
+            successorTurnId: nonEmptyText,
+            inputDigest: digestText,
+            input: jsonValueSchema,
+          })
+          .strict(),
       })
       .strict(),
     authoritativeBasis: z
@@ -284,21 +302,121 @@ export class MissionEvidenceError extends Error {
   }
 }
 
+/**
+ * Distinguishes an unfinished mission from an evidence-export defect without
+ * opening either durable store for mutation.
+ */
+export function isMissionEvidenceReady(
+  options: MissionEvidenceBuildOptions,
+): boolean {
+  requireText(options.missionId, "missionId");
+  if (!existsSync(options.missionDatabasePath)) return false;
+  let mission: DatabaseSync | undefined;
+  let m2: DatabaseSync | undefined;
+  try {
+    mission = openReadOnlyDatabase(options.missionDatabasePath, "mission");
+    const missionRow = mission
+      .prepare(
+        `SELECT current_turn_id FROM m4_missions WHERE mission_id = ?`,
+      )
+      .get(options.missionId) as Record<string, unknown> | undefined;
+    if (
+      missionRow === undefined ||
+      typeof missionRow["current_turn_id"] !== "string" ||
+      missionRow["current_turn_id"].length === 0
+    ) {
+      return false;
+    }
+    if (!existsSync(options.m2DatabasePath)) {
+      throw new MissionEvidenceError(
+        "terminal mission binding exists without its durable M2 database",
+      );
+    }
+    m2 = openReadOnlyDatabase(options.m2DatabasePath, "M2");
+    return (
+      countRows(
+        m2,
+        `SELECT COUNT(*) AS count FROM reservation_events
+          WHERE event_kind = 'terminal_verified'`,
+      ) > 0
+    );
+  } catch (error: unknown) {
+    if (error instanceof MissionEvidenceError) throw error;
+    throw new MissionEvidenceError(
+      `mission evidence readiness check failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    );
+  } finally {
+    try {
+      m2?.close();
+    } finally {
+      mission?.close();
+    }
+  }
+}
+
 export function buildMissionEvidenceBundle(
   options: MissionEvidenceBuildOptions,
 ): MissionEvidenceBundle {
   validateBuildOptions(options);
-  const m2 = openReadOnlyDatabase(options.m2DatabasePath, "M2");
-  const mission = openReadOnlyDatabase(options.missionDatabasePath, "mission");
+  let m2: DatabaseSync | undefined;
+  let factory: DatabaseSync | undefined;
+  let mission: DatabaseSync | undefined;
   try {
+    m2 = openReadOnlyDatabase(options.m2DatabasePath, "M2");
+    mission = openReadOnlyDatabase(options.missionDatabasePath, "mission");
+    factory = openReadOnlyDatabase(options.factoryDatabasePath, "factory");
     const missionRow = requireOneRow(
       mission,
-      `SELECT mission_id, environment_id, trueforge_session_id, current_turn_id
+      `SELECT mission_id, environment_id, trueforge_session_id, current_turn_id,
+              m2_environment_identity, factory_environment_identity
          FROM m4_missions WHERE mission_id = ?`,
       [options.missionId],
       "mission binding",
     );
+    const environmentId = requireText(missionRow["environment_id"], "environment_id");
+    const currentM2Identity = databaseInstanceIdentityFromHandle(
+      m2,
+      canonicalDatabasePath(options.m2DatabasePath),
+      "m2",
+      environmentId,
+    );
+    const currentFactoryIdentity = databaseInstanceIdentityFromHandle(
+      factory,
+      canonicalDatabasePath(options.factoryDatabasePath),
+      "factory",
+      environmentId,
+    );
+    if (
+      requireText(missionRow["m2_environment_identity"], "m2_environment_identity") !==
+        currentM2Identity ||
+      requireText(
+        missionRow["factory_environment_identity"],
+        "factory_environment_identity",
+      ) !== currentFactoryIdentity
+    ) {
+      throw new MissionEvidenceError(
+        "mission database instance identities conflict with its durable environment binding",
+      );
+    }
     const currentTurnId = requireText(missionRow["current_turn_id"], "current_turn_id");
+    const terminalTurnRow = requireOneRow(
+      mission,
+      `SELECT intent_key, previous_turn_id, input_digest, input_json
+         FROM m4_successor_intents
+        WHERE mission_id = ? AND trueforge_session_id = ? AND successor_turn_id = ?`,
+      [
+        options.missionId,
+        requireText(missionRow["trueforge_session_id"], "trueforge_session_id"),
+        currentTurnId,
+      ],
+      "terminal TrueForge successor intent",
+    );
+    const terminalTurnInput = sanitizeEvidenceValue(
+      parseCanonicalStoredJson(terminalTurnRow["input_json"], "terminal turn input"),
+    );
 
     const admissionRows = allRows(
       m2,
@@ -325,7 +443,7 @@ export function buildMissionEvidenceBundle(
         throw new MissionEvidenceError("admission row identity does not match its canonical body");
       }
       const addenda = allRows(
-        m2,
+        m2!,
         `SELECT sequence, addendum_id, admission_record_id, kind, body_json
            FROM admission_addenda WHERE admission_record_id = ? ORDER BY sequence`,
         [admissionRecordId],
@@ -454,7 +572,9 @@ export function buildMissionEvidenceBundle(
 
     const actions = allRows(
       mission,
-      `SELECT bridge_key, action_kind, tool_name, arguments_digest, arguments_json
+      `SELECT bridge_key, trueforge_session_id, trueforge_turn_id,
+              trueforge_thread_id, trueforge_tool_call_id, action_kind,
+              tool_name, arguments_digest, arguments_json
          FROM m4_bridge_actions WHERE mission_id = ? ORDER BY bridge_key`,
       [options.missionId],
     );
@@ -471,7 +591,7 @@ export function buildMissionEvidenceBundle(
         throw new MissionEvidenceError(`bridge ${bridgeKey} arguments digest is inconsistent`);
       }
       const outcome = requireOneRow(
-        mission,
+        mission!,
         `SELECT result_json FROM m4_bridge_events
            WHERE bridge_key = ? AND status = 'approval_bound'`,
         [bridgeKey],
@@ -479,6 +599,22 @@ export function buildMissionEvidenceBundle(
       );
       return {
         bridgeKey,
+        trueforgeSessionId: requireText(
+          action["trueforge_session_id"],
+          "bridge trueforge_session_id",
+        ),
+        trueforgeTurnId: requireText(
+          action["trueforge_turn_id"],
+          "bridge trueforge_turn_id",
+        ),
+        trueforgeThreadId: requireText(
+          action["trueforge_thread_id"],
+          "bridge trueforge_thread_id",
+        ),
+        trueforgeToolCallId: requireText(
+          action["trueforge_tool_call_id"],
+          "bridge trueforge_tool_call_id",
+        ),
         actionKind: requireActionKind(action["action_kind"]),
         toolName: requireText(action["tool_name"], "bridge tool_name"),
         argumentsDigest,
@@ -604,12 +740,22 @@ export function buildMissionEvidenceBundle(
       schemaVersion: MISSION_EVIDENCE_PAYLOAD_SCHEMA_VERSION,
       mission: {
         missionId: requireText(missionRow["mission_id"], "mission_id"),
-        environmentId: requireText(missionRow["environment_id"], "environment_id"),
+        environmentId,
         trueforgeSessionId: requireText(
           missionRow["trueforge_session_id"],
           "trueforge_session_id",
         ),
         terminalTurnId: currentTurnId,
+        terminalTurnLink: {
+          successorIntentKey: requireText(terminalTurnRow["intent_key"], "intent_key"),
+          previousTurnId: requireText(
+            terminalTurnRow["previous_turn_id"],
+            "previous_turn_id",
+          ),
+          successorTurnId: currentTurnId,
+          inputDigest: requireDigest(terminalTurnRow["input_digest"], "input_digest"),
+          input: terminalTurnInput,
+        },
       },
       authoritativeBasis: {
         admissionRecordId: acceptedAdmissionId,
@@ -762,8 +908,15 @@ export function buildMissionEvidenceBundle(
       { cause: error },
     );
   } finally {
-    mission.close();
-    m2.close();
+    try {
+      factory?.close();
+    } finally {
+      try {
+        mission?.close();
+      } finally {
+        m2?.close();
+      }
+    }
   }
 }
 
@@ -833,6 +986,36 @@ export function verifyMissionEvidenceBundle(bundle: MissionEvidenceBundle): void
 }
 
 export function verifyMissionEvidencePayload(payload: MissionEvidencePayload): void {
+  const terminalTurnLink = payload.mission.terminalTurnLink;
+  if (
+    terminalTurnLink.successorTurnId !== payload.mission.terminalTurnId ||
+    terminalTurnLink.successorIntentKey !==
+      stableTupleId("m4-successor-intent", [
+        payload.mission.trueforgeSessionId,
+        terminalTurnLink.previousTurnId,
+      ]) ||
+    terminalTurnLink.inputDigest !== sha256(canonicalSerialize(terminalTurnLink.input))
+  ) {
+    throw new MissionEvidenceError(
+      "TrueForge session and terminal-turn linkage is inconsistent",
+    );
+  }
+  for (const binding of payload.ownerApprovalBindings) {
+    if (
+      binding.trueforgeSessionId !== payload.mission.trueforgeSessionId ||
+      binding.bridgeKey !==
+        stableTupleId("m4-bridge", [
+          binding.trueforgeSessionId,
+          binding.trueforgeTurnId,
+          binding.trueforgeThreadId,
+          binding.trueforgeToolCallId,
+        ])
+    ) {
+      throw new MissionEvidenceError(
+        `approval bridge ${binding.bridgeKey} has inconsistent TrueForge identity linkage`,
+      );
+    }
+  }
   const admissionByRole = new Map(payload.admissions.map((item) => [item.role, item]));
   if (admissionByRole.size !== 3) {
     throw new MissionEvidenceError("evidence admissions must contain each durable role once");
@@ -927,6 +1110,34 @@ export function verifyMissionEvidencePayload(payload: MissionEvidencePayload): v
     throw new MissionEvidenceError("selected REPLAN candidate and owner-choice linkage is inconsistent");
   }
   const acceptanceBody = requireObject(payload.promiseAcceptance.body, "promise acceptance");
+  const acceptanceOwnerDecisionId = requireText(
+    acceptanceBody["ownerDecisionId"],
+    "acceptance ownerDecisionId",
+  );
+  const acceptanceOwnerDecision = requireSingle(
+    payload.ownerDecisions.filter(
+      (item) => item.ownerDecisionId === acceptanceOwnerDecisionId,
+    ),
+    "promise acceptance owner decision",
+  );
+  const acceptanceOwnerDecisionBody = requireObject(
+    acceptanceOwnerDecision.decision,
+    "promise acceptance owner decision",
+  );
+  const acceptedOwnerChoice = requireSingle(
+    accepted.addenda.filter((item) => item.kind === "owner_choice"),
+    "accepted-plan owner choice",
+  );
+  const acceptanceApproval = requireSingle(
+    payload.ownerApprovalBindings.filter(
+      (binding) => binding.toolName === "accept_promise",
+    ),
+    "Promise acceptance approval bridge",
+  );
+  const acceptanceApprovalBody = requireObject(
+    acceptanceApproval.approval,
+    "Promise acceptance approval",
+  );
   const acceptedRecordPlan = requireObject(
     acceptedRecord["selectedPlan"],
     "accepted selected plan",
@@ -938,7 +1149,15 @@ export function verifyMissionEvidencePayload(payload: MissionEvidencePayload): v
   if (
     acceptanceBody["selectedPlanId"] !== payload.selectedPlan.executionPlanId ||
     acceptedRecordPlan["selectedPlanId"] !== payload.selectedPlan.executionPlanId ||
-    acceptanceBody["ownerDecisionId"] === undefined ||
+    acceptanceOwnerDecisionBody["kind"] !== "ACCEPT_PROMISE" ||
+    acceptanceOwnerDecisionBody["ownerDecisionId"] !== acceptanceOwnerDecisionId ||
+    acceptanceOwnerDecisionBody["admissionRecordId"] !== acceptedAdmissionId ||
+    acceptanceOwnerDecisionBody["selectedPlanId"] !== payload.selectedPlan.executionPlanId ||
+    canonicalSerialize(acceptedOwnerChoice.body) !==
+      canonicalSerialize(acceptanceOwnerDecision.decision) ||
+    acceptanceApproval.actionKind !== "owner_decision" ||
+    acceptanceApprovalBody["source"] !== "owner" ||
+    acceptanceApprovalBody["decision"] !== "allow" ||
     acceptanceAddendum.addendumId !== payload.promiseAcceptance.addendumId ||
     canonicalSerialize(acceptanceAddendum.body) !==
       canonicalSerialize(payload.promiseAcceptance.body)
@@ -1105,15 +1324,13 @@ export function verifyMissionEvidencePayload(payload: MissionEvidencePayload): v
     !payload.ownerApprovalBindings.some(
       (binding) =>
         binding.bridgeKey === mechanical.bridgeKey &&
-        canonicalSerialize(binding) ===
-          canonicalSerialize({
-            bridgeKey: mechanical.bridgeKey,
-            actionKind: "consequential_effect",
-            toolName: mechanical.toolName,
-            argumentsDigest: mechanical.argumentsDigest,
-            arguments: mechanical.arguments,
-            approval: mechanical.approval,
-          }),
+        binding.actionKind === "consequential_effect" &&
+        binding.toolName === mechanical.toolName &&
+        binding.argumentsDigest === mechanical.argumentsDigest &&
+        canonicalSerialize(binding.arguments) ===
+          canonicalSerialize(mechanical.arguments) &&
+        canonicalSerialize(binding.approval) ===
+          canonicalSerialize(mechanical.approval),
     )
   ) {
     throw new MissionEvidenceError("mechanical alternate-representation denial is inconsistent");
@@ -1251,11 +1468,17 @@ function validateBuildOptions(options: MissionEvidenceBuildOptions): void {
 }
 
 function openReadOnlyDatabase(path: string, label: string): DatabaseSync {
+  let database: DatabaseSync | undefined;
   try {
-    const database = new DatabaseSync(resolve(path), { readOnly: true });
+    database = new DatabaseSync(resolve(path), { readOnly: true });
     database.exec("PRAGMA query_only = ON");
     return database;
   } catch (error: unknown) {
+    try {
+      database?.close();
+    } catch {
+      // Preserve the original open/configuration error.
+    }
     throw new MissionEvidenceError(`could not open ${label} database read-only`, {
       cause: error,
     });
