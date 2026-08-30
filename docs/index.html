@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#09100c">
+  <title>FlakeBrake — a commitment firewall for humans and agents</title>
+  <meta name="description" content="FlakeBrake is a commitment firewall for humans and agents. TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay before anyone relies on the consequential outcome.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="FlakeBrake — a commitment firewall for humans and agents">
+  <meta property="og:description" content="TrueForge coordinates the agents; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay. Built on TrueForge 0.1.4.">
+  <meta property="og:site_name" content="FlakeBrake">
+  <!-- Update the og:image/og:url origin below if the site is published somewhere other than the default GitHub Pages origin. -->
+  <meta property="og:url" content="https://dvellon.github.io/flakebrake/">
+  <meta property="og:image" content="https://dvellon.github.io/flakebrake/assets/social-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23c9f45b'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='14' font-weight='900' text-anchor='middle' fill='%2317220f'%3EFB%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="./" aria-label="FlakeBrake home">
+        <span class="brand-mark" aria-hidden="true">FB</span>
+        <span class="brand-name"><strong>FlakeBrake</strong><small>Built on TrueForge</small></span>
+      </a>
+      <nav class="topnav" aria-label="Site">
+        <a href="#problem">Problem</a>
+        <a href="#trueforge">TrueForge</a>
+        <a href="#honest">Firewall</a>
+        <a href="#scenario">Story</a>
+        <a href="#proof">Proof Center</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#quality">Quality</a>
+        <a href="blog.html">Blog</a>
+        <a class="nav-cta" href="https://github.com/dvellon/flakebrake">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ============================== HERO ============================== -->
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <ul class="hero-badges">
+        <li class="badge-tf">Built on TrueForge 0.1.4</li>
+        <li>Deterministic judge profile</li>
+        <li>No credentials required</li>
+        <li>MIT licensed</li>
+      </ul>
+      <h1 id="hero-title">A rush order. One safe promise. <span class="accent">Proof all the way down.</span></h1>
+      <p class="category">FlakeBrake is a <span class="accent">commitment firewall</span> for humans and agents.</p>
+      <p class="lede">A <strong>human-governed TrueForge agent</strong> that replans constrained work, pauses for exact authorization, mechanically blocks equivalent denied actions, executes <strong>one fenced mutation</strong>, verifies the result independently, and reconnects without repeating a single owner decision or effect.</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="#scenario">Follow the three-minute story</a>
+        <a class="button button-quiet" href="https://github.com/dvellon/flakebrake">View the repository</a>
+        <a class="button button-quiet" href="blog.html">Read the blog post</a>
+      </div>
+
+      <div class="chain" role="group" aria-label="The TrueForge action chain FlakeBrake runs on">
+        <p class="chain-title"><span class="chain-mark">TrueForge action chain</span> <span class="chain-note">every station below is a real TrueForge 0.1.4 interface, exercised on every judge run</span></p>
+        <ol class="chain-track">
+          <li class="chain-step"><span class="k">Session</span><span class="v">durable session &amp; turn graph</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step"><span class="k">Three subagents</span><span class="v">portfolio · capacity · assurance</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step"><span class="k">Four MCP services</span><span class="v">orders · capacity · simulator · change&nbsp;control</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step"><span class="k">Local sandbox</span><span class="v">mechanical assurance code</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step"><span class="k">Native approval pause</span><span class="v">the turn holds for a person</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step chain-step-human"><span class="k">Human decision</span><span class="v">approve or deny, exactly as displayed</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step"><span class="k">Reconnect</span><span class="v">durable replay, no repeats</span></li>
+          <li class="chain-sep" aria-hidden="true">→</li>
+          <li class="chain-step chain-step-verified"><span class="k">Verified effect</span><span class="v">independent read-back first</span></li>
+        </ol>
+        <p class="chain-footnote"><strong>Honest by construction:</strong> the judge path runs genuine TrueForge 0.1.4 sessions, turns, dynamic subagents, MCP connectors, sandbox execution, native approval events, and reconnect behavior — with a bounded local deterministic model provider, so judging needs no OpenAI or Daytona credentials and produces the same evidence every time.</p>
+      </div>
+    </section>
+
+    <!-- ============================== PROBLEM ============================== -->
+    <section id="problem" class="section" aria-labelledby="problem-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">01</span>The operator problem</p>
+        <h2 id="problem-title">A fluent plan is not an authorization.</h2>
+        <div class="prose">
+          <p>Agent systems are good at producing a plausible next action. They are far less reliable at deciding whether a <strong>new commitment stays feasible next to every promise already accepted</strong> — the human review budget, the agent work budget, the production window that protected orders already occupy. The dangerous failure mode is quiet: the agent says yes first and discovers the conflict mid-execution, when capacity is already spent.</p>
+          <p>Most agent demos never touch this. They show a happy path where the model's confidence is treated as authority, and they skip the questions an operator would actually ask:</p>
+        </div>
+        <div class="grid grid-3">
+          <article class="tile">
+            <span class="mono-label">Skipped question № 1</span>
+            <h3>Who authorized <em>that exact</em> effect?</h3>
+            <p>A chat transcript that says "sounds good" binds nothing. FlakeBrake pauses the TrueForge turn and shows the owner the exact tool, arguments, expected effect, and a SHA-256 action digest before anything is allowed to happen.</p>
+          </article>
+          <article class="tile">
+            <span class="mono-label">Skipped question № 2</span>
+            <h3>What happens when the agent asks again, differently?</h3>
+            <p>Renaming an action or switching to another tool adapter is the oldest trick in the book. FlakeBrake's denials are typed, durable constraints that recognize the same material effect through equivalent representations — and block it without another human call.</p>
+          </article>
+          <article class="tile">
+            <span class="mono-label">Skipped question № 3</span>
+            <h3>Did the effect actually happen — once?</h3>
+            <p>A completed tool response is not success. FlakeBrake fences a single execution attempt, stores one receipt, reads the factory back independently, and only then exposes a verified terminal state. Refresh the browser and the counts don't move.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== TRUEFORGE ============================== -->
+    <section id="trueforge" class="section" aria-labelledby="trueforge-title">
+      <div class="wrap">
+        <p class="eyebrow eyebrow-blue"><span class="idx">02</span>Built on TrueForge</p>
+        <h2 id="trueforge-title">TrueForge owns the agent loop. FlakeBrake owns the policy.</h2>
+        <div class="prose">
+          <p>The mission runs inside the pinned <strong>TrueForge 0.1.4</strong> server through the pinned <strong>0.1.3 SDK</strong> — not a lookalike shim. TrueForge owns the session and turn graph, the dynamic subagent threads, the MCP connector routing, sandbox execution, the native approval pauses, and reconnection. FlakeBrake supplies what TrueForge deliberately doesn't decide: the admission kernel, exact authorization semantics, denial equivalence, fencing, and independent verification.</p>
+        </div>
+
+        <dl class="facts">
+          <div class="fact"><dt>Runtime</dt><dd>TrueForge 0.1.4 · SDK 0.1.3<small>pinned in <code>package.json</code>, surfaced live in the judge UI</small></dd></div>
+          <div class="fact"><dt>Root agent</dt><dd><code>flakebrake-root-obligation-commander</code><small>the only role that talks to the owner</small></dd></div>
+          <div class="fact"><dt>Subagents</dt><dd>Three dynamic roles<small>portfolio &amp; order analyst · capacity &amp; schedule analyst · assurance &amp; simulation engineer</small></dd></div>
+          <div class="fact"><dt>MCP services</dt><dd>Four Streamable HTTP connectors<small><code>factory-orders</code> · <code>factory-capacity</code> · <code>factory-simulator</code> · <code>factory-change-control</code></small></dd></div>
+          <div class="fact"><dt>Approval gate</dt><dd>Four gated tools, native pauses<small>every consequential change-control tool requires an owner decision</small></dd></div>
+          <div class="fact"><dt>Sandbox</dt><dd>Enabled, downloads off<small>the assurance subagent runs generated analysis code in an isolated TrueForge sandbox</small></dd></div>
+          <div class="fact"><dt>Provider profile</dt><dd><code>flakebrake-deterministic/m4-mission</code><small>a bounded local model endpoint registered with the real TrueForge server</small></dd></div>
+          <div class="fact"><dt>Reconnect</dt><dd>Durable session replay<small>refresh and restart re-project the same session — never re-run it</small></dd></div>
+        </dl>
+
+        <figure class="shot">
+          <div class="shot-frame">
+            <img src="assets/pages/harness-observed.png" width="1280" height="714"
+              alt="TrueForge harness strip from the judge UI after a verified run: the action chain marks Mission and Verified result as VERIFIED, with 3 specialist agents, 4 factory tools, Sandbox check, Human pause, and Same-session resume all OBSERVED, above the sentence 'TrueForge coordinated 3 specialist agents, connected 4 factory tools, ran a sandbox check, paused for your decisions, and resumed the same durable session.' Session, runtime, and MCP identifiers sit behind the collapsed technical-evidence disclosure.">
+          </div>
+          <figcaption><strong>Observed, not asserted:</strong> the harness ribbon after a verified deterministic run. Before the mission starts every chain station reads <em>Configured</em>; afterwards the stations read <em>Observed</em> and the mission and result read <em>Verified</em> — and the disclosure's facts flip from "4 services configured / Configured / Dynamic · configured" to <em>4/4 services reached, 1 executed, 3 threads evidenced, Native · 4 owner calls</em>. Runtime evidence from that run, captured at the current build.</figcaption>
+        </figure>
+
+        <div class="vocab" role="group" aria-label="How FlakeBrake labels its evidence">
+          <div>
+            <h3><span class="dot dot-configured" aria-hidden="true"></span>Configured</h3>
+            <p>What the root agent spec declares before any run: four MCP services, sandbox enabled, dynamic subagents enabled, four approval-gated tools. Setup facts — never presented as runtime proof.</p>
+            <p class="sample">4 services configured · Dynamic · configured</p>
+          </div>
+          <div>
+            <h3><span class="dot dot-observed" aria-hidden="true"></span>Observed</h3>
+            <p>What this run actually exercised, from durable runtime evidence: services reached, sandbox executions, subagent threads, owner calls, model requests.</p>
+            <p class="sample">4/4 services reached · 3 threads evidenced</p>
+          </div>
+          <div>
+            <h3><span class="dot dot-verified" aria-hidden="true"></span>Verified</h3>
+            <p>The only state presented as success: an independent read-back of authoritative state confirming the one approved effect, recorded as a terminal event.</p>
+            <p class="sample">Terminal verified success</p>
+          </div>
+        </div>
+
+        <div class="honesty">
+          <p><strong>What the deterministic profile does and doesn't prove.</strong> The judge run proves the orchestration and safety mechanics through TrueForge's genuine public interfaces; it does not evaluate an external model's judgment, because the provider is a bounded deterministic endpoint built for reproducible judging. Separately, the repository carries credential-gated test coverage — skipped without an external M0 configuration — that exercises an OpenAI model provider and a Daytona sandbox provider through the same boundaries. That coverage is an optional assurance gate, never part of the credential-free judge path.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== FIREWALL ============================== -->
+    <section id="honest" class="section" aria-labelledby="honest-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">03</span>The commitment firewall</p>
+        <h2 id="honest-title">How agents keep each other honest</h2>
+        <div class="prose">
+          <p>TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect. <strong>FlakeBrake sits behind the consequential MCP boundaries</strong> and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay — before another agent, or a human, relies on the consequential outcome.</p>
+        </div>
+        <div class="pull">Agents can propose anything; they cannot make it true. Every consequential effect must pass current-state checks, authorization, fenced execution, and independent verification.</div>
+        <div class="prose">
+          <p>Specialists recommend. Before a recommendation can become a consequential effect, <strong>the root's change-control call and FlakeBrake's stores independently re-evaluate the exact action against current authoritative state</strong>. Only the root invokes the consequential change-control tools, and in the deterministic fixture the effect arguments are constructed from authoritative SQLite state — raw prose cannot authorize, mutate, verify, or replay an effect. That precision matters, so the firewall's claim comes in two distinct layers:</p>
+        </div>
+        <div class="boundary">
+          <article class="is-rec">
+            <p class="who">Layer 1 · Recorded recommendation</p>
+            <h3>Preserved, not certified</h3>
+            <p>TrueForge keeps each specialist thread and its output in durable history — context the root works from, evidence a judge can read. FlakeBrake makes no claim to understand or certify arbitrary prose, and this isn't deception detection: another agent can consume the authoritative domain outcome, but nothing verifies the semantic truth of a specialist sentence.</p>
+          </article>
+          <article class="is-gov">
+            <p class="who">Layer 2 · Governed effect</p>
+            <h3>Authoritatively enforced</h3>
+            <p>Capacity, authorization, equivalent denial, execution identity, read-back, and replay are enforced against current authoritative M1–M4 state before another agent or human relies on the consequential outcome. An <em>unsupported, stale, conflicting, duplicated, or unverified</em> consequential claim is mechanically unusable.</p>
+          </article>
+        </div>
+
+        <ul class="checks">
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"This replan fits."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>Capacity recommendations are recomputed against the authoritative versioned basis — the deterministic kernel re-evaluates the complete portfolio at the MCP boundary, and the assurance engineer independently recomputes demand, ranking, and protected-order preservation in the sandbox.</p>
+              <code>M1 kernel · versioned Promise Basis</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"The earlier evaluation is still good."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>A stale basis cannot be treated as current. Acceptance atomically compares the complete evaluated version tuple; once portfolio v2 is durable, the v1 REPLAN can never be accepted.</p>
+              <code>M2 ledger · version compare-and-swap</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"This is a different action now."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>A differently worded denied action remains denied. Typed effect normalization matches the material effect across tool names and schemas, so the active denial blocks the equivalent representation — no new owner call, no mutation.</p>
+              <code>M2 ledger · typed denial equivalence</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"The tool returned a receipt — done."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>An executor cannot declare success merely because it returned a receipt. Independent read-back of authoritative factory state and a terminal verification event stand between the mutation and the word "success".</p>
+              <code>M3 boundary · independent read-back</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"I restarted, so I'll run it again."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>A restarted agent cannot repeat an already completed effect. Attempts are fenced and idempotent: replay converges on the original durable result and creates no second mutation.</p>
+              <code>M2/M3 · fenced idempotent attempts</code>
+            </div>
+          </li>
+        </ul>
+
+        <div class="prose">
+          <p>Routine inter-agent checks are <strong>automatic</strong> — nobody is interrupted while the firewall recomputes, matches versions, or converges a replay. Humans enter exactly where policy says a consequence needs an owner: the four approval-gated change-control tools that pause the TrueForge turn.</p>
+        </div>
+
+        <div class="chain chain-firewall" role="group" aria-label="The commitment-firewall architecture sequence">
+          <p class="chain-title"><span class="chain-mark">Architecture sequence</span> <span class="chain-note">the amber station is the only one that costs a human interruption — and only when policy requires it</span></p>
+          <ol class="chain-track chain-steps-7">
+            <li class="chain-step"><span class="k">Specialist recommendation</span><span class="v">three subagents investigate &amp; propose</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step"><span class="k">TrueForge root turn</span><span class="v">only the root acts on a recommendation</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-fb"><span class="k">FlakeBrake MCP check</span><span class="v">basis, authorization, equivalence, identity</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-human"><span class="k">Human approval when required</span><span class="v">the four gated tools pause the turn</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-fb"><span class="k">Fenced execution</span><span class="v">one claimed, idempotent attempt</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-fb"><span class="k">Independent read-back</span><span class="v">authoritative state, read separately</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-verified"><span class="k">Evidence-bound result</span><span class="v">durable, replayable, verified</span></li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== SCENARIO ============================== -->
+    <section id="scenario" class="section" aria-labelledby="scenario-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">04</span>The deterministic hero scenario</p>
+        <h2 id="scenario-title">Ten steps from overload to proven, in about three minutes.</h2>
+        <div class="prose">
+          <p>A rush order arrives at a synthetic microfactory whose protected, important, and best-effort orders already consume finite human-review, agent-work, and production-cell capacity. Every run of the story below is the same, end to end, because the basis is canonical and the code is deterministic — which is exactly what makes it checkable.</p>
+        </div>
+
+        <ol class="steps">
+          <li class="step-denied">
+            <span class="step-no" aria-hidden="true">1</span>
+            <div class="step-body">
+              <h3>The direct plan comes back REPLAN<span class="chip">Replan</span></h3>
+              <p>Evaluation is side-effect free. The complete portfolio is checked against declared capacity: agent work would go over by 2 and owner decisions over by 1. Nothing is dropped, nothing mutates.</p>
+            </div>
+          </li>
+          <li>
+            <span class="step-no" aria-hidden="true">2</span>
+            <div class="step-body">
+              <h3>Candidates are compared as complete portfolios</h3>
+              <p>Replan candidates are whole portfolio states, not local patches. The winner modifies one best-effort display order from quantity 10 to 8. Protected work is a hard constraint and stays untouched.</p>
+            </div>
+          </li>
+          <li class="step-human">
+            <span class="step-no" aria-hidden="true">3</span>
+            <div class="step-body">
+              <h3>The owner approves the exact modification<span class="chip">Owner call 1</span></h3>
+              <p>TrueForge pauses the turn natively. The owner sees the mission, tool, expected effect, and the SHA-256 action digest — and authorizes only that.</p>
+            </div>
+          </li>
+          <li class="step-human">
+            <span class="step-no" aria-hidden="true">4</span>
+            <div class="step-body">
+              <h3>The fresh promise is accepted atomically<span class="chip">Owner call 2</span></h3>
+              <p>Portfolio v2 is durable before readmission. The fresh ADMITTABLE evaluation and its exact authorization grant commit in one transaction — the stale v1 REPLAN can never be accepted.</p>
+            </div>
+          </li>
+          <li class="step-denied">
+            <span class="step-no" aria-hidden="true">5</span>
+            <div class="step-body">
+              <h3>The owner denies the primary reservation<span class="chip">Owner call 3</span></h3>
+              <p>The 09:10–09:40 slot conflicts with protected production commitments. The denial is not a chat message; it becomes an active, typed constraint in the ledger.</p>
+            </div>
+          </li>
+          <li class="step-denied">
+            <span class="step-no" aria-hidden="true">6</span>
+            <div class="step-body">
+              <h3>The equivalent retry is blocked mechanically<span class="chip">Auto-blocked</span></h3>
+              <p>The planner submits the same material effect through a different MCP adapter, <code>submit_schedule_change</code>. Typed effect normalization recognizes it, and the active denial blocks it — no extra owner call, no mutation.</p>
+            </div>
+          </li>
+          <li class="step-human">
+            <span class="step-no" aria-hidden="true">7</span>
+            <div class="step-body">
+              <h3>The distinct alternative is approved<span class="chip">Owner call 4</span></h3>
+              <p>09:40–10:10 is a genuinely different effect, so it earns a real decision of its own. The owner approves it against its own digest.</p>
+            </div>
+          </li>
+          <li>
+            <span class="step-no" aria-hidden="true">8</span>
+            <div class="step-body">
+              <h3>Exactly one fenced mutation executes<span class="chip">Exactly once</span></h3>
+              <p>The grant's allowance is claimed, the attempt is fenced and idempotent, one synthetic factory mutation runs, and one receipt is stored. A retry returns the original durable result instead of acting twice.</p>
+            </div>
+          </li>
+          <li>
+            <span class="step-no" aria-hidden="true">9</span>
+            <div class="step-body">
+              <h3>The factory is read back independently<span class="chip">Read-back</span></h3>
+              <p>Verification doesn't trust the mutation's own response. Authoritative state is read separately, and actual consumption is appended to the ledger: 6 agent work units, 30 production-cell minutes.</p>
+            </div>
+          </li>
+          <li class="step-verified">
+            <span class="step-no" aria-hidden="true">10</span>
+            <div class="step-body">
+              <h3>Only then: verified success<span class="chip">Verified</span></h3>
+              <p>The terminal verified event is recorded, and the root TrueForge mission is allowed to complete. The UI's outcome flips to "Verified success" — and it means it.</p>
+            </div>
+          </li>
+        </ol>
+
+        <figure class="shot">
+          <div class="shot-frame">
+            <img src="assets/pages/owner-approval-pause.png" width="1280" height="714"
+              alt="The judge UI's external owner boundary paused on the first decision. The panel reads 'Your decision is required', names the action 'Select Portfolio Modification — Modify order/best-effort-display: quantity 10 → 8', offers a collapsed 'Durable action identity' disclosure, and presents Deny action and Approve action buttons with a recommendation note.">
+          </div>
+          <figcaption><strong>Owner call 1, as the judge sees it.</strong> TrueForge holds the turn; the UI never auto-approves. The response can authorize only the exact digest and arguments displayed — missing, stale, malformed, or replayed-with-different-arguments responses fail closed.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- ============================== BOUNDARY ============================== -->
+    <section id="boundary" class="section" aria-labelledby="boundary-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">05</span>The owner boundary</p>
+        <h2 id="boundary-title">Denied once by a human. Denied again by the ledger.</h2>
+        <div class="prose">
+          <p>These are two different safety properties, and FlakeBrake demonstrates both in the same run. Conflating them is how agent demos oversell — a human "no" that evaporates on the next rephrase isn't governance.</p>
+        </div>
+        <div class="boundary">
+          <article class="is-owner">
+            <p class="who">Human judgment</p>
+            <h3>Owner denial</h3>
+            <p>A person looks at the exact 09:10–09:40 reservation — mission, predecessor turn, tool, expected effect, digest — and chooses <em>Deny action</em>. That choice is recorded durably, with its rationale, as an active constraint.</p>
+          </article>
+          <article class="is-policy">
+            <p class="who">Mechanical enforcement</p>
+            <h3>Equivalent-action denial</h3>
+            <p>When the same material effect arrives through a different tool name and schema, typed effect normalization matches it to the active denial and blocks it automatically. No second interruption, no mutation, no chance to relitigate by rewording.</p>
+          </article>
+        </div>
+        <figure class="shot">
+          <div class="shot-frame">
+            <img src="assets/pages/mechanical-denial.png" width="1280" height="714"
+              alt="Judge UI policy panel showing two entries: 'Owner denied primary interval' with the rationale that the primary interval conflicts with protected production commitments, and 'Blocked automatically — same denied action' recording that the equivalent reservation for cell-alpha 09:10–09:40 cannot bypass the active denial.">
+          </div>
+          <figcaption><strong>Both denials, side by side, from the record.</strong> The mechanical block consumed no owner call — the four-call budget is itself an asserted safety property of the run.</figcaption>
+        </figure>
+        <div class="digest-note">
+          <p><strong>About that digest:</strong> every consequential action is bound to a SHA-256 content digest of its exact identity and arguments. It's a precise fingerprint for matching decisions to actions — a digest, not a cryptographic signature, and FlakeBrake never pretends otherwise.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== EXACTLY ONCE ============================== -->
+    <section id="once" class="section" aria-labelledby="once-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">06</span>Exactly once, then proven</p>
+        <h2 id="once-title">The whole run fits in eight numbers.</h2>
+        <div class="ledger" role="group" aria-label="Durable counts from the deterministic hero run">
+          <div><strong>4</strong><span>owner calls</span></div>
+          <div><strong>1</strong><span>mechanical block</span></div>
+          <div><strong>1</strong><span>acceptance</span></div>
+          <div><strong>1</strong><span>attempt</span></div>
+          <div><strong>1</strong><span>factory change</span></div>
+          <div><strong>1</strong><span>change record</span></div>
+          <div><strong>2</strong><span>measured facts</span></div>
+          <div class="is-zero"><strong>0</strong><span>duplicates</span></div>
+        </div>
+        <p class="ledger-caption">Counts rendered live by the judge UI and asserted by the deterministic test gates — including zero duplicate approvals and zero unauthorized mutations. Refreshing the browser changes none of them.</p>
+
+        <ol class="proof-ladder">
+          <li>
+            <span class="rung">Rung 1</span>
+            <h3>Factory change record</h3>
+            <p>This record proves the one-time-locked factory command committed. By itself, it is not verified success — and the UI says so in exactly those words.</p>
+          </li>
+          <li>
+            <span class="rung">Rung 2</span>
+            <h3>Independent read-back</h3>
+            <p>Authoritative factory state is read separately from the mutation result, and actual consumption facts are appended to the immutable ledger.</p>
+          </li>
+          <li>
+            <span class="rung">Rung 3 · the only "success"</span>
+            <h3>Verified terminal event</h3>
+            <p>Only after the read-back matches is a terminal verified event recorded and the root mission allowed to finish.</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ============================== RECONNECT ============================== -->
+    <section id="reconnect" class="section" aria-labelledby="reconnect-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">07</span>Reconnect without regret</p>
+        <h2 id="reconnect-title">Refresh the browser. Nothing happens twice.</h2>
+        <div class="prose">
+          <p>Mission identity, the TrueForge session and turn graph, approvals, tool results, and the terminal projection are all durable. A refresh calls the read-only state API and <strong>replays that projection</strong> — it does not restart the mission, reopen an approval, or repeat an effect. The harness ribbon labels the state plainly: <em>Durable session replayed</em>.</p>
+          <p>The same discipline runs deeper than the browser: a lost approval response reconciles to its existing successor turn, same-mission retries converge on the original durable result, and the client's monotonic request generations and durable revisions mean an old poll can never overwrite a newer decision or regress a verified outcome.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== PROOF CENTER ============================== -->
+    <section id="proof" class="section" aria-labelledby="proof-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">08</span>Operator proof center</p>
+        <h2 id="proof-title">Safety and impact, from the record — not from the narrator.</h2>
+        <div class="prose">
+          <p>Judges shouldn't have to reconstruct the causal chain from a timeline. The Operator Proof Center sits at the top of the judge UI and answers the four operator questions at a glance — direct plan, safe winner, owner boundary, durable outcome — then backs each answer with disclosure drawers built from the same canonical projection the ledger holds: exact control decisions, capacity before/after impact, durable proof and replay, and optional technical identities.</p>
+        </div>
+        <figure class="shot">
+          <div class="shot-frame">
+            <img src="assets/pages/proof-center-verified.png" width="1280" height="714"
+              alt="The Operator Proof Center in its Verified record state. Summary cards read: Direct plan 'Doesn’t fit yet' (REPLAN) with agent work over by 2 and human decisions over by 1; Safe winner 10 → 8 for the best-effort display order with protected work unchanged; Human decisions 3 allowed · 1 denied with 1 equivalent action mechanically blocked; Durable outcome 1 factory change · verified with 1 change record, 1 verified completion, 2 measured facts. Below are disclosure rows to show decision history, exact capacity math, the durable ledger, and technical identifiers, plus a 'What FlakeBrake prevented' summary naming the denied 09:10–09:40 interval and the approved 09:40–10:10 mutation.">
+          </div>
+          <figcaption><strong>The verified record, one screen.</strong> Even the counterfactual — "What FlakeBrake prevented" — is composed only of facts derivable from the deterministic fixture: the overload amounts, the protected order kept at 10, the bounded 10&nbsp;→&nbsp;8 change, and which interval did and didn't become the factory result.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- ============================== ARCHITECTURE ============================== -->
+    <section id="architecture" class="section" aria-labelledby="arch-title">
+      <div class="wrap">
+        <p class="eyebrow">Architecture</p>
+        <h2 id="arch-title">Five deliberate layers, one trust boundary at a time.</h2>
+        <div class="prose">
+          <p>The model can propose; deterministic code evaluates and authorizes; the owner decides; the ledger remembers; verification reads back independently. Each layer exists so no other layer has to be trusted for something it can't prove.</p>
+        </div>
+        <ol class="stack">
+          <li>
+            <span class="layer">M1</span>
+            <div><h3>Deterministic admission kernel</h3><p>Pure portfolio feasibility, candidate ranking, Promise Basis versioning, and typed effect comparison. Returns ADMITTABLE, REPLAN, or REJECT — and never mutates anything.</p></div>
+          </li>
+          <li>
+            <span class="layer">M2</span>
+            <div><h3>Immutable SQLite ledger</h3><p>Append-only admissions, owner decisions, denials, grants, shared allowances, fences, attempts, receipts, and actual-consumption facts. Acceptance and grant issuance commit atomically; database-incarnation identity keeps replaced files from impersonating state.</p></div>
+          </li>
+          <li>
+            <span class="layer">M3</span>
+            <div><h3>Synthetic factory &amp; MCP boundary</h3><p>An invocation-owned factory behind four Streamable HTTP MCP services. Exact-once mutation, independent read-back, and idempotent replay live here — the browser never touches SQLite.</p></div>
+          </li>
+          <li class="is-tf">
+            <span class="layer">M4</span>
+            <div><h3>TrueForge mission orchestration</h3><p>The root obligation commander, three dynamic subagents, sandbox execution, four MCP connectors, native approval pauses, and durable session/turn recovery — TrueForge 0.1.4 running the loop for real.</p></div>
+          </li>
+          <li>
+            <span class="layer">M5</span>
+            <div><h3>Judge UI &amp; control boundary</h3><p>A loopback-only service projecting canonical backend state, with strict request validation, monotonic polling, bounded shutdown, and the Operator Proof Center on top.</p></div>
+          </li>
+        </ol>
+        <p class="quality-note">The full trust-boundary and data-flow write-up, including the end-to-end mermaid diagram, lives in <a href="https://github.com/dvellon/flakebrake/blob/main/docs/architecture.md">docs/architecture.md</a>; the frozen normative contract is <a href="https://github.com/dvellon/flakebrake/blob/main/docs/PRODUCT_SPEC_v0.1.md">PRODUCT_SPEC_v0.1.md</a>.</p>
+      </div>
+    </section>
+
+    <!-- ============================== QUALITY ============================== -->
+    <section id="quality" class="section" aria-labelledby="quality-title">
+      <div class="wrap">
+        <p class="eyebrow">Code quality</p>
+        <h2 id="quality-title">Reviewed in public, remediated with regressions.</h2>
+        <div class="prose">
+          <p>Every implementation PR was reviewed by the GitHub Qodo application, remediated with focused regression tests, re-reviewed at the exact head, and merged only after separate human adjudication. The trail is public — and it's presented here as evidence of process, not as a claim that automated review replaces testing or human approval.</p>
+        </div>
+        <div class="pr-grid">
+          <article class="pr-card">
+            <span class="pr-no">PR #5 · M4 orchestration</span>
+            <h3>Qodo caught the owner boundary leaking.</h3>
+            <ul>
+              <li><span class="sev">High · Security</span> — a live-owner bypass path</li>
+              <li><span class="sev">High · Correctness</span> — non-atomic acceptance/grant</li>
+              <li><span class="sev">High · Reliability</span> — rollback overwriting concurrent writes</li>
+            </ul>
+            <a href="https://github.com/dvellon/flakebrake/pull/5">Review trail →</a>
+          </article>
+          <article class="pr-card">
+            <span class="pr-no">PR #6 · SQLite contention</span>
+            <h3>Even the test protocol got reviewed.</h3>
+            <ul>
+              <li><span class="sev">High · Test reliability</span> — readiness reported before contention was actually proven</li>
+              <li><span class="sev">Lifecycle</span> — startup exit handling in the child process</li>
+            </ul>
+            <a href="https://github.com/dvellon/flakebrake/pull/6">Review trail →</a>
+          </article>
+          <article class="pr-card">
+            <span class="pr-no">PR #7 · M5 judge UI</span>
+            <h3>The UI's replay discipline was hardened here.</h3>
+            <ul>
+              <li><span class="sev">Medium · Reliability</span> — monotonic polling</li>
+              <li><span class="sev">High · Correctness</span> — durable failed-mission recovery</li>
+              <li><span class="sev">High · Reliability</span> — malformed-target containment</li>
+            </ul>
+            <a href="https://github.com/dvellon/flakebrake/pull/7">Review trail →</a>
+          </article>
+        </div>
+        <p class="quality-note">FlakeBrake went through 16 Qodo-reviewed pull requests, resolving more than 50 findings, with zero unresolved findings on the merged release. Earlier milestone trails live in merged <a href="https://github.com/dvellon/flakebrake/pull/2">PR&nbsp;#2</a>, <a href="https://github.com/dvellon/flakebrake/pull/3">#3</a>, and <a href="https://github.com/dvellon/flakebrake/pull/4">#4</a>; later rounds — submission readiness, M5 polish, and the Judge Clarity corrections — in <a href="https://github.com/dvellon/flakebrake/pull/8">#8</a>, <a href="https://github.com/dvellon/flakebrake/pull/9">#9</a>, and <a href="https://github.com/dvellon/flakebrake/pull/14">#14</a>. Each preserves initial findings, remediation rounds, exact-head re-reviews, and the final human adjudication.</p>
+      </div>
+    </section>
+
+    <!-- ============================== VIDEO ============================== -->
+    <section id="video" class="section" aria-labelledby="video-title">
+      <div class="wrap">
+        <p class="eyebrow">Three-minute demo</p>
+        <h2 id="video-title">Watch the whole story in one take.</h2>
+        <div class="video-panel">
+          <a class="video-frame" href="https://www.youtube.com/watch?v=E00_3udo804">
+            <div>
+              <span class="play" aria-hidden="true">▶</span>
+              <p class="mono-label">Watch on YouTube</p>
+              <p>REPLAN to verified success in under three minutes — all four owner calls and the mechanical block on screen.</p>
+            </div>
+          </a>
+          <div class="video-meta">
+            <span><strong>Runtime</strong> under 3:00</span>
+            <span><strong>Path</strong> deterministic judge profile, credential-free</span>
+            <span><strong>Script</strong> <a href="https://github.com/dvellon/flakebrake/blob/main/docs/demo-script.md">docs/demo-script.md</a></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== TRY IT ============================== -->
+    <section id="try" class="section" aria-labelledby="try-title">
+      <div class="wrap">
+        <p class="eyebrow">Run it yourself</p>
+        <h2 id="try-title">One command to the control room.</h2>
+        <div class="quickstart">
+          <div class="quickstart-bar">
+            <span>Deterministic judge mode · Node 22+</span>
+            <button class="copy-button" type="button" data-copy="git clone https://github.com/dvellon/flakebrake.git&#10;cd flakebrake&#10;npm ci&#10;npm run m5:ui" hidden>Copy</button>
+          </div>
+          <pre><code>git clone https://github.com/dvellon/flakebrake.git
+cd flakebrake
+npm ci
+npm run m5:ui
+<span class="cmt"># open http://127.0.0.1:4173 · choose "Start hero mission"</span>
+<span class="cmt"># no OpenAI or Daytona credentials required</span></code></pre>
+        </div>
+        <p class="try-note">The judge service binds to loopback only, creates its stores in an invocation-owned temporary root, and cleans up on Ctrl+C. The full credential-free verification ladder — typecheck, deterministic test suites, and the Firefox browser gate — is in the <a href="https://github.com/dvellon/flakebrake#readme">README</a>.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a class="brand" href="./" aria-label="FlakeBrake home">
+            <span class="brand-mark" aria-hidden="true">FB</span>
+            <span class="brand-name"><strong>FlakeBrake</strong><small>Built on TrueForge</small></span>
+          </a>
+          <p>Obligation admission control for autonomous agents: no promise is accepted unless the complete, versioned portfolio can keep it — and the one approved effect is proven before success is reported.</p>
+        </div>
+        <div class="footer-cols">
+          <div class="footer-col">
+            <h3>Project</h3>
+            <ul>
+              <li><a href="https://github.com/dvellon/flakebrake">GitHub repository</a></li>
+              <li><a href="https://github.com/dvellon/flakebrake#readme">README &amp; verification</a></li>
+              <li><a href="https://github.com/dvellon/flakebrake/blob/main/LICENSE">MIT License</a></li>
+            </ul>
+          </div>
+          <div class="footer-col">
+            <h3>Deep dives</h3>
+            <ul>
+              <li><a href="blog.html">Blog post</a></li>
+              <li><a href="https://github.com/dvellon/flakebrake/blob/main/docs/architecture.md">Architecture</a></li>
+              <li><a href="https://github.com/dvellon/flakebrake/blob/main/docs/demo-script.md">Demo script</a></li>
+              <li><a href="#video">Three-minute video</a></li>
+            </ul>
+          </div>
+          <div class="footer-col">
+            <h3>Review evidence</h3>
+            <ul>
+              <li><a href="https://github.com/dvellon/flakebrake/pull/5">Qodo trail · PR #5</a></li>
+              <li><a href="https://github.com/dvellon/flakebrake/pull/6">Qodo trail · PR #6</a></li>
+              <li><a href="https://github.com/dvellon/flakebrake/pull/7">Qodo trail · PR #7</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="footer-legal">
+        <span>© 2026 dvellon · Released under the <a href="https://github.com/dvellon/flakebrake/blob/main/LICENSE">MIT License</a></span>
+        <span>Built on TrueForge 0.1.4 · Reviewed with Qodo · Dependencies retain their own licenses</span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
