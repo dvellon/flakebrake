@@ -108,3 +108,19 @@ export {
   startM5JudgeServer,
 } from "./m5-ui.js";
 export type * from "./m5-ui.js";
+export {
+  MISSION_EVIDENCE_CANONICALIZATION,
+  MISSION_EVIDENCE_PAYLOAD_SCHEMA_VERSION,
+  MISSION_EVIDENCE_SCHEMA_VERSION,
+  MissionEvidenceError,
+  buildMissionEvidenceBundle,
+  exportMissionEvidenceBundle,
+  missionEvidenceBundleSchema,
+  missionEvidencePayloadSchema,
+  sanitizeEvidenceValue,
+  serializeMissionEvidenceBundle,
+  verifyMissionEvidenceBundle,
+  verifyMissionEvidenceBytes,
+  verifyMissionEvidencePayload,
+} from "./mission-evidence.js";
+export type * from "./mission-evidence.js";

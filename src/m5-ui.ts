@@ -32,6 +32,7 @@ import {
   HERO_RESOURCE_KEYS,
 } from "./hero-fixture.js";
 import { evaluateAdmission } from "./kernel.js";
+import { exportMissionEvidenceBundle } from "./mission-evidence.js";
 import {
   m4OwnerDecisionResponse,
   type M4ApprovalRecord,
@@ -581,6 +582,25 @@ export class M5DemoCoordinator {
     };
   }
 
+  /** Canonical completed-mission evidence projected through read-only handles. */
+  public evidenceBundle(): string {
+    this.#assertOpen();
+    try {
+      return exportMissionEvidenceBundle({
+        missionId: M4_HERO_MISSION_ID,
+        m2DatabasePath: this.#paths.m2,
+        factoryDatabasePath: this.#paths.factory,
+        missionDatabasePath: this.#paths.mission,
+      });
+    } catch {
+      throw new M5RequestError(
+        409,
+        "evidence_not_ready",
+        "Canonical mission evidence is available only after durable verification completes",
+      );
+    }
+  }
+
   public async close(): Promise<void> {
     if (this.#closed) return;
     this.#closing = true;
@@ -1025,6 +1045,11 @@ export async function startM5JudgeServer(
     if (url.pathname === "/api/state") {
       requireMethod(request, "GET");
       sendJson(response, 200, coordinator.state());
+      return;
+    }
+    if (url.pathname === "/api/evidence") {
+      requireMethod(request, "GET");
+      sendMissionEvidence(response, coordinator.evidenceBundle());
       return;
     }
     if (url.pathname === "/api/mission") {
@@ -1615,6 +1640,16 @@ function sendJson(response: ServerResponse, statusCode: number, value: unknown):
   const body = canonicalSerialize(value);
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+function sendMissionEvidence(response: ServerResponse, body: string): void {
+  if (response.headersSent) return;
+  response.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Disposition": 'attachment; filename="flakebrake-mission-evidence.json"',
     "Content-Length": Buffer.byteLength(body),
   });
   response.end(body);
