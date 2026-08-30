@@ -123,6 +123,23 @@
           <p id="readback-note" class="readback-note">Independent read-back has not yet occurred.</p>
         </section>
       </div>
+
+      <section class="challenge-lab" aria-labelledby="challenge-title">
+        <div class="challenge-intro">
+          <div>
+            <p class="eyebrow">Deterministic assurance demonstration</p>
+            <h2 id="challenge-title" tabindex="-1">Challenge FlakeBrake</h2>
+            <p class="challenge-copy">Run six bounded attacks against isolated, invocation-owned stores. Every rejection is judged by complete before/after ledger equality; the positive control proves replay returns the original result and receipt.</p>
+          </div>
+          <div class="challenge-controls">
+            <span id="challenge-status" class="pill pill-neutral" role="status" aria-live="polite">Not run</span>
+            <button id="challenge-button" class="button button-primary" type="button">Run challenge lab</button>
+          </div>
+        </div>
+        <p class="challenge-safety">Credential-free · no external providers · no raw values or local paths · no destructive controls</p>
+        <div id="challenge-summary" class="challenge-summary" aria-live="polite"></div>
+        <div id="challenge-results" class="challenge-results"></div>
+      </section>
       <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
     </main>
     <footer>Local deterministic evidence · loopback only · no credentials required</footer>

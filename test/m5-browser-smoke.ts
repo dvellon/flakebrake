@@ -31,9 +31,19 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
 
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
+const requestedPort = process.env["FLAKEBRAKE_M5_BROWSER_PORT"];
+const browserPort = requestedPort === undefined ? 0 : Number(requestedPort);
+if (
+  !Number.isSafeInteger(browserPort) ||
+  browserPort < 0 ||
+  browserPort > 65_535 ||
+  (requestedPort !== undefined && String(browserPort) !== requestedPort)
+) {
+  throw new TypeError("FLAKEBRAKE_M5_BROWSER_PORT must be a canonical TCP port");
+}
 const running = await startM5JudgeServer({
   dataRoot: root,
-  port: 0,
+  port: browserPort,
   cleanupDataOnClose: true,
 });
 const transportKillServer = createServer((socket) => socket.destroy());
@@ -298,8 +308,40 @@ try {
     ["1", "1", "1", "1"],
   );
 
+  const challengeButton = await browser.findElement(By.id("challenge-button"));
+  await browser.executeScript("document.getElementById('challenge-button').focus();");
+  assert.equal(
+    await browser.executeScript(
+      "return document.activeElement === document.getElementById('challenge-button');",
+    ),
+    true,
+    "the deterministic assurance control is keyboard focusable",
+  );
+  await challengeButton.sendKeys(Key.ENTER);
+  smokeStage = "challenge_lab_clicked";
+  await waitText(browser, By.id("challenge-status"), "6 / 6 passed", 60_000);
+  assert.equal((await browser.findElements(By.css(".challenge-case"))).length, 6);
+  assert.equal((await browser.findElements(By.css(".challenge-pass"))).length, 6);
+  assert.equal(
+    (await browser.findElements(By.css(".challenge-count"))).length,
+    48,
+    "all eight before/after count classes are visible for all six challenges",
+  );
+  const challengeText = await browser.findElement(By.css(".challenge-lab")).getText();
+  assert.match(challengeText, /Identity substitution/u);
+  assert.match(challengeText, /Stale authoritative basis/u);
+  assert.match(challengeText, /Conflicting attempt ID reuse/u);
+  assert.match(challengeText, /Forged or mismatched receipt/u);
+  assert.match(challengeText, /Equivalent representation after denial/u);
+  assert.match(challengeText, /Valid idempotent replay/u);
+  assert.match(challengeText, /Zero unauthorized effects/iu);
+  assert.doesNotMatch(challengeText, /\/tmp\/|\\Users\\|file:\/\//u);
+  await browser.executeScript("document.getElementById('challenge-title').scrollIntoView({block: 'start'});");
+  await screenshot(browser, join(screenshots, "07-challenge-lab.png"));
+
   const viewports = [
-    [1440, 900], [1280, 800], [1120, 800], [1024, 768], [981, 800], [820, 1180],
+    [1440, 900], [1280, 800], [1120, 800], [1024, 768], [981, 800],
+    [600, 960], [390, 844], [820, 1180],
   ] as const;
   for (const [width, height] of viewports) {
     await browser.manage().window().setRect({ width, height });
@@ -307,7 +349,8 @@ try {
     assert.equal(await hasHorizontalOverflow(browser), false, `${String(width)}x${String(height)} overflow`);
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
-  await screenshot(browser, join(screenshots, "07-tablet-820x1180.png"));
+  await browser.executeScript("document.getElementById('challenge-title').scrollIntoView({block: 'start'});");
+  await screenshot(browser, join(screenshots, "08-tablet-820x1180.png"));
   assert.equal(
     capture.capturedErrorCount(),
     0,
@@ -327,12 +370,19 @@ try {
     5_000,
     "the session network observer lost coverage before the end of the smoke",
   );
-  await browser.get(transportProbeDocument);
-  await browser.wait(
-    () => armedNetworkCapture.failedResponses().some((entry) => entry.startsWith(transportProbePrefix)),
-    5_000,
-    "the session transport-failure channel lost coverage before the end of the smoke",
-  );
+  const applicationWindow = await browser.getWindowHandle();
+  await browser.switchTo().newWindow("tab");
+  try {
+    await browser.get(transportProbeDocument);
+    await browser.wait(
+      () => armedNetworkCapture.failedResponses().some((entry) => entry.startsWith(transportProbePrefix)),
+      5_000,
+      "the session transport-failure channel lost coverage before the end of the smoke",
+    );
+  } finally {
+    await browser.close();
+    await browser.switchTo().window(applicationWindow);
+  }
   const sessionFailures = armedNetworkCapture.failedResponses();
   assert.deepEqual(
     sessionFailures.filter((entry) => entry !== networkProbeEntry && !entry.startsWith(transportProbePrefix)),

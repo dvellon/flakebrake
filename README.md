@@ -90,6 +90,29 @@ minutes:
 
 See the timed [demo script](docs/demo-script.md) for narration and checkpoints.
 
+## Challenge FlakeBrake assurance lab
+
+The judge UI also includes an optional, clearly separated **Challenge
+FlakeBrake** panel. It is a deterministic assurance demonstration, not a
+replacement for the normal hero mission. One keyboard-accessible control runs
+six bounded cases against separate invocation-owned M2 and factory stores:
+
+- admission, grant, owner-decision, and plan identity substitution;
+- stale authoritative factory compare-and-swap basis;
+- conflicting reuse of an execution-attempt identity;
+- a caller-forged mutation receipt presented as verified success;
+- an equivalent v2 effect representation after a durable v1 denial; and
+- a valid replay through the alternate schedule-change adapter as a positive
+  control.
+
+Every case uses the existing public store or `factory-change-control` MCP path.
+The panel shows the redacted action, authoritative reason, enforced rule, all
+eight requested before/after counts, and SHA-256 digests of complete canonical
+M2 + factory snapshots. A rejection passes only when every table and row is
+equal before and after. The replay control additionally requires the original
+result and receipt, one mutation, and no duplicate actual facts. It uses no
+credentials or external providers and exposes no filesystem paths.
+
 ## Architecture overview
 
 FlakeBrake is deliberately layered:

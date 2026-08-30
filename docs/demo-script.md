@@ -105,3 +105,25 @@ corrections.”
 - Terminal verification precedes root completion.
 - Refresh changes none of those counts.
 - Press `Ctrl+C` after the demo and confirm clean shutdown.
+
+## Optional 60–90 seconds — Challenge FlakeBrake
+
+After the normal hero story, scroll to **Challenge FlakeBrake** and activate
+**Run challenge lab** with the keyboard or pointer.
+
+**Say:** “This is a separate deterministic assurance demonstration. These are
+real rejected calls through the canonical stores and public change-control
+adapter, each running against its own invocation-owned state.”
+
+**Show:** Six green **Zero unauthorized effects** results. Open one snapshot
+disclosure and point out that the complete before/after digests match, then
+scan the eight count classes: admissions, grants, attempts, fences, mutations,
+receipts, terminal events, and actual facts.
+
+For the positive control, point to **Replayed: yes**, **Original result: same**,
+**Original receipt: same**, **Second mutation: none**, and **Duplicate facts:
+none**.
+
+**Say:** “Invalid identity, stale basis, attempt conflict, forged receipt, and
+alternate representation after denial all fail closed. The one valid replay
+returns prior evidence without executing twice.”

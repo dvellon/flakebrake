@@ -7,7 +7,8 @@ const nodes = Object.fromEntries(
     "approval-guidance", "decision-announcer", "policy-decision", "capacity-grid", "obligations",
     "proposal", "basis-note", "basis-resolution", "winning-change", "candidate-list", "model-requests",
     "agent-tree", "runtime-chips", "timeline", "verification-pill", "result-metrics",
-    "actual-facts", "proof-stages", "readback-note", "toast",
+    "actual-facts", "proof-stages", "readback-note", "challenge-title", "challenge-status",
+    "challenge-button", "challenge-summary", "challenge-results", "toast",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -16,6 +17,7 @@ let poll = null;
 let requestCounter = 0;
 let missionMutationInFlight = false;
 let approvalMutationInFlight = null;
+let challengeMutationInFlight = false;
 let responseGeneration = 1;
 let responseSequence = 0;
 let latestAppliedSequence = 0;
@@ -88,6 +90,9 @@ async function mutate(path, body) {
   if (approvalIdentity !== null) {
     if (approvalMutationInFlight === approvalIdentity) return;
     approvalMutationInFlight = approvalIdentity;
+  } else if (path === "/api/challenge") {
+    if (challengeMutationInFlight) return;
+    challengeMutationInFlight = true;
   } else {
     if (missionMutationInFlight) return;
     missionMutationInFlight = true;
@@ -95,7 +100,7 @@ async function mutate(path, body) {
   invalidateResponses();
   const intent = path === "/api/mission"
     ? body.operation === "reset" ? "mission_reset" : "mission_start"
-    : "approval";
+    : path === "/api/challenge" ? "challenge_run" : "approval";
   const token = responseToken(intent);
   render();
   try {
@@ -110,6 +115,7 @@ async function mutate(path, body) {
     await refresh();
   } finally {
     if (approvalIdentity !== null) approvalMutationInFlight = null;
+    else if (path === "/api/challenge") challengeMutationInFlight = false;
     else missionMutationInFlight = false;
     render();
   }
@@ -165,6 +171,8 @@ function applyState(candidate, token) {
       token.sourceMissionId === state.mission.missionId && newerDurableGeneration;
     if (state.run.status === "verified" && candidate.run.status !== "verified" && !explicitReset) return false;
     if (state.run.status === "failed" && candidate.run.status !== "failed" && !explicitRecovery && !explicitReset) return false;
+    if (state.challengeLab.status === "complete" && candidate.challengeLab.status !== "complete") return false;
+    if (state.challengeLab.status === "failed" && candidate.challengeLab.status !== "failed") return false;
     if (state.mission.sessionId !== null && candidate.mission.sessionId !== null &&
       candidate.mission.sessionId !== state.mission.sessionId && !explicitReset) return false;
     if (candidate.run.generation === state.run.generation && candidate.revision === state.revision) {
@@ -187,6 +195,7 @@ function render() {
   renderActivity();
   renderTimeline();
   renderExecution();
+  renderChallengeLab();
 }
 
 function renderHeader() {
@@ -400,6 +409,54 @@ function renderExecution() {
     : "Independent read-back has not yet occurred.";
 }
 
+function renderChallengeLab() {
+  const lab = state.challengeLab;
+  const labels = {
+    idle: "Not run",
+    running: "Running bounded challenges",
+    complete: lab.allPassed ? "6 / 6 passed" : "Attention required",
+    failed: "Stopped safely",
+    closed: "Closed",
+  };
+  nodes["challenge-status"].textContent = labels[lab.status];
+  nodes["challenge-status"].className = `pill ${lab.status === "complete" && lab.allPassed ? "pill-verified" : lab.status === "failed" ? "pill-denied" : lab.status === "running" ? "pill-pending" : "pill-neutral"}`;
+  nodes["challenge-button"].disabled = challengeMutationInFlight || !lab.canRun;
+  nodes["challenge-button"].textContent = lab.status === "running" ? "Running challenge lab…" : lab.status === "complete" ? "Challenge lab complete" : lab.status === "failed" ? "Challenge stopped safely" : "Run challenge lab";
+  if (lab.status === "idle") {
+    nodes["challenge-summary"].innerHTML = "<strong>Ready.</strong> The normal hero flow is independent; this lab uses six separate owned ledger pairs.";
+    nodes["challenge-results"].innerHTML = "";
+    return;
+  }
+  if (lab.status === "running") {
+    nodes["challenge-summary"].innerHTML = "<strong>Executing deterministic controls.</strong> Each action is bounded and uses the canonical stores or public change-control adapter.";
+    nodes["challenge-results"].innerHTML = "";
+    return;
+  }
+  if (lab.status === "failed") {
+    nodes["challenge-summary"].innerHTML = "<strong>Lab stopped safely.</strong> No pass is claimed because the complete evidence set could not be assembled.";
+    nodes["challenge-results"].innerHTML = "";
+    return;
+  }
+  if (lab.status === "closed") return;
+  nodes["challenge-summary"].innerHTML = lab.allPassed
+    ? `<strong>PASS · ${lab.challenges.length} / ${lab.challenges.length}</strong> Every rejected action left its complete durable snapshot unchanged; the replay control created no second effect.`
+    : "<strong>NOT PASSED.</strong> At least one control did not establish zero unauthorized effects.";
+  const countLabels = [
+    ["admissions", "Admissions"], ["grants", "Grants"], ["attempts", "Attempts"],
+    ["fences", "Fences"], ["mutations", "Mutations"], ["receipts", "Receipts"],
+    ["terminalEvents", "Terminal events"], ["actualFacts", "Actual facts"],
+  ];
+  assignPreservingDisclosure(nodes["challenge-results"], lab.challenges.map((challenge, index) => {
+    const counts = countLabels.map(([key, label]) => {
+      const before = challenge.before.counts[key];
+      const after = challenge.after.counts[key];
+      return `<div class="challenge-count"><span>${escapeHtml(label)}</span><strong>${before} → ${after}</strong></div>`;
+    }).join("");
+    const replay = challenge.replayProof === null ? "" : `<div class="replay-proof" role="group" aria-label="Replay proof"><span>Replayed: ${challenge.replayProof.replayed ? "yes" : "no"}</span><span>Original result: ${challenge.replayProof.originalResultReturned ? "same" : "different"}</span><span>Original receipt: ${challenge.replayProof.originalReceiptReturned ? "same" : "different"}</span><span>Second mutation: ${challenge.replayProof.noSecondMutation ? "none" : "detected"}</span><span>Duplicate facts: ${challenge.replayProof.noDuplicateFacts ? "none" : "detected"}</span></div>`;
+    return `<article class="challenge-case ${challenge.zeroUnauthorizedEffects ? "challenge-pass" : "challenge-fail"}" aria-labelledby="challenge-case-${index}"><div class="challenge-case-heading"><div><p class="eyebrow">${challenge.control === "positive" ? "Positive control" : "Adversarial rejection"}</p><h3 id="challenge-case-${index}">${escapeHtml(challenge.title)}</h3></div><span class="pill ${challenge.zeroUnauthorizedEffects ? "pill-verified" : "pill-denied"}">${challenge.zeroUnauthorizedEffects ? "Zero unauthorized effects" : "Not proven"}</span></div><dl class="challenge-explanation"><div><dt>Attempted action · redacted</dt><dd>${escapeHtml(challenge.attemptedAction)}</dd></div><div><dt>Authoritative result</dt><dd>${escapeHtml(challenge.authoritativeReason)}</dd></div><div><dt>Linkage or policy rule</dt><dd>${escapeHtml(challenge.rule)}</dd></div><div><dt>Real adapter path</dt><dd>${escapeHtml(challenge.adapterPath)}</dd></div></dl><div class="challenge-counts" role="group" aria-label="Before and after durable counts">${counts}</div>${replay}<details class="snapshot-proof"><summary>Complete durable snapshot equality</summary><dl><div><dt>Before</dt><dd>${escapeHtml(challenge.before.snapshotDigest)}</dd></div><div><dt>After</dt><dd>${escapeHtml(challenge.after.snapshotDigest)}</dd></div></dl><strong>${challenge.snapshotEqual ? "Equal · every table and row matched" : "Different · zero mutation not established"}</strong></details></article>`;
+  }).join(""));
+}
+
 function showError(message) {
   nodes.toast.textContent = message;
   nodes.toast.classList.add("visible");
@@ -418,6 +475,10 @@ nodes["start-button"].addEventListener("click", () => {
 nodes["reset-button"].addEventListener("click", () => {
   nodes["approval-title"].focus?.({ preventScroll: true });
   void mutate("/api/mission", { operation: "reset", requestId: requestId("reset") });
+});
+nodes["challenge-button"].addEventListener("click", () => {
+  nodes["challenge-title"].focus?.({ preventScroll: true });
+  void mutate("/api/challenge", { operation: "run", requestId: requestId("challenge") });
 });
 nodes["allow-button"].addEventListener("click", () => {
   if (!state?.pendingApproval) return;
