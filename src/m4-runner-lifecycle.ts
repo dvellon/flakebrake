@@ -7,7 +7,8 @@ interface OwnedResource {
 }
 
 export interface M4RunnerLifecycleError extends Error {
-  readonly cleanupFailures: readonly unknown[];
+  /** Best-effort compatibility view. Use m4RunnerCleanupFailures as canonical. */
+  readonly cleanupFailures?: readonly unknown[];
 }
 
 const CLEANUP_FAILURE_SOURCES = new WeakMap<Error, (readonly unknown[])[]>();
@@ -471,18 +472,26 @@ export function retainM4RunnerCleanupDiagnostics(
   const sources = CLEANUP_FAILURE_SOURCES.get(primary) ?? [];
   if (!sources.includes(cleanupFailures)) sources.push(cleanupFailures);
   CLEANUP_FAILURE_SOURCES.set(primary, sources);
-  if (!("cleanupFailures" in primary) && Object.isExtensible(primary)) {
-    Object.defineProperty(primary, "cleanupFailures", {
-      configurable: false,
-      enumerable: false,
-      get: () => m4RunnerCleanupFailures(primary),
-    });
-  }
+  installCleanupFailuresCompatibilityAccessor(primary);
   return primary as M4RunnerLifecycleError;
 }
 
 export function m4RunnerCleanupFailures(error: Error): readonly unknown[] {
   return (CLEANUP_FAILURE_SOURCES.get(error) ?? []).flatMap((source) => source);
+}
+
+function installCleanupFailuresCompatibilityAccessor(error: Error): void {
+  try {
+    if ("cleanupFailures" in error || !Object.isExtensible(error)) return;
+    Object.defineProperty(error, "cleanupFailures", {
+      configurable: false,
+      enumerable: false,
+      get: () => m4RunnerCleanupFailures(error),
+    });
+  } catch {
+    // The WeakMap was populated first and remains canonical. A hostile proxy
+    // or other property-definition failure must not replace the primary Error.
+  }
 }
 
 function ownedResource<T>(

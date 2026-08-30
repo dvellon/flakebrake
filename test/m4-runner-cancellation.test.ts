@@ -830,6 +830,93 @@ test("late acquisition settlement closes immediately and late rejection is obser
   }
 });
 
+test(
+  "cleanup diagnostics remain canonical for every Error extensibility state",
+  async (context) => {
+    const cases = [
+      {
+        label: "extensible Error",
+        makePrimary: (error: Error) => error,
+        compatibilityProperty: true,
+      },
+      {
+        label: "frozen Error",
+        makePrimary: (error: Error) => Object.freeze(error),
+        compatibilityProperty: false,
+      },
+      {
+        label: "preventExtensions Error",
+        makePrimary: (error: Error) => Object.preventExtensions(error),
+        compatibilityProperty: false,
+      },
+      {
+        label: "sealed Error",
+        makePrimary: (error: Error) => Object.seal(error),
+        compatibilityProperty: false,
+      },
+    ] as const;
+    for (const testCase of cases) {
+      await context.test(testCase.label, () => {
+        const primary = testCase.makePrimary(new Error(testCase.label));
+        const firstFailure = new Error("first cleanup failure");
+        const secondFailure = new Error("second cleanup failure");
+        const thirdFailure = new Error("third cleanup failure");
+        const firstSource = [firstFailure, secondFailure];
+        const secondSource = [thirdFailure];
+        const retained = retainM4RunnerCleanupDiagnostics(primary, firstSource);
+
+        assert.equal(retained, primary);
+        assert.equal(
+          retainM4RunnerCleanupDiagnostics(primary, secondSource),
+          primary,
+        );
+        assert.equal(
+          retainM4RunnerCleanupDiagnostics(primary, firstSource),
+          primary,
+        );
+        const firstRead = m4RunnerCleanupFailures(retained);
+        const secondRead = m4RunnerCleanupFailures(retained);
+        assert.deepEqual(firstRead, [firstFailure, secondFailure, thirdFailure]);
+        assert.deepEqual(secondRead, firstRead);
+        assert.notEqual(firstRead, secondRead);
+        assert.equal(firstRead[0], firstFailure);
+        assert.equal(firstRead[1], secondFailure);
+        assert.equal(firstRead[2], thirdFailure);
+        assert.deepEqual(firstSource, [firstFailure, secondFailure]);
+        assert.deepEqual(secondSource, [thirdFailure]);
+        assert.equal(
+          Object.hasOwn(retained, "cleanupFailures"),
+          testCase.compatibilityProperty,
+        );
+        if (testCase.compatibilityProperty) {
+          assert.deepEqual(retained.cleanupFailures, firstRead);
+        } else {
+          assert.equal(retained.cleanupFailures, undefined);
+        }
+      });
+    }
+  },
+);
+
+test("cleanup property-definition failure preserves identity and canonical diagnostics", () => {
+  const definitionFailure = new Error("compatibility property rejected");
+  const authoritative = new Error("authoritative frozen-compatible abort");
+  const primary = new Proxy(authoritative, {
+    defineProperty: () => {
+      throw definitionFailure;
+    },
+  });
+  const cleanupFailure = new Error("owned cleanup failed");
+  const retained = retainM4RunnerCleanupDiagnostics(primary, [cleanupFailure]);
+
+  assert.equal(retained, primary);
+  assert.equal(Object.hasOwn(retained, "cleanupFailures"), false);
+  const diagnostics = m4RunnerCleanupFailures(retained);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0], cleanupFailure);
+  assert.notEqual(diagnostics[0], definitionFailure);
+});
+
 test("cleanup rejection retains the primary abort and does not short-circuit reverse teardown", async () => {
   const cancellation = new AbortController();
   const ownership = new DeterministicM4RunnerOwnership(cancellation.signal);
@@ -855,7 +942,7 @@ test("cleanup rejection retains the primary abort and does not short-circuit rev
   assert.deepEqual(order, ["third", "second", "first"]);
   assert.equal(failures.length, 1);
   assert.match(String(failures[0]), /second close failed/u);
-  assert.deepEqual(primary.cleanupFailures, failures);
+  assert.deepEqual(m4RunnerCleanupFailures(primary), failures);
 });
 
 test("repeated and concurrent teardown close each owned resource exactly once", async () => {
