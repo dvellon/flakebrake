@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +20,7 @@ import {
 
 interface BidiNetworkModule {
   responseCompleted(callback: (event: { response?: { status?: number | string; url?: string } } | null) => void): Promise<void>;
+  fetchError(callback: (event: { errorText?: string; request?: { url?: string } } | null) => void): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -34,6 +36,18 @@ const running = await startM5JudgeServer({
   port: 0,
   cleanupDataOnClose: true,
 });
+const transportKillServer = createServer((socket) => socket.destroy());
+await new Promise<void>((resolveListen) => {
+  transportKillServer.listen(0, "127.0.0.1", resolveListen);
+});
+const transportKillAddress = transportKillServer.address();
+if (transportKillAddress === null || typeof transportKillAddress === "string") {
+  throw new Error("the transport-failure probe server did not expose a loopback port");
+}
+const transportProbeUrl = `http://127.0.0.1:${String(transportKillAddress.port)}/m5-controlled-transport-failure-probe`;
+const transportProbeDocument = `data:text/html;charset=utf-8,${encodeURIComponent(
+  `<script>fetch("${transportProbeUrl}", { cache: "no-store" }).catch(() => {});</script>`,
+)}`;
 let driver: WebDriver | null = null;
 let capture: SessionErrorCapture | null = null;
 let networkCapture: SessionNetworkCapture | null = null;
@@ -75,15 +89,29 @@ try {
           if (Number.isFinite(status)) callback({ url: String(event?.response?.url ?? ""), status });
         });
       },
-      removeFailedResponseHandlers: async () => {
+      addFetchErrorHandler: async (callback) => {
+        await bidiNetwork.fetchError((event) => {
+          if (typeof event?.errorText === "string") {
+            callback({ url: String(event.request?.url ?? ""), errorText: event.errorText });
+          }
+        });
+      },
+      removeNetworkHandlers: async () => {
         await bidiNetwork.close();
       },
     },
     sessionBrowser,
     networkProbeUrl,
+    {
+      url: transportProbeUrl,
+      trigger: async () => {
+        await browser.get(transportProbeDocument);
+      },
+    },
   );
   const armedNetworkCapture = networkCapture;
   const networkProbeEntry = formatFailedResponse(networkProbeUrl, 404);
+  const transportProbePrefix = `${transportProbeUrl} transport=`;
   capture = await armSessionErrorCapture(browserScript, sessionBrowser);
   await capture.openApplication(running.url);
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
@@ -299,9 +327,15 @@ try {
     5_000,
     "the session network observer lost coverage before the end of the smoke",
   );
+  await browser.get(transportProbeDocument);
+  await browser.wait(
+    () => armedNetworkCapture.failedResponses().some((entry) => entry.startsWith(transportProbePrefix)),
+    5_000,
+    "the session transport-failure channel lost coverage before the end of the smoke",
+  );
   const sessionFailures = armedNetworkCapture.failedResponses();
   assert.deepEqual(
-    sessionFailures.filter((entry) => entry !== networkProbeEntry),
+    sessionFailures.filter((entry) => entry !== networkProbeEntry && !entry.startsWith(transportProbePrefix)),
     [],
     "no unexpected request failed at any point in the browser session",
   );
@@ -309,6 +343,11 @@ try {
     sessionFailures.filter((entry) => entry === networkProbeEntry).length,
     2,
     "controlled resource failures persist in session evidence across refreshes",
+  );
+  assert.equal(
+    sessionFailures.some((entry) => entry.startsWith(transportProbePrefix)),
+    true,
+    "the controlled end-of-session transport failure was observed by the session channel",
   );
   process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
 } catch (error: unknown) {
@@ -350,6 +389,16 @@ try {
     await networkCapture.dispose();
     networkCapture = null;
   }
+} catch (error: unknown) {
+  cleanupErrors.push(error);
+}
+try {
+  await new Promise<void>((resolveClose, rejectClose) => {
+    transportKillServer.close((error) => {
+      if (error) rejectClose(error);
+      else resolveClose();
+    });
+  });
 } catch (error: unknown) {
   cleanupErrors.push(error);
 }

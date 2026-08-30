@@ -21,9 +21,11 @@ import {
   armSessionNetworkCapture,
   CONTROLLED_ERROR_PROBE_URL,
   formatFailedResponse,
+  formatTransportFailure,
   type BrowserNetworkObserver,
   type BrowserScriptErrorObserver,
   type ObserverSessionBrowser,
+  type SessionTransportProbe,
 } from "./m5-error-capture.js";
 
 describe("M5 judge-readiness audit F-01 through F-26", () => {
@@ -401,17 +403,28 @@ describe("M5 live review regressions", { concurrency: false }, () => {
 
 describe("Qodo Round 3: executable session network-failure capture", () => {
   const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+  const TRANSPORT_PROBE_URL = "http://transport.invalid/m5-controlled-transport-failure-probe";
 
-  test("arming registers the observer before navigation and clears probe evidence", async () => {
-    const session = createFakeNetworkSession(NETWORK_PROBE_URL);
-    const capture = await armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL);
-    assert.deepEqual(session.events, ["register", "navigate:probe", "refresh"]);
+  const arm = (session: FakeNetworkSession): ReturnType<typeof armSessionNetworkCapture> =>
+    armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL, session.transportProbe);
+
+  test("arming registers both channels before navigation and clears probe evidence", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
+    assert.deepEqual(session.events, [
+      "register-response",
+      "register-fetch-error",
+      "transport-probe",
+      "navigate:probe",
+      "refresh",
+      "transport-probe",
+    ]);
     assert.deepEqual(capture.failedResponses(), []);
   });
 
-  test("a failure recorded before refresh persists across refresh and later navigation", async () => {
-    const session = createFakeNetworkSession(NETWORK_PROBE_URL);
-    const capture = await armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL);
+  test("an HTTP failure recorded before refresh persists across refresh and later navigation", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
     await session.browser.get("http://application.invalid/");
     assert.equal(session.emitFailedResponse("http://application.invalid/asset.js", 500), 1);
     await session.browser.refresh();
@@ -421,28 +434,53 @@ describe("Qodo Round 3: executable session network-failure capture", () => {
     ]);
   });
 
-  test("an observer that never observes failures fails closed", async () => {
-    const session = createFakeNetworkSession(NETWORK_PROBE_URL, { deliverResponses: false });
-    await assert.rejects(
-      armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL),
-      /did not observe the controlled missing-resource probe/u,
-    );
+  test("a transport failure recorded before refresh persists unless cleared as probe evidence", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
+    await session.browser.get("http://application.invalid/");
+    assert.equal(session.emitTransportFailure("http://application.invalid/api/state", "NS_ERROR_NET_RESET"), 1);
+    await session.browser.refresh();
+    await session.browser.get("http://application.invalid/deep");
+    assert.deepEqual(capture.failedResponses(), [
+      formatTransportFailure("http://application.invalid/api/state", "NS_ERROR_NET_RESET"),
+    ]);
   });
 
-  test("a page-scoped observer lost on refresh fails closed", async () => {
-    const session = createFakeNetworkSession(NETWORK_PROBE_URL, { dropHandlersOnRefresh: true });
-    await assert.rejects(
-      armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL),
-      /did not keep observing the missing-resource probe across refresh/u,
-    );
+  test("an observer that never observes HTTP failures fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { deliverResponses: false });
+    await assert.rejects(arm(session), /did not observe the controlled missing-resource probe/u);
   });
 
-  test("dispose removes the failure observation channel", async () => {
-    const session = createFakeNetworkSession(NETWORK_PROBE_URL);
-    const capture = await armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL);
+  test("an observer that ignores fetchError events fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { deliverTransportEvents: false });
+    await assert.rejects(arm(session), /did not observe the controlled transport-failure probe/u);
+  });
+
+  test("an unavailable fetchError subscription fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { registerFetchError: false });
+    await assert.rejects(arm(session), /did not observe the controlled transport-failure probe/u);
+  });
+
+  test("a page-scoped HTTP observer lost on refresh fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { dropHandlersOnRefresh: true });
+    await assert.rejects(arm(session), /did not keep observing the missing-resource probe across refresh/u);
+  });
+
+  test("fetchError coverage lost on refresh fails closed", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, {
+      dropFetchErrorHandlersOnRefresh: true,
+    });
+    await assert.rejects(arm(session), /did not keep observing the transport-failure probe across refresh/u);
+  });
+
+  test("dispose removes both failure observation channels", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await arm(session);
     await capture.dispose();
     assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.registeredFetchErrorHandlerCount(), 0);
     assert.equal(session.emitFailedResponse("http://application.invalid/late.js", 503), 0);
+    assert.equal(session.emitTransportFailure("http://application.invalid/late-poll", "NS_ERROR_NET_RESET"), 0);
     assert.deepEqual(capture.failedResponses(), []);
   });
 });
@@ -1663,23 +1701,38 @@ function createFakeBrowserSession(options?: {
 interface FakeNetworkSession {
   readonly observer: BrowserNetworkObserver;
   readonly browser: ObserverSessionBrowser;
+  readonly transportProbe: SessionTransportProbe;
   readonly events: readonly string[];
   registeredHandlerCount(): number;
+  registeredFetchErrorHandlerCount(): number;
   emitFailedResponse(url: string, status: number): number;
+  emitTransportFailure(url: string, errorText: string): number;
 }
 
-function createFakeNetworkSession(probeUrl: string, options?: {
+function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, options?: {
   readonly deliverResponses?: boolean;
+  readonly deliverTransportEvents?: boolean;
+  readonly registerFetchError?: boolean;
   readonly dropHandlersOnRefresh?: boolean;
+  readonly dropFetchErrorHandlersOnRefresh?: boolean;
 }): FakeNetworkSession {
   const deliverResponses = options?.deliverResponses ?? true;
+  const deliverTransportEvents = options?.deliverTransportEvents ?? true;
+  const registerFetchError = options?.registerFetchError ?? true;
   const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
+  const dropFetchErrorHandlersOnRefresh = options?.dropFetchErrorHandlersOnRefresh ?? false;
   const events: string[] = [];
   const handlers = new Set<(entry: { url: string; status: number }) => void>();
+  const fetchErrorHandlers = new Set<(entry: { url: string; errorText: string }) => void>();
   let currentUrl: string | null = null;
   const deliverToRegisteredHandlers = (url: string, status: number): number => {
     const active = [...handlers];
     for (const handler of active) handler({ url, status });
+    return active.length;
+  };
+  const deliverToFetchErrorHandlers = (url: string, errorText: string): number => {
+    const active = [...fetchErrorHandlers];
+    for (const handler of active) handler({ url, errorText });
     return active.length;
   };
   const deliverProbeResponse = (): void => {
@@ -1689,10 +1742,15 @@ function createFakeNetworkSession(probeUrl: string, options?: {
     observer: {
       addFailedResponseHandler: async (callback) => {
         handlers.add(callback);
-        events.push("register");
+        events.push("register-response");
       },
-      removeFailedResponseHandlers: async () => {
+      addFetchErrorHandler: async (callback) => {
+        if (registerFetchError) fetchErrorHandlers.add(callback);
+        events.push("register-fetch-error");
+      },
+      removeNetworkHandlers: async () => {
         handlers.clear();
+        fetchErrorHandlers.clear();
         events.push("remove");
       },
     },
@@ -1705,6 +1763,7 @@ function createFakeNetworkSession(probeUrl: string, options?: {
       refresh: async () => {
         events.push("refresh");
         if (dropHandlersOnRefresh) handlers.clear();
+        if (dropFetchErrorHandlersOnRefresh) fetchErrorHandlers.clear();
         deliverProbeResponse();
       },
       wait: async (condition, _timeoutMs, message) => {
@@ -1715,8 +1774,17 @@ function createFakeNetworkSession(probeUrl: string, options?: {
         throw new Error(message);
       },
     },
+    transportProbe: {
+      url: transportProbeUrl,
+      trigger: async () => {
+        events.push("transport-probe");
+        if (deliverTransportEvents) deliverToFetchErrorHandlers(transportProbeUrl, "NS_ERROR_NET_RESET");
+      },
+    },
     events,
     registeredHandlerCount: () => handlers.size,
+    registeredFetchErrorHandlerCount: () => fetchErrorHandlers.size,
     emitFailedResponse: deliverToRegisteredHandlers,
+    emitTransportFailure: deliverToFetchErrorHandlers,
   };
 }

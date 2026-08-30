@@ -18,7 +18,13 @@ export interface SessionErrorCapture {
 
 export interface BrowserNetworkObserver {
   addFailedResponseHandler(callback: (entry: { url: string; status: number }) => void): Promise<void>;
-  removeFailedResponseHandlers(): Promise<void>;
+  addFetchErrorHandler(callback: (entry: { url: string; errorText: string }) => void): Promise<void>;
+  removeNetworkHandlers(): Promise<void>;
+}
+
+export interface SessionTransportProbe {
+  readonly url: string;
+  trigger(): Promise<void>;
 }
 
 export interface SessionNetworkCapture {
@@ -28,6 +34,10 @@ export interface SessionNetworkCapture {
 
 export function formatFailedResponse(url: string, status: number): string {
   return `${url} status=${String(status)}`;
+}
+
+export function formatTransportFailure(url: string, errorText: string): string {
+  return `${url} transport=${errorText}`;
 }
 
 export const CONTROLLED_ERROR_PROBE_URL = `data:text/html;charset=utf-8,${encodeURIComponent(
@@ -72,13 +82,26 @@ export async function armSessionNetworkCapture(
   observer: BrowserNetworkObserver,
   browser: ObserverSessionBrowser,
   probeUrl: string,
+  transportProbe: SessionTransportProbe,
 ): Promise<SessionNetworkCapture> {
   const failed: string[] = [];
   const probeEntry = formatFailedResponse(probeUrl, 404);
+  const transportPrefix = `${transportProbe.url} transport=`;
   await observer.addFailedResponseHandler((entry) => {
     if (entry.status >= 400) failed.push(formatFailedResponse(entry.url, entry.status));
   });
+  await observer.addFetchErrorHandler((entry) => {
+    failed.push(formatTransportFailure(entry.url, entry.errorText));
+  });
   const probeObservations = (): number => failed.filter((entry) => entry === probeEntry).length;
+  const transportObservations = (): number =>
+    failed.filter((entry) => entry.startsWith(transportPrefix)).length;
+  await transportProbe.trigger();
+  await browser.wait(
+    () => transportObservations() >= 1,
+    5_000,
+    "the session network observer did not observe the controlled transport-failure probe",
+  );
   await browser.get(probeUrl);
   await browser.wait(
     () => probeObservations() >= 1,
@@ -90,6 +113,12 @@ export async function armSessionNetworkCapture(
     () => probeObservations() >= 2,
     5_000,
     "the session network observer did not keep observing the missing-resource probe across refresh",
+  );
+  await transportProbe.trigger();
+  await browser.wait(
+    () => transportObservations() >= 2,
+    5_000,
+    "the session network observer did not keep observing the transport-failure probe across refresh",
   );
   let settledLength = -1;
   let stableSamples = 0;
@@ -108,6 +137,6 @@ export async function armSessionNetworkCapture(
   failed.length = 0;
   return {
     failedResponses: () => [...failed],
-    dispose: () => observer.removeFailedResponseHandlers(),
+    dispose: () => observer.removeNetworkHandlers(),
   };
 }
