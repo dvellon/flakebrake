@@ -301,7 +301,12 @@ try {
       );
       assert.match(pendingTrustRows, /BLOCKED/u, "the mechanical handoff renders its Blocked result");
     }
-    const foldViewports = [[1280, 800]] as const;
+    const foldViewports = [
+      [1440, 900],
+      [1280, 800],
+      [1120, 800],
+      [1024, 768],
+    ] as const;
     for (const [foldWidth, foldHeight] of foldViewports) {
       await browser.manage().window().setRect({ width: foldWidth, height: foldHeight });
       await browser.executeScript("window.scrollTo(0, 0);");
@@ -325,7 +330,7 @@ try {
         `the operator decision actions are above the fold at ${String(foldWidth)}x${String(foldHeight)}`,
       );
     }
-    await browser.manage().window().setRect({ width: 1280, height: 800 });
+    await browser.manage().window().setRect({ width: 1440, height: 900 });
 
     if (ownerCall === 2) {
       assert.equal(
