@@ -11,6 +11,10 @@ export interface M4RunnerLifecycleError extends Error {
 }
 
 const CLEANUP_FAILURE_SOURCES = new WeakMap<Error, (readonly unknown[])[]>();
+// A signal is the authoritative lifecycle boundary. Every owner that observes
+// the same non-Error reason must share one safe diagnostic object.
+const NORMALIZED_ABORT_REASONS = new WeakMap<AbortSignal, Error>();
+const NON_ERROR_ABORT_DIAGNOSTICS = new WeakSet<Error>();
 
 interface OwnedHttpHandler {
   readonly request: IncomingMessage;
@@ -55,6 +59,7 @@ export class OwnedHttpServerLifecycle {
   #abortListener: (() => void) | undefined;
   #closePromise: Promise<void> | undefined;
   #serverStopPromise: Promise<void> | undefined;
+  #closeCancellationReason: Error | undefined;
   #serverCloseObserved = false;
   #closing = false;
   #closed = false;
@@ -181,13 +186,16 @@ export class OwnedHttpServerLifecycle {
     );
     if (!drained) {
       for (const handler of this.#handlers) {
+        const cancellationReason = this.#handlerCancellationReason();
         const reason =
           handler.forcedDrainReason ??
-          new Error(this.#options.incompleteRequestMessage);
+          new Error(this.#options.incompleteRequestMessage, {
+            cause: cancellationReason,
+          });
         handler.forcedDrainReason = reason;
         if (!handler.cancellation.signal.aborted) {
-          this.#recordCleanupDiagnostic(reason);
-          handler.cancellation.abort(reason);
+          this.#recordCleanupDiagnostic(reason, cancellationReason);
+          handler.cancellation.abort(cancellationReason);
         }
         // The reason is retained on the owned handler signal and, for runner
         // cancellation, on the primary error's cleanup diagnostics. It must
@@ -331,12 +339,19 @@ export class OwnedHttpServerLifecycle {
     if (this.#closing) socket.destroy();
   };
 
-  #recordCleanupDiagnostic(reason: Error): void {
+  #handlerCancellationReason(): Error {
+    const signal = this.#options.signal;
+    if (signal?.aborted === true) return abortReason(signal);
+    this.#closeCancellationReason ??= new DOMException(
+      "The operation was aborted",
+      "AbortError",
+    );
+    return this.#closeCancellationReason;
+  }
+
+  #recordCleanupDiagnostic(reason: Error, primary: Error): void {
     this.#cleanupDiagnostics.push(reason);
-    const primary = this.#options.signal?.reason;
-    if (primary instanceof Error) {
-      retainM4RunnerCleanupDiagnostics(primary, this.#cleanupDiagnostics);
-    }
+    retainM4RunnerCleanupDiagnostics(primary, this.#cleanupDiagnostics);
   }
 
   readonly #observeServerClose = (): void => {
@@ -452,17 +467,18 @@ export function retainM4RunnerCleanupDiagnostics(
   error: Error,
   cleanupFailures: readonly unknown[],
 ): M4RunnerLifecycleError {
-  const sources = CLEANUP_FAILURE_SOURCES.get(error) ?? [];
+  const primary = normalizedAbortCause(error) ?? error;
+  const sources = CLEANUP_FAILURE_SOURCES.get(primary) ?? [];
   if (!sources.includes(cleanupFailures)) sources.push(cleanupFailures);
-  CLEANUP_FAILURE_SOURCES.set(error, sources);
-  if (!("cleanupFailures" in error) && Object.isExtensible(error)) {
-    Object.defineProperty(error, "cleanupFailures", {
+  CLEANUP_FAILURE_SOURCES.set(primary, sources);
+  if (!("cleanupFailures" in primary) && Object.isExtensible(primary)) {
+    Object.defineProperty(primary, "cleanupFailures", {
       configurable: false,
       enumerable: false,
-      get: () => m4RunnerCleanupFailures(error),
+      get: () => m4RunnerCleanupFailures(primary),
     });
   }
-  return error as M4RunnerLifecycleError;
+  return primary as M4RunnerLifecycleError;
 }
 
 export function m4RunnerCleanupFailures(error: Error): readonly unknown[] {
@@ -521,6 +537,24 @@ function isServerNotRunningError(error: unknown): boolean {
   );
 }
 
-function abortReason(signal: AbortSignal): unknown {
-  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+function normalizedAbortCause(error: Error): Error | undefined {
+  // missionFailure preserves arbitrary causes in a wrapper. Returning the
+  // branded lifecycle diagnostic keeps that safe object primary without
+  // mistaking unrelated Error causes for cancellation ownership.
+  return error.cause instanceof Error &&
+    NON_ERROR_ABORT_DIAGNOSTICS.has(error.cause)
+    ? error.cause
+    : undefined;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error) return reason;
+  const existing = NORMALIZED_ABORT_REASONS.get(signal);
+  if (existing !== undefined) return existing;
+  const normalized = new Error("The operation was aborted", { cause: reason });
+  normalized.name = "AbortError";
+  NORMALIZED_ABORT_REASONS.set(signal, normalized);
+  NON_ERROR_ABORT_DIAGNOSTICS.add(normalized);
+  return normalized;
 }

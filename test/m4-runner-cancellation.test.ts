@@ -28,6 +28,16 @@ import type { M4MissionCheckpoint } from "../src/m4-mission-controller.js";
 import { startFactoryMcpHttpService } from "../src/mcp-http.js";
 import { createStore } from "../src/store.js";
 
+const OBJECT_ABORT_MARKER = "private-object-cancellation-payload";
+let objectAbortStringifications = 0;
+const objectAbortReason = {
+  kind: "deterministic cancellation",
+  toString: () => {
+    objectAbortStringifications += 1;
+    return OBJECT_ABORT_MARKER;
+  },
+};
+
 test(
   "deterministic runner aborts after four MCP listeners and the model listener",
   { timeout: 30_000 },
@@ -331,6 +341,104 @@ test(
       await service.close().catch(() => undefined);
       stalled.restore();
       fixture.remove();
+    }
+  },
+);
+
+test(
+  "MCP forced drain normalizes every mission abort reason once",
+  { timeout: 90_000 },
+  async (context) => {
+    const cases: readonly {
+      readonly label: string;
+      readonly abort: (controller: AbortController) => void;
+      readonly originalReason?: unknown;
+      readonly normalized: boolean;
+      readonly forbiddenMessage?: string;
+    }[] = [
+      {
+        label: "Error reason preserves identity",
+        abort: (controller) =>
+          controller.abort(new Error("authoritative Error cancellation")),
+        normalized: false,
+      },
+      {
+        label: "string reason has a safe diagnostic and exact cause",
+        abort: (controller) => controller.abort("private string cancellation"),
+        originalReason: "private string cancellation",
+        normalized: true,
+        forbiddenMessage: "private string cancellation",
+      },
+      {
+        label: "object reason has a safe diagnostic and exact cause",
+        abort: (controller) => controller.abort(objectAbortReason),
+        originalReason: objectAbortReason,
+        normalized: true,
+        forbiddenMessage: OBJECT_ABORT_MARKER,
+      },
+      {
+        label: "default reason remains diagnosable",
+        abort: (controller) => controller.abort(),
+        normalized: false,
+      },
+    ];
+    for (const testCase of cases) {
+      await context.test(testCase.label, async () => {
+        const directory = mkdtempSync(
+          join(tmpdir(), "flakebrake-mcp-non-error-abort-"),
+        );
+        const stalled = installStalledMcpTransport();
+        const cancellation = new AbortController();
+        const mission = runDeterministicM4Mission(
+          missionOptions(directory, cancellation.signal),
+        );
+        const stringificationsBefore = objectAbortStringifications;
+        try {
+          await stalled.started;
+          assert.equal(stalled.request()?.complete, true);
+          assert.equal(stalled.request()?.readableEnded, true);
+          testCase.abort(cancellation);
+          const originalReason: unknown = cancellation.signal.reason;
+          const failure = await mission.then(
+            () => {
+              throw new Error("aborted MCP mission unexpectedly completed");
+            },
+            (error: unknown) => error,
+          );
+          assert.ok(failure instanceof Error);
+          if (testCase.normalized) {
+            assert.equal(failure.name, "AbortError");
+            assert.equal(failure.message, "The operation was aborted");
+            assert.equal(failure.cause, testCase.originalReason);
+            if (testCase.forbiddenMessage !== undefined) {
+              assert.doesNotMatch(
+                failure.message,
+                new RegExp(testCase.forbiddenMessage, "u"),
+              );
+            }
+          } else {
+            assert.equal(failure, originalReason);
+          }
+          const diagnostics = m4RunnerCleanupFailures(failure);
+          assert.equal(
+            diagnostics.length,
+            1,
+            "the normalized mission abort must retain forced-drain diagnostics",
+          );
+          assert.match(
+            String(diagnostics[0]),
+            /shutdown aborted an incomplete request/u,
+          );
+          assert.ok(diagnostics[0] instanceof Error);
+          assert.equal(diagnostics[0].cause, failure);
+          assert.equal(objectAbortStringifications, stringificationsBefore);
+        } finally {
+          if (!cancellation.signal.aborted) cancellation.abort();
+          await mission.catch(() => undefined);
+          stalled.restore();
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
     }
   },
 );
