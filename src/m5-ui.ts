@@ -354,6 +354,16 @@ interface RecordedDecision {
   readonly canonicalInput: string;
 }
 
+interface ScenarioRuntimeProjection {
+  readonly decisionHistory: ReadonlyMap<string, RecordedDecision>;
+  readonly observedApprovals: readonly M4ApprovalRecord[];
+  readonly runtimeEvidence: M5JudgeState["evidenceTimeline"];
+  readonly status: M5RunStatus;
+  readonly errorCode: string | null;
+  readonly ownerCallsThisProcess: number;
+  readonly replayedTerminal: boolean;
+}
+
 interface DemoPaths {
   readonly m2: string;
   readonly factory: string;
@@ -390,6 +400,7 @@ export class M5DemoCoordinator {
     technicalIdentity: string | null;
     status: M5JudgeState["evidenceTimeline"][number]["status"];
   }[] = [];
+  readonly #scenarioRuntime = new Map<M5ScenarioId, ScenarioRuntimeProjection>();
   #pendingApproval: PendingApprovalInternal | null = null;
   #result: DeterministicM4MissionResult | null = null;
   #capacityShockResult: CapacityShockMissionResult | null = null;
@@ -557,19 +568,47 @@ export class M5DemoCoordinator {
       );
     }
     if (scenarioId === this.#scenarioId) return this.state();
+    this.#storeScenarioRuntime();
     this.#scenarioId = scenarioId;
+    this.#restoreScenarioRuntime(scenarioId);
+    this.#generation += 1;
+    this.#bumpRevision();
+    return this.state();
+  }
+
+  #storeScenarioRuntime(): void {
+    this.#scenarioRuntime.set(this.#scenarioId, {
+      decisionHistory: new Map(this.#decisionHistory),
+      observedApprovals: [...this.#observedApprovals],
+      runtimeEvidence: this.#runtimeEvidence.map((item) => ({ ...item })),
+      status: this.#status,
+      errorCode: this.#errorCode,
+      ownerCallsThisProcess: this.#ownerCallsThisProcess,
+      replayedTerminal: this.#replayedTerminal,
+    });
+  }
+
+  #restoreScenarioRuntime(scenarioId: M5ScenarioId): void {
     this.#decisionHistory.clear();
     this.#observedApprovals.length = 0;
     this.#runtimeEvidence.length = 0;
-    this.#result = null;
-    this.#capacityShockResult = null;
-    this.#status = "idle";
-    this.#errorCode = null;
-    this.#generation += 1;
-    this.#ownerCallsThisProcess = 0;
-    this.#replayedTerminal = false;
-    this.#bumpRevision();
-    return this.state();
+    const runtime = this.#scenarioRuntime.get(scenarioId);
+    if (runtime === undefined) {
+      this.#status = "idle";
+      this.#errorCode = null;
+      this.#ownerCallsThisProcess = 0;
+      this.#replayedTerminal = false;
+      return;
+    }
+    for (const [identity, decision] of runtime.decisionHistory) {
+      this.#decisionHistory.set(identity, decision);
+    }
+    this.#observedApprovals.push(...runtime.observedApprovals);
+    this.#runtimeEvidence.push(...runtime.runtimeEvidence.map((item) => ({ ...item })));
+    this.#status = runtime.status;
+    this.#errorCode = runtime.errorCode;
+    this.#ownerCallsThisProcess = runtime.ownerCallsThisProcess;
+    this.#replayedTerminal = runtime.replayedTerminal;
   }
 
   public start(): M5JudgeState {
@@ -679,8 +718,9 @@ export class M5DemoCoordinator {
     this.#decisionHistory.clear();
     this.#observedApprovals.length = 0;
     this.#runtimeEvidence.length = 0;
-    this.#result = null;
-    this.#capacityShockResult = null;
+    if (this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID) this.#capacityShockResult = null;
+    else this.#result = null;
+    this.#scenarioRuntime.delete(this.#scenarioId);
     this.#status = "idle";
     this.#errorCode = null;
     this.#generation += 1;
@@ -817,6 +857,7 @@ export class M5DemoCoordinator {
     const execution = this.#readExecution();
     const result = this.#result;
     const capacityResult = this.#capacityShockResult;
+    const activeMissionResult = capacityShock ? capacityResult?.mission : result?.mission;
     const activity = capacityShock
       ? capacityResult === null
         ? emptyActivity()
@@ -865,20 +906,15 @@ export class M5DemoCoordinator {
         missionId: capacityShock ? CAPACITY_SHOCK_MISSION_ID : M4_HERO_MISSION_ID,
         sessionId:
           missionSnapshot?.mission.trueforgeSessionId ??
-          capacityResult?.mission.trueforgeSessionId ??
-          result?.mission.trueforgeSessionId ??
+          activeMissionResult?.trueforgeSessionId ??
           null,
         currentTurnId:
           missionSnapshot?.mission.currentTurnId ??
-          capacityResult?.mission.finalTurnId ??
-          result?.mission.finalTurnId ??
+          activeMissionResult?.finalTurnId ??
           null,
-        terminalProjectionDigest:
-          capacityResult?.mission.projectionDigest ?? result?.mission.projectionDigest ?? null,
+        terminalProjectionDigest: activeMissionResult?.projectionDigest ?? null,
         disconnectedAndResumed:
-          (capacityResult?.mission.disconnectedAndResumed ??
-            result?.mission.disconnectedAndResumed ??
-            false) || this.#replayedTerminal,
+          (activeMissionResult?.disconnectedAndResumed ?? false) || this.#replayedTerminal,
       },
       harness: HARNESS_PROJECTION,
       hero: {
@@ -1361,10 +1397,15 @@ export class M5DemoCoordinator {
   }
 
   #currentApprovals(snapshot: M4MissionSnapshot | null): readonly M4ApprovalRecord[] {
-    if (this.#capacityShockResult !== null) {
+    if (
+      this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID &&
+      this.#capacityShockResult !== null
+    ) {
       return this.#capacityShockResult.mission.approvals;
     }
-    if (this.#result !== null) return this.#result.mission.approvals;
+    if (this.#scenarioId === "rush-order" && this.#result !== null) {
+      return this.#result.mission.approvals;
+    }
     const fromSnapshot = snapshot?.bridgeOutcomes
       .filter((item) => item.status === "approval_bound")
       .map((item) => approvalRecordFromJson(item.result))

@@ -3991,6 +3991,128 @@ test("M5 integration: scenario switching rejects stale polls and cross-scenario 
   }
 });
 
+test("M5 integration: switching back reattaches the exact durable verified hero", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-scenario-restore-"));
+  const running = await startM5JudgeServer({
+    dataRoot: directory,
+    port: 0,
+    cleanupDataOnClose: false,
+  });
+  try {
+    const hero = await completeHeroMission(running, "scenario-restore-hero");
+    assert.equal(hero.run.status, "verified");
+    const heroEvidenceResponse = await fetch(`${running.url}/api/evidence`);
+    assert.equal(heroEvidenceResponse.status, 200);
+    const heroEvidence = await heroEvidenceResponse.text();
+    const heroIdentity = {
+      mission: hero.mission,
+      ownerCallsThisProcess: hero.run.ownerCallsThisProcess,
+      execution: hero.execution,
+      safety: hero.safety,
+      approvals: hero.approvals,
+      activity: hero.activity,
+      hero: hero.hero,
+      harness: hero.harness,
+      evidenceTimeline: hero.evidenceTimeline,
+      agentTrust: hero.agentTrust,
+      challengeLab: hero.challengeLab,
+    };
+
+    await postJson(running, "/api/scenario", {
+      scenarioId: "capacity-shock",
+      requestId: "scenario-restore-select-capacity-0001",
+    });
+    const capacity = await completeHeroMission(running, "scenario-restore-capacity");
+    assert.equal(capacity.run.status, "verified");
+    assert.notEqual(capacity.mission.sessionId, hero.mission.sessionId);
+    const capacityIdentity = {
+      mission: capacity.mission,
+      ownerCallsThisProcess: capacity.run.ownerCallsThisProcess,
+      execution: capacity.execution,
+      safety: capacity.safety,
+    };
+
+    await postJson(running, "/api/mission", {
+      operation: "start",
+      requestId: "scenario-restore-capacity-replay-0001",
+    });
+    const capacityReplay = await getState(running);
+    assert.deepEqual(
+      {
+        mission: capacityReplay.mission,
+        ownerCallsThisProcess: capacityReplay.run.ownerCallsThisProcess,
+        execution: capacityReplay.execution,
+        safety: capacityReplay.safety,
+      },
+      capacityIdentity,
+      "capacity replay adds no owner call or durable effect",
+    );
+
+    await postJson(running, "/api/scenario", {
+      scenarioId: "rush-order",
+      requestId: "scenario-restore-select-hero-0001",
+    });
+    const restored = await getState(running);
+    assert.equal(restored.scenario.scenarioId, "rush-order");
+    assert.equal(restored.run.status, "verified");
+    assert.deepEqual(
+      {
+        mission: restored.mission,
+        ownerCallsThisProcess: restored.run.ownerCallsThisProcess,
+        execution: restored.execution,
+        safety: restored.safety,
+        approvals: restored.approvals,
+        activity: restored.activity,
+        hero: restored.hero,
+        harness: restored.harness,
+        evidenceTimeline: restored.evidenceTimeline,
+        agentTrust: restored.agentTrust,
+        challengeLab: restored.challengeLab,
+      },
+      heroIdentity,
+      "the prior verified hero identity and durable projection are restored exactly",
+    );
+    assert.equal(restored.scenario.staleBasisRejectionCount, 0);
+    assert.notEqual(restored.mission.missionId, capacity.mission.missionId);
+    assert.equal(restored.challengeLab.status, "idle");
+    const restoredEvidenceResponse = await fetch(`${running.url}/api/evidence`);
+    assert.equal(restoredEvidenceResponse.status, 200);
+    assert.equal(await restoredEvidenceResponse.text(), heroEvidence);
+
+    await postJson(running, "/api/mission", {
+      operation: "reset",
+      requestId: "scenario-restore-reset-hero-0001",
+    });
+    const resetHero = await getState(running);
+    assert.equal(resetHero.run.status, "idle");
+    assert.equal(resetHero.execution.mutationCount, 0);
+    assert.equal((await fetch(`${running.url}/api/evidence`)).status, 409);
+    await postJson(running, "/api/scenario", {
+      scenarioId: "capacity-shock",
+      requestId: "scenario-restore-capacity-after-hero-reset-0001",
+    });
+    const capacityAfterHeroReset = await getState(running);
+    assert.deepEqual(
+      {
+        mission: capacityAfterHeroReset.mission,
+        ownerCallsThisProcess: capacityAfterHeroReset.run.ownerCallsThisProcess,
+        execution: capacityAfterHeroReset.execution,
+        safety: capacityAfterHeroReset.safety,
+      },
+      capacityIdentity,
+      "resetting the active hero does not reset isolated Capacity state",
+    );
+    await postJson(running, "/api/scenario", {
+      scenarioId: "rush-order",
+      requestId: "scenario-restore-hero-after-reset-0001",
+    });
+    assert.equal((await getState(running)).run.status, "idle");
+  } finally {
+    await running.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("M5 Round 1: reconnect generation invalidates responses issued before disconnect", async () => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-reconnect-race-"));
   const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
