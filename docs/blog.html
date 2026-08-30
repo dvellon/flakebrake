@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#09100c">
+  <title>The "no" that survives a rename — building FlakeBrake on TrueForge</title>
+  <meta name="description" content="Why the hardest part of a safe autonomous agent isn't planning — it's making a human's denial stick when the same effect comes back wearing a different tool name. How FlakeBrake was built on TrueForge 0.1.4, and what repeated Qodo review changed.">
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="The &quot;no&quot; that survives a rename — building FlakeBrake on TrueForge">
+  <meta property="og:description" content="A human-governed TrueForge agent that replans constrained work, pauses for exact authorization, blocks equivalent denied actions mechanically, and proves its one mutation before claiming success.">
+  <meta property="og:site_name" content="FlakeBrake">
+  <!-- Update the og:image/og:url origin below if the site is published somewhere other than the default GitHub Pages origin. -->
+  <meta property="og:url" content="https://dvellon.github.io/flakebrake/blog.html">
+  <meta property="og:image" content="https://dvellon.github.io/flakebrake/assets/social-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23c9f45b'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='14' font-weight='900' text-anchor='middle' fill='%2317220f'%3EFB%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="./" aria-label="FlakeBrake home">
+        <span class="brand-mark" aria-hidden="true">FB</span>
+        <span class="brand-name"><strong>FlakeBrake</strong><small>Built on TrueForge</small></span>
+      </a>
+      <nav class="topnav" aria-label="Site">
+        <a href="./">Home</a>
+        <a href="./#scenario">Demo story</a>
+        <a href="./#quality">Quality</a>
+        <a class="nav-cta" href="https://github.com/dvellon/flakebrake">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <header class="article-header wrap">
+      <p class="eyebrow">FlakeBrake · engineering notes</p>
+      <h1>The "no" that survives a rename</h1>
+      <p class="lede">The hardest part of building a safe autonomous agent wasn't the planning. It was making a human's denial mean something after the same action came back wearing a different tool name.</p>
+      <div class="article-byline">
+        <span><strong>dvellon</strong></span>
+        <span>August 30, 2026</span>
+        <span>~7 min read</span>
+        <span>TrueForge 0.1.4 · TypeScript · SQLite</span>
+      </div>
+    </header>
+
+    <article class="article wrap" aria-label="Blog post">
+      <div class="article-body">
+        <p>Picture a small factory's scheduling agent on a Tuesday morning. A rush order lands — good margin, tight window — and the agent does what agents do: it produces a fluent, confident plan to take the job. The plan is locally reasonable. It is also wrong, because the factory's protected medical order, its two "important" orders, and its best-effort work already consume most of the agent-work budget and the exact production-cell interval the rush job wants. The agent didn't lie. It just answered a smaller question than the one that mattered.</p>
+
+        <p>That gap is where I decided to spend my hackathon: not making an agent that plans better, but making one that is <em>structurally unable to promise what the whole system can't keep</em> — and that can prove, afterward, that the one thing it was allowed to do is the one thing that happened. The result is FlakeBrake, an obligation admission controller wrapped around a TrueForge mission.</p>
+
+        <h2>Scarce capacity turns confidence into damage</h2>
+        <p>Autonomous action is at its most dangerous precisely when capacity is scarce, because that's when every commitment is a trade against something already promised. An agent that overcommits under abundance wastes time. An agent that overcommits under scarcity <em>reassigns loss</em> — quietly, to whichever existing obligation was least defended. And the usual failure amplifiers are all downstream of the yes: retrying a mutation after a lost response, replaying a stale approval, resubmitting a denied action through a different tool, reporting success because a tool call returned 200.</p>
+
+        <p>So FlakeBrake treats promise acceptance as an admission decision over the <em>complete</em> versioned portfolio, not a model assertion. Feasibility is computed by a deterministic kernel; every admission binds to exact portfolio, capacity, and authorization versions; and infeasible proposals get a bounded, portfolio-wide replan — in the demo, the smallest safe change turns out to be trimming one best-effort order from quantity 10 to 8 while protected work stays untouchable.</p>
+
+        <h2>Why TrueForge, specifically</h2>
+        <p>I could have hand-rolled an agent loop. I've done it before, and it produces exactly the kind of demo I didn't want: a bespoke while-loop where "session," "approval," and "resume" mean whatever my code says they mean that day. The interesting properties of FlakeBrake — pausing a turn for a human, surviving a disconnect, keeping subagent work isolated — are only worth demonstrating if they run on infrastructure I <em>don't</em> control.</p>
+
+        <p>TrueForge gave me that substrate. The mission runs inside the pinned 0.1.4 server through its 0.1.3 SDK, and every load-bearing element is a TrueForge primitive: a durable session and turn graph; a root "obligation commander" agent that alone talks to the owner; three dynamic subagents (portfolio analyst, capacity analyst, assurance engineer) doing scoped investigation; four MCP services exposing orders, capacity, simulation, and change control; a sandbox where the assurance subagent runs generated analysis code that is never allowed to make decisions; native approval pauses on the four consequential tools; and reconnect behavior that replays durable state instead of re-running the mission.</p>
+
+        <div class="article-chain">
+          <div class="chain" role="group" aria-label="The TrueForge action chain">
+            <p class="chain-title"><span class="chain-mark">The chain, every run</span></p>
+            <ol class="chain-track">
+              <li class="chain-step"><span class="k">Session</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step"><span class="k">Three subagents</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step"><span class="k">Four MCP services</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step"><span class="k">Local sandbox</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step"><span class="k">Native approval pause</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step chain-step-human"><span class="k">Human decision</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step"><span class="k">Reconnect</span></li>
+              <li class="chain-sep" aria-hidden="true">→</li>
+              <li class="chain-step chain-step-verified"><span class="k">Verified effect</span></li>
+            </ol>
+          </div>
+        </div>
+
+        <p>One honesty note, because it matters to me: the credential-free judge mode swaps in a bounded local deterministic model provider so anyone can run the mission reproducibly, with no OpenAI or Daytona accounts. Everything else is the real thing — real TrueForge sessions, turns, subagents, MCP connectors, sandbox execution, native approval events, reconnect. The deterministic profile proves the orchestration and the safety mechanics; it deliberately doesn't claim to prove an external model's judgment. Credential-gated tests that exercise an OpenAI provider and a Daytona sandbox exist in the repo as a separate, optional gate.</p>
+
+        <h2>Two kinds of "no"</h2>
+        <p>The demo's centerpiece is a distinction I now think every agent system needs to make explicit. When the mission requests the rush order's preferred 09:10–09:40 production slot, the owner denies it — a human reading an exact request (mission, tool, expected effect, SHA-256 action digest) and choosing "Deny action." That's the first kind of no: judgment.</p>
+
+        <p>Then the planner does the sneaky thing, by design: it submits the <em>same material effect</em> through a different MCP adapter, <code>submit_schedule_change</code>, with a different action name and schema. And here the second kind of no fires: the denial recorded in the ledger is a typed, normalized effect constraint, so the equivalent representation is matched and blocked mechanically — no second interruption, no mutation, no owner fatigue.</p>
+
+        <div class="pull">An owner's denial that evaporates on the next rephrase isn't governance. It's a suggestion box.</div>
+
+        <p>Keeping those two denials distinct also keeps the human budget honest: the whole mission takes exactly four owner calls, and the mechanical block isn't one of them. When the agent proposes the genuinely different 09:40–10:10 alternative, that's a new effect with its own digest — so it earns a real decision, and gets approved.</p>
+
+        <h2>A mutation is not a success</h2>
+        <p>The most quietly radical rule in FlakeBrake is that the mutation's own result is treated as a claim, not a conclusion. The approved alternative executes exactly once — allowance claimed, attempt fenced, one synthetic factory mutation, one receipt. And then the system refuses to celebrate. It reads the factory back through an independent path, appends the actual consumption facts (6 agent work units, 30 production-cell minutes) to the ledger, and only after the read-back matches does it record the terminal verified event that lets the root TrueForge mission complete. The judge UI even lectures you about it, in so many words: a receipt, by itself, is not verified success.</p>
+
+        <h2>Exactly-once is a recovery philosophy, not a flag</h2>
+        <p>Everything above has to survive the boring disasters: a refresh mid-approval, a lost response, a process restart. My rule was that recovery must <em>replay</em> decisions and effects, never repeat them. The mission, session, turn graph, approvals, tool results, and terminal projection are all durable; a browser refresh re-projects that state rather than re-running anything; a lost approval response reconciles to its existing successor turn; idempotent retries return the original durable result. The client enforces its own discipline too — monotonic request generations mean a stale poll can't overwrite a newer decision or regress a verified outcome. The end-of-demo party trick is deliberately anticlimactic: refresh the browser, and every count stays exactly where it was.</p>
+
+        <h2>What repeated Qodo review actually changed</h2>
+        <p>Every implementation PR went through the Qodo review app, and I mean this as an unsentimental compliment: its best findings were the ones I was least likely to catch, because they lived in gaps between components I'd tested separately. On the M4 PR it flagged a live-owner bypass path (High/Security) and a non-atomic acceptance/grant commit (High/Correctness) — the second being exactly the kind of bug that turns "atomic by design" into "atomic by luck." On the SQLite PR it caught my contention test reporting readiness before contention was actually proven, which would have made the test pass vacuously forever. On the M5 PR it pushed monotonic polling and malformed-request containment further than my first version. The rhythm that emerged — finding, focused regression test, fix, re-review at the exact head, human adjudication — improved the codebase, but it improved my process more: I stopped merging anything whose safety property didn't have a test with its name on it.</p>
+
+        <h2>Limits, honestly</h2>
+        <p>FlakeBrake v0.1 is a bounded demonstration, and it says so. It's a synthetic microfactory, not a production integration; capacity assumptions are declared and versioned, not inferred; the judge UI is loopback-only with no multi-user auth story; and deterministic mode proves mechanics, not model quality. The single most transferable lesson, for me: put authority in code and evidence in ledgers, and let the model be brilliant <em>inside</em> those walls. The second lesson is about demos themselves — a deterministic, replayable story that shows its counterfactual ("here's the overload that didn't ship") is worth more than an impressive run nobody can reproduce.</p>
+
+        <h2>Where this points</h2>
+        <p>Agents are going to be deployed against scarce, contended, real-world capacity — that's where they're useful. Trustworthy deployment there needs exactly the properties this small system demonstrates end to end: admission before commitment, authorization bound to exact effects, denials that survive renames, one fenced mutation, independent verification, and recovery that never repeats a human's decision. TrueForge supplied the durable spine that made those properties demonstrable rather than aspirational. The rest was mostly discipline — and a willingness to let "not yet" be the agent's most impressive answer.</p>
+      </div>
+
+      <footer class="article-footer">
+        <p>FlakeBrake is MIT-licensed and runs credential-free: <a href="https://github.com/dvellon/flakebrake">github.com/dvellon/flakebrake</a>. The <a href="./">project site</a> walks the full deterministic story, and <a href="https://github.com/dvellon/flakebrake/blob/main/docs/architecture.md">docs/architecture.md</a> maps the trust boundaries layer by layer.</p>
+      </footer>
+    </article>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-legal">
+        <span>© 2026 dvellon · Released under the <a href="https://github.com/dvellon/flakebrake/blob/main/LICENSE">MIT License</a></span>
+        <span>Built on TrueForge 0.1.4 · Reviewed with Qodo</span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
