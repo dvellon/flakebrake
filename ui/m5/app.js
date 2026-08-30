@@ -267,7 +267,8 @@ function renderProofCenter() {
   const ownerDenied = ownerDecisions.filter((item) => item.decision === "deny");
   const mechanicalDenials = state.approvals.filter((item) => item.source === "active_m2_denial");
   const verified = state.execution.terminalStatus === "terminal_verified" && state.execution.independentReadBackObserved;
-  const replayed = verified && (state.run.connection === "replayed" || reattachedTerminal);
+  const replayed = verified &&
+    (state.run.connection === "replayed" || state.mission.disconnectedAndResumed || reattachedTerminal);
 
   nodes["proof-center-status"].className = `pill ${verified ? "pill-verified" : state.execution.mutationCount > 0 ? "pill-pending" : "pill-neutral"}`;
   nodes["proof-center-status"].textContent = verified ? "Verified record" : state.execution.mutationCount > 0 ? "Read-back pending" : "Canonical basis";

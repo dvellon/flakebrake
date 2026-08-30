@@ -223,7 +223,7 @@ describe("M5 TrueForge harness ribbon", () => {
       serverVersion: "0.1.4",
       sdkVersion: "0.1.3",
       providerProfile: "Deterministic judge profile",
-      modelName: "m4-mission",
+      modelName: "flakebrake-deterministic/m4-mission",
       rootAgentName: "flakebrake-root-obligation-commander",
       mcpConfigured: [
         "factory-orders",
@@ -292,6 +292,30 @@ describe("M5 TrueForge harness ribbon", () => {
     };
     const failedHarness = await createPollingHarness(failedState, []);
     assert.equal(failedHarness.text("harness-state"), "Failed");
+  });
+
+  test("the proof center counts a genuine disconnect-resume as replay evidence", async () => {
+    const verifiedBase = uiProjection(idle, 2, "verified");
+    const resumedTerminal: M5JudgeState = {
+      ...verifiedBase,
+      mission: { ...verifiedBase.mission, disconnectedAndResumed: true },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const resumed = await createPollingHarness(resumedTerminal, []);
+    assert.match(
+      resumed.evaluate<string>("document.getElementById('proof-durable-proof').innerHTML"),
+      /attached to a durable replay/u,
+      "server-side disconnect-and-resume evidence marks continuity as observed",
+    );
+
+    const liveTerminal: M5JudgeState = {
+      ...verifiedBase,
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const live = await createPollingHarness(liveTerminal, []);
+    const liveProof = live.evaluate<string>("document.getElementById('proof-durable-proof').innerHTML");
+    assert.doesNotMatch(liveProof, /attached to a durable replay/u, "a live completion does not invent a disconnect");
+    assert.match(liveProof, /durable across refresh and restart/u);
   });
 });
 

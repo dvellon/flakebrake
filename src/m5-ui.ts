@@ -49,6 +49,7 @@ import {
 import { createStore } from "./store.js";
 import {
   DETERMINISTIC_MODEL_NAME,
+  DETERMINISTIC_MODEL_PROVIDER_NAME,
   FLAKEBRAKE_ROOT_AGENT_NAME,
   flakeBrakeRootAgentSpec,
   TRUEFORGE_SDK_VERSION,
@@ -232,14 +233,15 @@ export interface M5JudgeState {
 }
 
 const HARNESS_PROJECTION: M5JudgeState["harness"] = (() => {
-  const spec = flakeBrakeRootAgentSpec(DETERMINISTIC_MODEL_NAME);
+  const qualifiedModelName = `${DETERMINISTIC_MODEL_PROVIDER_NAME}/${DETERMINISTIC_MODEL_NAME}`;
+  const spec = flakeBrakeRootAgentSpec(qualifiedModelName);
   const mcpServers = spec.mcpServers ?? [];
   return {
     framework: "TrueForge",
     serverVersion: TRUEFORGE_SERVER_VERSION,
     sdkVersion: TRUEFORGE_SDK_VERSION,
     providerProfile: "Deterministic judge profile",
-    modelName: DETERMINISTIC_MODEL_NAME,
+    modelName: qualifiedModelName,
     rootAgentName: FLAKEBRAKE_ROOT_AGENT_NAME,
     mcpConfigured: mcpServers.map((server) => server.name),
     sandboxConfigured: spec.config?.sandbox?.enabled === true,
