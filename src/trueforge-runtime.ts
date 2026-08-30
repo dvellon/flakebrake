@@ -16,6 +16,7 @@ import {
 
 import { FACTORY_MCP_SERVICE_NAMES } from "./mcp.js";
 import type { RunningFactoryMcpHttpCluster } from "./mcp-http.js";
+import { retainM4RunnerCleanupDiagnostics } from "./m4-runner-lifecycle.js";
 
 export const TRUEFORGE_SERVER_VERSION = "0.1.4";
 export const TRUEFORGE_SDK_VERSION = "0.1.3";
@@ -29,6 +30,7 @@ export interface TrueForgeServerOptions {
   readonly sqlitePath: string;
   readonly localSandboxRootParent: string;
   readonly port?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface RunningTrueForgeServer {
@@ -47,7 +49,8 @@ export async function startTrueForgeServer(
 ): Promise<RunningTrueForgeServer> {
   requirePath(options.sqlitePath, "sqlitePath");
   requirePath(options.localSandboxRootParent, "localSandboxRootParent");
-  const port = options.port ?? (await allocateLoopbackPort());
+  throwIfAborted(options.signal);
+  const port = options.port ?? (await allocateLoopbackPort(options.signal));
   const cliPath = fileURLToPath(
     new URL(
       "../../node_modules/@truefoundry/trueforge/dist/cli.js",
@@ -55,54 +58,76 @@ export async function startTrueForgeServer(
     ),
   );
   const codeModeTempRoot = `/tmp/fbtf-${String(port)}`;
-  await mkdir(codeModeTempRoot, { recursive: true, mode: 0o700 });
-  const localSandboxCompatibility = await prepareLocalSandboxCompatibility(
-    options.localSandboxRootParent,
-  );
-  const child = spawn(process.execPath, [cliPath, "--port", String(port)], {
-    env: {
-      ...process.env,
-      HOST: "127.0.0.1",
-      PORT: String(port),
-      SQLITE_PATH: options.sqlitePath,
-      XDG_DATA_HOME: options.localSandboxRootParent,
-      TMPDIR: codeModeTempRoot,
-      TMP: codeModeTempRoot,
-      TEMP: codeModeTempRoot,
-      NODE_ENV: "production",
-      STANDALONE: "true",
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  child.stdin.end();
   const logs = new BoundedProcessLog();
-  child.stdout.on("data", (chunk: Buffer) => logs.append(chunk));
-  child.stderr.on("data", (chunk: Buffer) => logs.append(chunk));
   const baseUrl = `http://127.0.0.1:${String(port)}`;
+  let localSandboxCompatibility: LocalSandboxCompatibility | undefined;
+  let child: ChildProcessWithoutNullStreams | undefined;
   try {
-    await waitForTrueForge(baseUrl, child, logs);
+    await mkdir(codeModeTempRoot, { recursive: true, mode: 0o700 });
+    throwIfAborted(options.signal);
+    localSandboxCompatibility = await prepareLocalSandboxCompatibility(
+      options.localSandboxRootParent,
+    );
+    throwIfAborted(options.signal);
+    child = spawn(process.execPath, [cliPath, "--port", String(port)], {
+      env: {
+        ...process.env,
+        HOST: "127.0.0.1",
+        PORT: String(port),
+        SQLITE_PATH: options.sqlitePath,
+        XDG_DATA_HOME: options.localSandboxRootParent,
+        TMPDIR: codeModeTempRoot,
+        TMP: codeModeTempRoot,
+        TEMP: codeModeTempRoot,
+        NODE_ENV: "production",
+        STANDALONE: "true",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stdin.end();
+    child.stdout.on("data", (chunk: Buffer) => logs.append(chunk));
+    child.stderr.on("data", (chunk: Buffer) => logs.append(chunk));
+    await waitForTrueForge(baseUrl, child, logs, options.signal);
   } catch (error: unknown) {
-    await stopChild(child);
-    await localSandboxCompatibility.close();
-    await rm(codeModeTempRoot, { recursive: true, force: true });
+    const cleanupFailures = await closeTrueForgeResources(
+      child,
+      localSandboxCompatibility,
+      codeModeTempRoot,
+      options.signal?.aborted === true,
+    );
+    if (error instanceof Error) {
+      retainM4RunnerCleanupDiagnostics(error, cleanupFailures);
+    }
     throw error;
   }
+  const runningChild = child;
+  const runningSandboxCompatibility = localSandboxCompatibility;
   const client = new TrueForge({ baseUrl, auth: false, maxRetries: 0 });
-  let closed = false;
+  let closePromise: Promise<void> | undefined;
   return {
     version: TRUEFORGE_SERVER_VERSION,
     host: "127.0.0.1",
     port,
     baseUrl,
     client,
-    process: child,
+    process: runningChild,
     safeDiagnosticLog: () => logs.safeText(),
     close: async () => {
-      if (closed) return;
-      closed = true;
-      await stopChild(child);
-      await localSandboxCompatibility.close();
-      await rm(codeModeTempRoot, { recursive: true, force: true });
+      closePromise ??= (async () => {
+        const cleanupFailures = await closeTrueForgeResources(
+          runningChild,
+          runningSandboxCompatibility,
+          codeModeTempRoot,
+          options.signal?.aborted === true,
+        );
+        if (cleanupFailures.length > 0) {
+          throw new AggregateError(
+            cleanupFailures,
+            "TrueForge deterministic runtime teardown failed",
+          );
+        }
+      })();
+      await closePromise;
     },
   };
 }
@@ -340,65 +365,158 @@ function connectorDescription(
   }
 }
 
-async function allocateLoopbackPort(): Promise<number> {
+async function allocateLoopbackPort(signal?: AbortSignal): Promise<number> {
+  throwIfAborted(signal);
   const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    server.close();
-    throw new Error("Unable to allocate a loopback port");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const settle = (outcome: "resolve" | "reject", error?: unknown): void => {
+        if (settled) return;
+        settled = true;
+        server.off("error", onError);
+        signal?.removeEventListener("abort", onAbort);
+        if (outcome === "resolve") resolve();
+        else reject(error);
+      };
+      const onError = (error: Error): void => settle("reject", error);
+      const onAbort = (): void => settle("reject", abortReason(signal));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted === true) {
+        onAbort();
+        return;
+      }
+      server.once("error", onError);
+      server.listen(
+        { host: "127.0.0.1", port: 0, ...(signal === undefined ? {} : { signal }) },
+        () => settle("resolve"),
+      );
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Unable to allocate a loopback port");
+    }
+    return address.port;
+  } finally {
+    await closeListeningServer(server);
   }
-  const port = address.port;
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-  return port;
 }
 
 async function waitForTrueForge(
   baseUrl: string,
   child: ChildProcessWithoutNullStreams,
   logs: BoundedProcessLog,
+  signal?: AbortSignal,
 ): Promise<void> {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
+    throwIfAborted(signal);
     if (child.exitCode !== null) {
       throw new Error(
         `TrueForge 0.1.4 exited during startup (${String(child.exitCode)}): ${logs.safeText()}`,
       );
     }
     try {
-      const response = await fetch(`${baseUrl}/healthz`);
+      const response = await fetch(`${baseUrl}/healthz`, {
+        ...(signal === undefined ? {} : { signal }),
+      });
       if (response.ok && (await response.text()) === "OK!") return;
-    } catch {
+    } catch (error: unknown) {
+      if (signal?.aborted === true) throw abortReason(signal);
       // Startup is asynchronous; retry until the bounded deadline.
     }
-    await delay(50);
+    await abortableDelay(50, signal);
   }
   throw new Error(`TrueForge 0.1.4 startup timed out: ${logs.safeText()}`);
 }
 
-async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+async function stopChild(
+  child: ChildProcessWithoutNullStreams,
+  cancellation = false,
+): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGINT");
+  child.kill(cancellation ? "SIGTERM" : "SIGINT");
   const exited = await Promise.race([
     new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
-    delay(5_000).then(() => false),
+    delay(cancellation ? 1_000 : 5_000).then(() => false),
   ]);
   if (!exited && child.exitCode === null) {
     child.kill("SIGTERM");
-    await Promise.race([
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
-      delay(5_000),
+    const terminated = await Promise.race([
+      new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
+      delay(cancellation ? 1_000 : 5_000).then(() => false),
     ]);
+    if (!terminated && child.exitCode === null) {
+      child.kill("SIGKILL");
+      const killed = await Promise.race([
+        new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
+        delay(2_000).then(() => false),
+      ]);
+      if (!killed && child.exitCode === null) {
+        throw new Error("TrueForge child did not exit after bounded termination");
+      }
+    }
   }
 }
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal === undefined) return delay(milliseconds);
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function closeTrueForgeResources(
+  child: ChildProcessWithoutNullStreams | undefined,
+  localSandboxCompatibility: LocalSandboxCompatibility | undefined,
+  codeModeTempRoot: string,
+  cancellation = false,
+): Promise<readonly unknown[]> {
+  const failures: unknown[] = [];
+  for (const close of [
+    child === undefined ? undefined : () => stopChild(child, cancellation),
+    localSandboxCompatibility === undefined
+      ? undefined
+      : () => localSandboxCompatibility.close(),
+    () => rm(codeModeTempRoot, { recursive: true, force: true }),
+  ]) {
+    if (close === undefined) continue;
+    try {
+      await close();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+  }
+  return failures;
+}
+
+function closeListeningServer(server: import("node:net").Server): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw abortReason(signal);
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
 function requirePath(value: string, field: string): void {

@@ -106,6 +106,29 @@ The original rush-order hero remains the default and is unchanged. See the
 [capacity-shock scenario note](docs/capacity-shock-scenario.md) for exact fixture
 numbers, alternatives, durable counts, and the stale-basis explanation.
 
+## Challenge FlakeBrake assurance lab
+
+The judge UI also includes an optional, clearly separated **Challenge
+FlakeBrake** panel. It is a deterministic assurance demonstration, not a
+replacement for the normal hero mission. One keyboard-accessible control runs
+six bounded cases against separate invocation-owned M2 and factory stores:
+
+- admission, grant, owner-decision, and plan identity substitution;
+- stale authoritative factory compare-and-swap basis;
+- conflicting reuse of an execution-attempt identity;
+- a caller-forged mutation receipt presented as verified success;
+- an equivalent v2 effect representation after a durable v1 denial; and
+- a valid replay through the alternate schedule-change adapter as a positive
+control.
+
+Every case uses the existing public store or `factory-change-control` MCP path.
+The panel shows the redacted action, authoritative reason, enforced rule, all
+eight requested before/after counts, and SHA-256 digests of complete canonical
+M2 + factory snapshots. A rejection passes only when every table and row is
+equal before and after. The replay control additionally requires the original
+result and receipt, one mutation, and no duplicate actual facts. It uses no
+credentials or external providers and exposes no filesystem paths.
+
 ## Architecture overview
 
 FlakeBrake is deliberately layered:
@@ -213,6 +236,27 @@ bindings fail closed.
 The M5 client also uses monotonic request generations and durable revisions so
 an older poll cannot overwrite a newer approval or regress terminal success.
 
+## Canonical mission evidence
+
+After terminal verification, the execution ledger exposes **Download evidence
+JSON**. The read-only `/api/evidence` endpoint returns a versioned canonical
+Mission Evidence Bundle and a SHA-256 digest of its exact payload. The digest is
+a commitment to those bytes; it does not authenticate the producer.
+
+Verify a downloaded bundle by itself, or require an exact match to the three
+durable source databases:
+
+```bash
+npm run evidence:verify -- --bundle /absolute/path/mission-evidence.json
+npm run evidence:verify -- \
+  --bundle /absolute/path/mission-evidence.json \
+  --data-dir /absolute/path/to/m5-data
+```
+
+The verifier opens source databases read-only and validates canonical encoding,
+schema, digest, linkage, exact counts, independent read-back, and terminal
+consistency. See [the evidence format and trust boundary](docs/mission-evidence.md).
+
 ## Deterministic judge mode
 
 ### Prerequisites
@@ -261,6 +305,27 @@ Without M0 configuration, the complete `npm test` run intentionally skips the
 two genuine-provider tests. All deterministic M1–M5 tests still run. The browser
 command drives the hero mission, recovery, owner decisions, verification,
 refresh/reconnect, keyboard focus, tablet layout, and clean shutdown in Firefox.
+
+### Explicit recovery demonstration
+
+The optional recovery demonstration is a separate mode and cannot be activated
+from the standard hero UI. It uses fresh invocation-owned SQLite databases,
+binds only to loopback, and deliberately closes its owning runner at either of
+two exact deterministic boundaries:
+
+- after the M2 execution fence is durable and before the factory mutation;
+- after the factory transaction commits and before M2 binds its receipt.
+
+Start it on its dedicated default port:
+
+```bash
+npm run recovery:demo
+```
+
+Open `http://127.0.0.1:4177`, select a boundary, then advance the visible
+interruption, restart, recovery/verification, and completed-replay stages. No
+credentials or process-wide kill commands are used. The focused browser check
+is `npm run test:recovery:browser`.
 
 ## Optional genuine OpenAI/Daytona mode
 

@@ -34,6 +34,7 @@ import {
   ExecutionAttemptConflictError,
   StatefulInputError,
 } from "./stateful-domain.js";
+import { reachRecoveryDemoFactoryCommitBoundary } from "./recovery-demo-seam.js";
 
 export type FactoryScheduleReservation =
   | {
@@ -315,8 +316,8 @@ export class SyntheticFactoryEnvironment {
       }
     }
 
-    return m2Store.runWithExecutionFence(fenceId, (fence) =>
-      inImmediateTransaction(this.#database, () => {
+    return m2Store.runWithExecutionFence(fenceId, (fence) => {
+      const completed = inImmediateTransaction(this.#database, () => {
         const prior = this.#readExecutionResult(request.executionAttemptId);
         if (prior !== null) {
           if (prior.requestBytes !== canonicalRequestBytes) {
@@ -464,8 +465,12 @@ export class SyntheticFactoryEnvironment {
           );
         const response = deepFreeze({ replayed: false, result });
         return { value: response, binding: resultBinding(result) };
-      }),
-    );
+      });
+      if (!completed.value.replayed) {
+        reachRecoveryDemoFactoryCommitBoundary(completed.value.result);
+      }
+      return completed;
+    });
   }
 
   #seedIfEmpty(): void {

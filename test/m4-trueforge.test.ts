@@ -161,7 +161,7 @@ interface HttpFixture {
 describe("M4 genuine Streamable HTTP MCP transport", () => {
   let fixture: HttpFixture;
 
-  before(async () => {
+  before(async (context) => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-http-"));
     const m2Path = join(directory, "m2.sqlite");
     const factoryPath = join(directory, "factory.sqlite");
@@ -185,6 +185,7 @@ describe("M4 genuine Streamable HTTP MCP transport", () => {
         factoryDatabasePath: factoryPath,
         now: () => HERO_HORIZON_END,
         enableM4Tools: true,
+        signal: context.signal,
       }),
     };
   });
@@ -424,7 +425,7 @@ describe("M4 genuine TrueForge deterministic mission", () => {
   let restarted: DeterministicM4MissionResult;
 
   before(
-    async () => {
+    async (context) => {
       directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-trueforge-"));
       options = {
         m2DatabasePath: join(directory, "m2.sqlite"),
@@ -432,6 +433,7 @@ describe("M4 genuine TrueForge deterministic mission", () => {
         missionDatabasePath: join(directory, "mission.sqlite"),
         trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
         localSandboxRootParent: join(directory, "trueforge-data"),
+        signal: context.signal,
       };
       first = await runDeterministicM4Mission(options);
       restarted = await runDeterministicM4Mission(options);
@@ -1230,7 +1232,7 @@ describe("M4 genuine TrueForge deterministic mission", () => {
   test(
     "14. a lost approval response recovers the exact completed successor without a sibling",
     { timeout: 120_000 },
-    async () => {
+    async (context) => {
       const paused = first.mission.approvals[0];
       assert.ok(paused);
       const store = new M4MissionStore({
@@ -1243,7 +1245,10 @@ describe("M4 genuine TrueForge deterministic mission", () => {
         store.close();
       }
 
-      const recovered = await runDeterministicM4Mission(options);
+      const recovered = await runDeterministicM4Mission({
+        ...options,
+        signal: context.signal,
+      });
       assert.equal(
         recovered.trueforgeModelRequests,
         0,
@@ -2017,7 +2022,7 @@ test("18. grouped approval calls are denied and retried only sequentially", asyn
 test(
   "13. process restarts recover running, paused, claimed, and committed mission boundaries",
   { timeout: 180_000 },
-  async () => {
+  async (context) => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-m4-recovery-"));
     const base: DeterministicM4MissionOptions = {
       m2DatabasePath: join(directory, "m2.sqlite"),
@@ -2026,6 +2031,7 @@ test(
       trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
       localSandboxRootParent: join(directory, "trueforge-data"),
       disconnectInitialStreamAfterEvents: 10_000,
+      signal: context.signal,
     };
     const boundaries = [
       "running",
@@ -2091,7 +2097,7 @@ test(
   },
 );
 
-test("Qodo R1.1 live mode without an external owner fails closed before mutation", async () => {
+test("Qodo R1.1 live mode without an external owner fails closed before mutation", async (context) => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-owner-"));
   const options = liveOptions(directory, {
     m0TrueForgeDatabasePath: join(directory, "missing-m0.sqlite"),
@@ -2111,6 +2117,7 @@ test("Qodo R1.1 live mode without an external owner fails closed before mutation
       missionDatabasePath: join(wrongMissionDirectory, "mission.sqlite"),
       trueforgeDatabasePath: join(wrongMissionDirectory, "trueforge.sqlite"),
       localSandboxRootParent: join(wrongMissionDirectory, "sandboxes"),
+      signal: context.signal,
       ownerDecisionProvider: (request: M4OwnerApprovalRequest) => ({
         ...m4OwnerDecisionResponse(request, "test-owner/wrong-mission", {
           status: "allow",
@@ -2162,6 +2169,7 @@ test(
       trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
       localSandboxRootParent: join(directory, "sandboxes"),
       missionId: M4_LIVE_MISSION_ID,
+      signal: context.signal,
     };
     let ownerCallCount = 0;
     const options = {
@@ -2436,13 +2444,14 @@ test("Qodo R1.5 CLI rejects every malformed value-taking flag before allocation"
 test(
   "Qodo R1.6 replacing a database at the bound pathname fails before mutation",
   { timeout: 180_000 },
-  async () => {
+  async (context) => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-incarnation-"));
     const options = liveOptions(directory);
     try {
       await runDeterministicM4Mission({
         ...options,
         missionId: "mission/qodo-database-incarnation",
+        signal: context.signal,
       });
       const original = join(directory, "original-m2.sqlite");
       renameSync(options.m2DatabasePath, original);
@@ -2457,6 +2466,7 @@ test(
         runDeterministicM4Mission({
           ...options,
           missionId: "mission/qodo-database-incarnation",
+          signal: context.signal,
         }),
         /database instance identity.*conflicts/u,
       );
@@ -2484,6 +2494,7 @@ test(
         runDeterministicM4Mission({
           ...options,
           missionId: "mission/qodo-database-incarnation",
+          signal: context.signal,
         }),
         /database instance identity.*conflicts/u,
       );
@@ -2970,18 +2981,19 @@ for (const schedule of [
   test(
     `Qodo R2.2 ${schedule} invalidates approval with complete zero-mutation snapshots`,
     { timeout: 180_000 },
-    async () => testDatabaseSwapSchedule(schedule),
+    async (context) => testDatabaseSwapSchedule(schedule, context.signal),
   );
 }
 
 test(
   "Qodo R2.2 no-swap control reaches one terminal mutation",
   { timeout: 180_000 },
-  async () => {
+  async (context) => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-qodo-r2-no-swap-"));
     try {
       const completed = await runDeterministicM4Mission({
         ...liveOptions(directory),
+        signal: context.signal,
         ownerDecisionProvider: deterministicM4OwnerDecisions(
           "test-owner/qodo-r2-no-swap",
         ),
@@ -3892,6 +3904,7 @@ type DatabaseSwapSchedule =
 
 async function testDatabaseSwapSchedule(
   schedule: DatabaseSwapSchedule,
+  signal: AbortSignal,
 ): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), `flakebrake-qodo-r2-${schedule}-`));
   const originalM2 = join(directory, "original-m2.sqlite");
@@ -3911,6 +3924,7 @@ async function testDatabaseSwapSchedule(
     trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
     localSandboxRootParent: join(directory, "sandboxes"),
     missionId: `mission/qodo-r2-${schedule}`,
+    signal,
   };
   const policy = deterministicM4OwnerDecisions(
     `test-owner/qodo-r2-${schedule}`,
