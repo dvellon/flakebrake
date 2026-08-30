@@ -30,7 +30,12 @@ import {
   type MissionEvidenceBuildOptions,
 } from "../src/index.js";
 import { runMissionEvidenceCli } from "../src/mission-evidence-cli.js";
-import { createMissionEvidenceDatabaseLifecycle } from "../src/mission-evidence.js";
+import {
+  createMissionEvidenceDatabaseLifecycle,
+  verifyDefaultMissionEvidenceDatabaseCleanup,
+  verifyMissionEvidenceBytesWithLifecycle,
+} from "../src/mission-evidence.js";
+import { requireVerifiedEvidenceCleanup } from "../src/mission-evidence-lifecycle.js";
 
 describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-evidence-test-"));
@@ -157,6 +162,17 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     assert.match(result.payloadDigest, /^sha256:[0-9a-f]{64}$/u);
     assert.equal(result.canonicalByteLength, Buffer.byteLength(canonicalBytes));
     assert.equal(result.databaseMatch, true);
+    assert.deepEqual(verifyDefaultMissionEvidenceDatabaseCleanup(), {
+      status: "verified_clean",
+      proof: "lifecycle_ownership",
+      lifecycle: {
+        activeOperationCount: 0,
+        retainedOperationCount: 0,
+        ownedHandleCount: 0,
+        closed: false,
+      },
+      descriptorCount: null,
+    });
     assert.deepEqual(durableSnapshot(options), beforeVerification);
   });
 
@@ -288,6 +304,53 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
       ownedHandleCount: 0,
       closed: true,
     });
+    assert.equal(lifecycle.verifyCleanup(null).status, "verified_clean");
+    assert.deepEqual(durableSnapshot(options), beforeVerification);
+  });
+
+  test("direct database-backed verification retains failed cleanup until retry", () => {
+    const beforeVerification = durableSnapshot(options);
+    const owned = new Set<DatabaseSync>();
+    let trueforgeCloseAttempts = 0;
+    let failTrueforgeCloseOnce = true;
+    const lifecycle = createMissionEvidenceDatabaseLifecycle((request, openDefault) => {
+      const database = openDefault();
+      let wrapper!: DatabaseSync;
+      wrapper = new Proxy(database, {
+        get(target, property) {
+          if (property === "close") {
+            return (): void => {
+              if (request.key === "trueforge") {
+                trueforgeCloseAttempts += 1;
+                if (failTrueforgeCloseOnce) {
+                  failTrueforgeCloseOnce = false;
+                  throw new Error("injected direct-verifier TrueForge close failure");
+                }
+              }
+              target.close();
+              owned.delete(wrapper);
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as DatabaseSync;
+      owned.add(wrapper);
+      return wrapper;
+    });
+
+    assert.throws(
+      () => verifyMissionEvidenceBytesWithLifecycle(canonicalBytes, options, lifecycle),
+      /handle cleanup failed/u,
+    );
+    assert.equal(trueforgeCloseAttempts, 1);
+    assert.equal(owned.size, 1);
+    assert.equal(lifecycle.verifyCleanup(null).status, "cleanup_incomplete");
+
+    lifecycle.drain();
+    assert.equal(trueforgeCloseAttempts, 2);
+    assert.equal(owned.size, 0);
+    requireVerifiedEvidenceCleanup(lifecycle.verifyCleanup(null));
     assert.deepEqual(durableSnapshot(options), beforeVerification);
   });
 
@@ -612,7 +675,7 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     assert.equal(count, 2);
   });
 
-  test("portable reopen and cleanup integration still runs without procfs", () => {
+  test("unavailable procfs requires portable verified ownership cleanup", () => {
     let unavailableProbeCalls = 0;
     const unavailableCount = (path: string): number | null => {
       unavailableProbeCalls += 1;
@@ -874,8 +937,8 @@ function exerciseRejectedOpenCleanup(
           /(?:could not open mission database read-only|file is not a database)/u,
         );
       }
-      assertExactDescriptorCountWhenAvailable(probe.m2DatabasePath, descriptorCount);
-      assertExactDescriptorCountWhenAvailable(
+      assertEvidenceCleanupVerifiedForPath(probe.m2DatabasePath, descriptorCount);
+      assertEvidenceCleanupVerifiedForPath(
         probe.missionDatabasePath,
         descriptorCount,
       );
@@ -891,7 +954,7 @@ function exerciseRejectedOpenCleanup(
         /database instance identities conflict/u,
       );
       for (const path of databasePaths(probe)) {
-        assertExactDescriptorCountWhenAvailable(path, descriptorCount);
+        assertEvidenceCleanupVerifiedForPath(path, descriptorCount);
         const reopened = new DatabaseSync(path, { readOnly: true });
         try {
           const row = reopened.prepare("SELECT 1 AS ready").get();
@@ -899,7 +962,7 @@ function exerciseRejectedOpenCleanup(
         } finally {
           reopened.close();
         }
-        assertExactDescriptorCountWhenAvailable(path, descriptorCount);
+        assertEvidenceCleanupVerifiedForPath(path, descriptorCount);
       }
       assert.equal(exportMissionEvidenceBundle(source), expectedBundle);
 
@@ -911,12 +974,14 @@ function exerciseRejectedOpenCleanup(
   }
 }
 
-function assertExactDescriptorCountWhenAvailable(
+function assertEvidenceCleanupVerifiedForPath(
   path: string,
   descriptorCount: (path: string) => number | null,
 ): void {
   const count = descriptorCount(path);
-  if (count !== null) assert.equal(count, 0, `open descriptor leaked for ${path}`);
+  requireVerifiedEvidenceCleanup(
+    verifyDefaultMissionEvidenceDatabaseCleanup(count),
+  );
 }
 
 function databasePaths(paths: MissionEvidenceBuildOptions): readonly string[] {

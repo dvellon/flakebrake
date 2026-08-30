@@ -16,6 +16,7 @@ import { stableTupleId } from "./identity.js";
 import {
   EvidenceHandleLifecycleManager,
   withEvidenceHandleOwnership,
+  type EvidenceCleanupVerification,
   type EvidenceHandleRequest,
 } from "./mission-evidence-lifecycle.js";
 import {
@@ -542,6 +543,13 @@ const defaultMissionEvidenceDatabaseLifecycle =
 /** @internal Bounded drain for direct database-backed callers at shutdown. */
 export function drainDefaultMissionEvidenceDatabaseLifecycle(): void {
   defaultMissionEvidenceDatabaseLifecycle.drain();
+}
+
+/** @internal Cross-platform cleanup proof for direct evidence operations. */
+export function verifyDefaultMissionEvidenceDatabaseCleanup(
+  descriptorCount: number | null = null,
+): EvidenceCleanupVerification {
+  return defaultMissionEvidenceDatabaseLifecycle.verifyCleanup(descriptorCount);
 }
 
 /**

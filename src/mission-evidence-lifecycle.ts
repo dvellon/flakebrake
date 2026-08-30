@@ -22,6 +22,27 @@ export interface EvidenceHandleLifecycleSnapshot {
   readonly closed: boolean;
 }
 
+export type EvidenceCleanupVerification =
+  | {
+      readonly status: "verified_clean";
+      readonly proof:
+        | "lifecycle_ownership"
+        | "descriptor_count"
+        | "lifecycle_and_descriptor";
+      readonly lifecycle: EvidenceHandleLifecycleSnapshot | null;
+      readonly descriptorCount: number | null;
+    }
+  | {
+      readonly status: "verification_unavailable";
+      readonly lifecycle: null;
+      readonly descriptorCount: null;
+    }
+  | {
+      readonly status: "cleanup_incomplete";
+      readonly lifecycle: EvidenceHandleLifecycleSnapshot | null;
+      readonly descriptorCount: number | null;
+    };
+
 type OwnedEntry<H extends EvidenceOwnedHandle> = {
   readonly key: string;
   readonly handle: H;
@@ -159,6 +180,92 @@ function cleanupErrorsFromUnknown(error: unknown): readonly Error[] {
   ]);
 }
 
+class EvidenceCleanupVerificationError extends Error {
+  public constructor(
+    public readonly verification: Exclude<
+      EvidenceCleanupVerification,
+      { readonly status: "verified_clean" }
+    >,
+  ) {
+    super(
+      verification.status === "verification_unavailable"
+        ? "evidence cleanup verification is unavailable"
+        : "evidence cleanup remains incomplete or operation-owned handles are live",
+    );
+    this.name = "EvidenceCleanupVerificationError";
+  }
+}
+
+/**
+ * Combine the portable lifecycle proof with optional process-descriptor
+ * evidence. At least one proof must be available, and either proof can expose
+ * an incomplete cleanup. Filesystem path operations are deliberately absent.
+ */
+export function evaluateEvidenceCleanup(
+  lifecycle: EvidenceHandleLifecycleSnapshot | null,
+  descriptorCount: number | null,
+): EvidenceCleanupVerification {
+  if (
+    descriptorCount !== null &&
+    (!Number.isSafeInteger(descriptorCount) || descriptorCount < 0)
+  ) {
+    throw new TypeError("evidence descriptor count must be a nonnegative integer or null");
+  }
+
+  const lifecycleIncomplete =
+    lifecycle !== null &&
+    (lifecycle.activeOperationCount > 0 ||
+      lifecycle.retainedOperationCount > 0 ||
+      lifecycle.ownedHandleCount > 0);
+  if (lifecycleIncomplete || (descriptorCount !== null && descriptorCount > 0)) {
+    return Object.freeze({
+      status: "cleanup_incomplete",
+      lifecycle,
+      descriptorCount,
+    });
+  }
+  if (lifecycle !== null) {
+    return Object.freeze({
+      status: "verified_clean",
+      proof:
+        descriptorCount === null
+          ? "lifecycle_ownership"
+          : "lifecycle_and_descriptor",
+      lifecycle,
+      descriptorCount,
+    });
+  }
+  if (descriptorCount !== null) {
+    return Object.freeze({
+      status: "verified_clean",
+      proof: "descriptor_count",
+      lifecycle: null,
+      descriptorCount,
+    });
+  }
+  return Object.freeze({
+    status: "verification_unavailable",
+    lifecycle: null,
+    descriptorCount: null,
+  });
+}
+
+/** Fail closed unless cleanup has at least one complete independent proof. */
+export function requireVerifiedEvidenceCleanup(
+  verification: EvidenceCleanupVerification,
+  primaryError?: unknown,
+): asserts verification is Extract<
+  EvidenceCleanupVerification,
+  { readonly status: "verified_clean" }
+> {
+  if (verification.status === "verified_clean") return;
+  const diagnostic = new EvidenceCleanupVerificationError(verification);
+  if (primaryError !== undefined) {
+    throw attachCleanupErrors(primaryError, [diagnostic]);
+  }
+  throw diagnostic;
+}
+
 /**
  * Internal outer owner for evidence-operation handle scopes. Each operation has
  * an isolated lower-level owner. A scope whose close fails moves from active to
@@ -181,6 +288,12 @@ export class EvidenceHandleLifecycleManager<H extends EvidenceOwnedHandle> {
       ownedHandleCount: this.#ownedHandleCount(),
       closed: this.#closed,
     });
+  }
+
+  public verifyCleanup(
+    descriptorCount: number | null = null,
+  ): EvidenceCleanupVerification {
+    return evaluateEvidenceCleanup(this.snapshot(), descriptorCount);
   }
 
   public run<Result>(operation: (scope: EvidenceHandleScope<H>) => Result): Result {

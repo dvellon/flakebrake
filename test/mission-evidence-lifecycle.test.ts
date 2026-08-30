@@ -8,7 +8,9 @@ import { describe, test } from "node:test";
 import {
   EvidenceHandleLifecycleManager,
   EvidenceHandleOwnership,
+  evaluateEvidenceCleanup,
   evidenceCleanupErrors,
+  requireVerifiedEvidenceCleanup,
   withEvidenceHandleOwnership,
   withEvidenceLifecycleShutdown,
   type EvidenceHandleRequest,
@@ -213,9 +215,20 @@ describe("mission evidence database-handle lifecycle", () => {
       ownedHandleCount: 1,
       closed: false,
     });
+    assert.equal(manager.verifyCleanup(null).status, "cleanup_incomplete");
+    assert.throws(
+      () => requireVerifiedEvidenceCleanup(manager.verifyCleanup(null)),
+      /cleanup remains incomplete/u,
+    );
 
     manager.drain();
     assert.equal(manager.snapshot().ownedHandleCount, 0);
+    assert.deepEqual(manager.verifyCleanup(null), {
+      status: "verified_clean",
+      proof: "lifecycle_ownership",
+      lifecycle: manager.snapshot(),
+      descriptorCount: null,
+    });
     const mission = factory.handles.find((handle) => handle.key === "mission");
     assert.equal(mission?.closeAttempts, 2);
     assert.equal(mission?.successfulCloses, 1);
@@ -235,6 +248,7 @@ describe("mission evidence database-handle lifecycle", () => {
     assert.equal(manager.snapshot().ownedHandleCount, 1);
     assert.throws(() => manager.drain(), /handle cleanup failed/u);
     assert.equal(manager.snapshot().ownedHandleCount, 1);
+    assert.equal(manager.verifyCleanup(null).status, "cleanup_incomplete");
     assert.equal(factory.handles.find((handle) => handle.key === "trueforge")?.closeAttempts, 2);
   });
 
@@ -307,6 +321,43 @@ describe("mission evidence database-handle lifecycle", () => {
     assertBalanced(factory);
   });
 
+  test("unavailable preferred verification distinguishes live, clean, and unverified ownership", () => {
+    const factory = new CountingFactory();
+    const manager = lifecycle(factory);
+    withEvidenceHandleOwnership(manager, (scope) => {
+      scope.acquire(FOUR_DATABASES[0]);
+      const live = manager.verifyCleanup(null);
+      assert.equal(live.status, "cleanup_incomplete");
+      assert.throws(
+        () => requireVerifiedEvidenceCleanup(live),
+        /cleanup remains incomplete/u,
+      );
+    });
+
+    const clean = manager.verifyCleanup(null);
+    assert.equal(clean.status, "verified_clean");
+    assert.doesNotThrow(() => requireVerifiedEvidenceCleanup(clean));
+
+    const unavailable = evaluateEvidenceCleanup(null, null);
+    assert.deepEqual(unavailable, {
+      status: "verification_unavailable",
+      lifecycle: null,
+      descriptorCount: null,
+    });
+    assert.throws(
+      () => requireVerifiedEvidenceCleanup(unavailable),
+      /verification is unavailable/u,
+    );
+
+    const primary = new Error("primary evidence verification failure");
+    assert.throws(
+      () => requireVerifiedEvidenceCleanup(unavailable, primary),
+      (error: unknown) => error === primary,
+    );
+    assert.equal(evidenceCleanupErrors(primary).length, 1);
+    assertBalanced(factory);
+  });
+
   test("a deliberately leaked idle handle defeats filesystem-only evidence but not ownership accounting", () => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-idle-handle-"));
     const databasePath = join(directory, "idle.sqlite");
@@ -315,43 +366,50 @@ describe("mission evidence database-handle lifecycle", () => {
     seeded.exec("CREATE TABLE proof (value INTEGER NOT NULL)");
     seeded.close();
 
-    const ownership = new EvidenceHandleOwnership<DatabaseSync>();
-    ownership.acquire("idle-read-only", () =>
+    const manager = new EvidenceHandleLifecycleManager<DatabaseSync>(() =>
       new DatabaseSync(databasePath, { readOnly: true }),
     );
     try {
-      if (process.platform === "win32") {
-        // Deterministically model the successful POSIX fallback on Windows;
-        // direct ownership remains the assertion on every platform.
-        const virtualFiles = new Set([databasePath]);
-        assert.equal(virtualFiles.delete(databasePath), true);
-        virtualFiles.add(movedPath);
-        assert.equal(virtualFiles.delete(movedPath), true);
-        virtualFiles.add(databasePath);
-        assert.equal(virtualFiles.delete(databasePath), true);
-        virtualFiles.add(databasePath);
-        assert.equal(virtualFiles.has(databasePath), true);
-      } else {
-        renameSync(databasePath, movedPath);
-        renameSync(movedPath, databasePath);
-        rmSync(databasePath);
-        const replacement = new DatabaseSync(databasePath);
-        replacement.exec("CREATE TABLE replacement (value INTEGER NOT NULL)");
-        replacement.close();
-        const reopened = new DatabaseSync(databasePath, { readOnly: true });
-        assert.equal(
-          reopened.prepare("SELECT COUNT(*) AS count FROM replacement").get()?.["count"],
-          0,
-        );
-        reopened.close();
-      }
+      withEvidenceHandleOwnership(manager, (scope) => {
+        scope.acquire({
+          key: "idle-read-only",
+          path: databasePath,
+          label: "idle read-only",
+        });
+        if (process.platform === "win32") {
+          // Deterministically model the successful POSIX fallback on Windows;
+          // direct ownership remains the assertion on every platform.
+          const virtualFiles = new Set([databasePath]);
+          assert.equal(virtualFiles.delete(databasePath), true);
+          virtualFiles.add(movedPath);
+          assert.equal(virtualFiles.delete(movedPath), true);
+          virtualFiles.add(databasePath);
+          assert.equal(virtualFiles.delete(databasePath), true);
+          virtualFiles.add(databasePath);
+          assert.equal(virtualFiles.has(databasePath), true);
+        } else {
+          renameSync(databasePath, movedPath);
+          renameSync(movedPath, databasePath);
+          rmSync(databasePath);
+          const replacement = new DatabaseSync(databasePath);
+          replacement.exec("CREATE TABLE replacement (value INTEGER NOT NULL)");
+          replacement.close();
+          const reopened = new DatabaseSync(databasePath, { readOnly: true });
+          assert.equal(
+            reopened.prepare("SELECT COUNT(*) AS count FROM replacement").get()?.["count"],
+            0,
+          );
+          reopened.close();
+        }
 
-      assert.throws(
-        () => assert.equal(ownership.ownedCount, 0, "operation-owned handle count"),
-        /operation-owned handle count/u,
-      );
+        assert.equal(manager.verifyCleanup(null).status, "cleanup_incomplete");
+        assert.throws(
+          () => requireVerifiedEvidenceCleanup(manager.verifyCleanup(null)),
+          /cleanup remains incomplete/u,
+        );
+      });
+      assert.equal(manager.verifyCleanup(null).status, "verified_clean");
     } finally {
-      assert.deepEqual(ownership.release(), []);
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -426,6 +484,7 @@ describe("mission evidence database-handle lifecycle", () => {
           ownedHandleCount: 2,
           closed: false,
         });
+        assert.equal(manager.verifyCleanup(null).status, "cleanup_incomplete");
         return "inner";
       });
       assert.equal(inner, "inner");
@@ -437,6 +496,7 @@ describe("mission evidence database-handle lifecycle", () => {
     assert.equal(result, "outer");
     assert.deepEqual(factory.closeOrder, ["factory", "m2"]);
     assert.equal(manager.snapshot().ownedHandleCount, 0);
+    assert.equal(manager.verifyCleanup(null).status, "verified_clean");
     assertBalanced(factory);
   });
 });

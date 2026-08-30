@@ -1556,6 +1556,7 @@ test("M5 evidence readiness/export failures retain cleanup until service shutdow
       message: "The request failed safely",
     });
     assert.equal(lifecycle.snapshot().ownedHandleCount, 1);
+    assert.equal(lifecycle.verifyCleanup(null).status, "cleanup_incomplete");
     assert.equal(owned.size, 1);
 
     // A later safe request drains only the failed callback before opening a new
@@ -1564,6 +1565,7 @@ test("M5 evidence readiness/export failures retain cleanup until service shutdow
     assert.equal(retry.status, 200);
     assert.match(retry.headers.get("content-type") ?? "", /application\/json/u);
     assert.equal(lifecycle.snapshot().ownedHandleCount, 0);
+    assert.equal(lifecycle.verifyCleanup(null).status, "verified_clean");
     assert.equal(owned.size, 0);
 
     // Fail the final TrueForge close in the real four-database export. The
@@ -1572,6 +1574,7 @@ test("M5 evidence readiness/export failures retain cleanup until service shutdow
     const exportFailure = await fetch(`${running.url}/api/evidence`);
     assert.equal(exportFailure.status, 500);
     assert.equal(lifecycle.snapshot().ownedHandleCount, 1);
+    assert.equal(lifecycle.verifyCleanup(null).status, "cleanup_incomplete");
     assert.equal(owned.size, 1);
     await running.close();
     assert.deepEqual(lifecycle.snapshot(), {
@@ -1580,6 +1583,7 @@ test("M5 evidence readiness/export failures retain cleanup until service shutdow
       ownedHandleCount: 0,
       closed: true,
     });
+    assert.equal(lifecycle.verifyCleanup(null).status, "verified_clean");
     assert.equal(owned.size, 0);
     assert.ok((closeAttempts.get("mission") ?? 0) >= 2);
     assert.ok((closeAttempts.get("trueforge") ?? 0) >= 2);
