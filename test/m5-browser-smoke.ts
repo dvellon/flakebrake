@@ -8,15 +8,13 @@ import { join } from "node:path";
 import { Builder, By, Key, until, type WebDriver, type WebElement } from "selenium-webdriver";
 import firefox from "selenium-webdriver/firefox.js";
 
-import { startM5JudgeServer } from "../src/m5-ui.js";
 import {
   armSessionErrorCapture,
   armSessionNetworkCapture,
   formatFailedResponse,
   type BrowserScriptErrorObserver,
-  type SessionErrorCapture,
-  type SessionNetworkCapture,
 } from "./m5-error-capture.js";
+import { startM5BrowserSmokeInvocation } from "./m5-browser-launcher.js";
 
 interface BidiNetworkModule {
   responseCompleted(callback: (event: { response?: { status?: number | string; url?: string } } | null) => void): Promise<void>;
@@ -29,38 +27,44 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
   Network(driver: WebDriver): Promise<BidiNetworkModule>;
 };
 
-const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
-let running: Awaited<ReturnType<typeof startM5JudgeServer>>;
-try {
-  running = await startM5JudgeServer({
-    dataRoot: root,
-    port: 4176,
-    cleanupDataOnClose: true,
-  });
-} catch (error: unknown) {
-  rmSync(root, { recursive: true, force: true });
-  throw error;
-}
-const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
-const transportKillServer = createServer((socket) => socket.destroy());
-await new Promise<void>((resolveListen) => {
-  transportKillServer.listen(0, "127.0.0.1", resolveListen);
-});
-const transportKillAddress = transportKillServer.address();
-if (transportKillAddress === null || typeof transportKillAddress === "string") {
-  throw new Error("the transport-failure probe server did not expose a loopback port");
-}
-const transportProbeUrl = `http://127.0.0.1:${String(transportKillAddress.port)}/m5-controlled-transport-failure-probe`;
-const transportProbeDocument = `data:text/html;charset=utf-8,${encodeURIComponent(
-  `<script>fetch("${transportProbeUrl}", { cache: "no-store" }).catch(() => {});</script>`,
-)}`;
+const invocation = await startM5BrowserSmokeInvocation();
+const root = invocation.dataRoot;
 let driver: WebDriver | null = null;
-let capture: SessionErrorCapture | null = null;
-let networkCapture: SessionNetworkCapture | null = null;
 let smokeStage = "startup";
 let primaryError: unknown = null;
+let screenshotsCaptured = 0;
 
 try {
+  const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
+  invocation.own(async () => {
+    rmSync(screenshots, { recursive: true, force: true });
+  });
+  const transportKillServer = createServer((socket) => socket.destroy());
+  invocation.own(async () => {
+    if (!transportKillServer.listening) return;
+    await new Promise<void>((resolveClose, rejectClose) => {
+      transportKillServer.close((error) => {
+        if (error) rejectClose(error);
+        else resolveClose();
+      });
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error): void => rejectListen(error);
+    transportKillServer.once("error", onError);
+    transportKillServer.listen(0, "127.0.0.1", () => {
+      transportKillServer.off("error", onError);
+      resolveListen();
+    });
+  });
+  const transportKillAddress = transportKillServer.address();
+  if (transportKillAddress === null || typeof transportKillAddress === "string") {
+    throw new Error("the transport-failure probe server did not expose a loopback port");
+  }
+  const transportProbeUrl = `http://127.0.0.1:${String(transportKillAddress.port)}/m5-controlled-transport-failure-probe`;
+  const transportProbeDocument = `data:text/html;charset=utf-8,${encodeURIComponent(
+    `<script>fetch("${transportProbeUrl}", { cache: "no-store" }).catch(() => {});</script>`,
+  )}`;
   const options = new firefox.Options().addArguments("-headless");
   options.enableBidi();
   const explicitFirefox = process.env["FLAKEBRAKE_FIREFOX_BINARY"];
@@ -69,6 +73,13 @@ try {
   else if (existsSync(localSnapFirefox)) options.setBinary(localSnapFirefox);
   const browser = await new Builder().forBrowser("firefox").setFirefoxOptions(options).build();
   driver = browser;
+  invocation.own(async () => {
+    await browser.quit();
+    driver = null;
+    if (process.env["FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE"] === "1") {
+      throw new Error("injected Selenium shutdown failure");
+    }
+  });
   const browserScript = (
     browser as WebDriver & { script(): BrowserScriptErrorObserver }
   ).script();
@@ -86,8 +97,8 @@ try {
     },
   };
   const bidiNetwork = await createBidiNetwork(browser);
-  const networkProbeUrl = `${running.url}/m5-controlled-missing-resource-probe`;
-  networkCapture = await armSessionNetworkCapture(
+  const networkProbeUrl = `${invocation.url}/m5-controlled-missing-resource-probe`;
+  const armedNetworkCapture = await armSessionNetworkCapture(
     {
       addFailedResponseHandler: async (callback) => {
         await bidiNetwork.responseCompleted((event) => {
@@ -115,11 +126,16 @@ try {
       },
     },
   );
-  const armedNetworkCapture = networkCapture;
+  invocation.own(async () => {
+    await armedNetworkCapture.dispose();
+  });
   const networkProbeEntry = formatFailedResponse(networkProbeUrl, 404);
   const transportProbePrefix = `${transportProbeUrl} transport=`;
-  capture = await armSessionErrorCapture(browserScript, sessionBrowser);
-  await capture.openApplication(running.url);
+  const armedErrorCapture = await armSessionErrorCapture(browserScript, sessionBrowser);
+  invocation.own(async () => {
+    await armedErrorCapture.dispose();
+  });
+  await armedErrorCapture.openApplication(invocation.url);
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
   await waitText(browser, By.css(".pill-denied"), "REPLAN");
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
@@ -401,7 +417,7 @@ try {
     "capacity-shock",
   );
   assert.equal(
-    capture.capturedErrorCount(),
+    armedErrorCapture.capturedErrorCount(),
     0,
     "the session-level observer captured no JavaScript errors across application loads",
   );
@@ -441,9 +457,8 @@ try {
     true,
     "the controlled end-of-session transport failure was observed by the session channel",
   );
-  process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
 } catch (error: unknown) {
-  const durable = await fetch(`${running.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
+  const durable = await fetch(`${invocation.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
     readonly run?: { readonly status?: string; readonly errorCode?: string | null };
     readonly pendingApproval?: { readonly toolName?: string } | null;
     readonly approvals?: readonly unknown[];
@@ -467,65 +482,15 @@ try {
   );
 }
 
-const cleanupErrors: unknown[] = [];
-try {
-  if (capture !== null) {
-    await capture.dispose();
-    capture = null;
-  }
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  if (networkCapture !== null) {
-    await networkCapture.dispose();
-    networkCapture = null;
-  }
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  await new Promise<void>((resolveClose, rejectClose) => {
-    transportKillServer.close((error) => {
-      if (error) rejectClose(error);
-      else resolveClose();
-    });
-  });
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  await driver?.quit();
-  if (process.env["FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE"] === "1") {
-    throw new Error("injected Selenium shutdown failure");
-  }
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  await running.close();
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  rmSync(root, { recursive: true, force: true });
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-
 if (primaryError !== null) {
-  if (cleanupErrors.length > 0) {
-    throw new AggregateError([primaryError, ...cleanupErrors], "M5 browser smoke and cleanup failed", {
-      cause: primaryError instanceof Error ? primaryError : undefined,
-    });
-  }
-  throw primaryError;
+  await invocation.fail(primaryError);
 }
-if (cleanupErrors.length > 0) {
-  throw new AggregateError(cleanupErrors, "M5 browser smoke cleanup failed");
-}
+await invocation.close();
 
-await assert.rejects(fetch(running.url), /fetch failed|ECONNREFUSED/u);
+await assert.rejects(fetch(invocation.url), /fetch failed|ECONNREFUSED/u);
+process.stdout.write(
+  `M5_BROWSER_SMOKE=PASS\nM5_BROWSER_SMOKE_PORT=${String(invocation.port)}\nM5_SCREENSHOTS_CAPTURED=${String(screenshotsCaptured)}\n`,
+);
 
 async function waitText(
   driver: WebDriver,
@@ -544,6 +509,7 @@ async function waitText(
 async function screenshot(driver: WebDriver, path: string): Promise<void> {
   const encoded = await driver.takeScreenshot();
   writeFileSync(path, encoded, "base64");
+  screenshotsCaptured += 1;
 }
 
 async function hasHorizontalOverflow(driver: WebDriver): Promise<boolean> {
