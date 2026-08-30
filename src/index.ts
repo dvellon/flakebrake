@@ -108,3 +108,21 @@ export {
   startM5JudgeServer,
 } from "./m5-ui.js";
 export type * from "./m5-ui.js";
+export {
+  RECOVERY_DEMO_ATTEMPT_ID,
+  RECOVERY_DEMO_END,
+  RECOVERY_DEMO_START,
+  inspectRecoveryDemo,
+  interruptRecoveryDemonstration,
+  recoverRecoveryDemonstration,
+  replayCompletedRecoveryDemonstration,
+  restartRecoveryDemonstration,
+} from "./recovery-demo-runner.js";
+export type * from "./recovery-demo-runner.js";
+export {
+  RecoveryDemoCoordinator,
+  RecoveryDemoRequestError,
+  recoveryDemoRequestId,
+  startRecoveryDemoServer,
+} from "./recovery-demo-ui.js";
+export type * from "./recovery-demo-ui.js";
