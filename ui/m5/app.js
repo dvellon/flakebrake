@@ -21,7 +21,11 @@ const nodes = Object.fromEntries(
     "guided-what", "guided-why", "guided-mechanical", "guided-next", "guided-number-display",
     "guided-number-protected", "guided-number-mutations", "guided-number-mutations-note",
     "trust-recheck", "trust-empty", "trust-rows", "trust-technical-list",
-    "evidence-bundle", "evidence-download", "toast",
+    "evidence-bundle", "evidence-download", "toast", "scenario-select",
+    "hero-eyebrow", "hero-title", "hero-lead", "hero-result", "hero-copy",
+    "scenario-transition", "basis-context", "proposal-heading", "activity-title",
+    "runtime-heading", "guided-story", "harness-ribbon", "agent-trust", "proof-center",
+    "challenge-lab",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -45,6 +49,12 @@ const resourcePresentation = {
   agent_work_units: ["Agent work", "Planning and orchestration effort"],
   human_review_decisions: ["Human decisions", "Explicit human approval capacity"],
   production_cell_minutes: ["Production cell", "Scheduled factory execution time"],
+};
+
+const originalHeroPresentation = {
+  unresolvedBasis: "The original rush basis needs the safest workable plan (a bounded replan) before any promise can be accepted.",
+  resolvedBasis: "Resolved through the safest workable plan (a bounded replan): the original over-capacity basis remains visible for audit, while the accepted alternative is verified.",
+  alternativeGuidance: "Recommended: Approve — 09:40–10:10 starts after the protected interval and fits the bound grant.",
 };
 
 function escapeHtml(value) {
@@ -113,7 +123,8 @@ async function mutate(path, body) {
   invalidateResponses();
   const intent = path === "/api/mission"
     ? body.operation === "reset" ? "mission_reset" : "mission_start"
-    : path === "/api/challenge" ? "challenge_run" : "approval";
+    : path === "/api/scenario" ? "scenario_switch"
+      : path === "/api/challenge" ? "challenge_run" : "approval";
   const token = responseToken(intent);
   render();
   try {
@@ -144,6 +155,7 @@ function responseToken(intent) {
     sourceRunGeneration: state?.run.generation ?? null,
     sourceMissionId: state?.mission.missionId ?? null,
     sourceSessionId: state?.mission.sessionId ?? null,
+    sourceScenarioId: state?.scenario.scenarioId ?? null,
   };
 }
 
@@ -165,9 +177,16 @@ function applyState(candidate, token) {
   if (state !== null) {
     if (candidate.run.generation < state.run.generation) return false;
     if (candidate.run.generation === state.run.generation && candidate.revision < state.revision) return false;
-    if (candidate.mission.missionId !== state.mission.missionId) return false;
     const newerDurableGeneration =
       candidate.run.generation > state.run.generation && candidate.revision > state.revision;
+    const explicitScenarioSwitch =
+      token.intent === "scenario_switch" &&
+      token.sourceRevision === state.revision &&
+      token.sourceRunGeneration === state.run.generation &&
+      token.sourceScenarioId === state.scenario.scenarioId &&
+      newerDurableGeneration;
+    if (candidate.scenario.scenarioId !== state.scenario.scenarioId && !explicitScenarioSwitch) return false;
+    if (candidate.mission.missionId !== state.mission.missionId && !explicitScenarioSwitch) return false;
     const tokenMatchesCurrentFailure =
       token.intent === "mission_start" && token.sourceRevision === state.revision &&
       token.sourceRunGeneration === state.run.generation &&
@@ -182,12 +201,12 @@ function applyState(candidate, token) {
       token.intent === "mission_reset" && token.sourceRevision === state.revision &&
       token.sourceRunGeneration === state.run.generation &&
       token.sourceMissionId === state.mission.missionId && newerDurableGeneration;
-    if (state.run.status === "verified" && candidate.run.status !== "verified" && !explicitReset) return false;
-    if (state.run.status === "failed" && candidate.run.status !== "failed" && !explicitRecovery && !explicitReset) return false;
-    if (state.challengeLab.status === "complete" && candidate.challengeLab.status !== "complete") return false;
-    if (state.challengeLab.status === "failed" && candidate.challengeLab.status !== "failed") return false;
+    if (state.run.status === "verified" && candidate.run.status !== "verified" && !explicitReset && !explicitScenarioSwitch) return false;
+    if (state.run.status === "failed" && candidate.run.status !== "failed" && !explicitRecovery && !explicitReset && !explicitScenarioSwitch) return false;
+    if (state.challengeLab.status === "complete" && candidate.challengeLab.status !== "complete" && !explicitScenarioSwitch) return false;
+    if (state.challengeLab.status === "failed" && candidate.challengeLab.status !== "failed" && !explicitScenarioSwitch) return false;
     if (state.mission.sessionId !== null && candidate.mission.sessionId !== null &&
-      candidate.mission.sessionId !== state.mission.sessionId && !explicitReset) return false;
+      candidate.mission.sessionId !== state.mission.sessionId && !explicitReset && !explicitScenarioSwitch) return false;
     if (candidate.run.generation === state.run.generation && candidate.revision === state.revision) {
       latestAppliedSequence = token.sequence;
       return false;
@@ -202,17 +221,28 @@ function applyState(candidate, token) {
 
 function render() {
   if (!state) return;
+  const capacityShock = state.scenario.scenarioId === "capacity-shock";
   renderHeader();
-  renderGuidedStory();
-  renderAgentTrust();
-  renderHarness();
-  renderProofCenter();
+  for (const id of ["guided-story", "harness-ribbon", "agent-trust", "proof-center", "challenge-lab"]) {
+    nodes[id].hidden = capacityShock;
+  }
+  if (capacityShock) {
+    nodes["hero-title"].setAttribute?.("role", "heading");
+    nodes["hero-title"].setAttribute?.("aria-level", "1");
+  } else {
+    nodes["hero-title"].removeAttribute?.("role");
+    nodes["hero-title"].removeAttribute?.("aria-level");
+    renderGuidedStory();
+    renderAgentTrust();
+    renderHarness();
+    renderProofCenter();
+  }
   renderApproval();
   renderHero();
   renderActivity();
   renderTimeline();
   renderExecution();
-  renderChallengeLab();
+  if (!capacityShock) renderChallengeLab();
 }
 
 const trustResultPresentation = {
@@ -585,18 +615,39 @@ function renderHeader() {
   nodes.outcome.textContent = outcomeLabels[state.run.status];
   nodes.outcome.className = state.run.status === "verified" ? "tone-verified" :
     state.run.status === "failed" ? "tone-denied" : running ? "tone-pending" : "tone-neutral";
+  nodes["scenario-select"].value = state.scenario.scenarioId;
+  nodes["scenario-select"].disabled = missionMutationInFlight || !state.scenario.selectorEnabled;
+  nodes["hero-eyebrow"].textContent = state.scenario.eyebrow;
+  nodes["hero-lead"].textContent = state.scenario.headlineLead;
+  nodes["hero-result"].textContent = state.scenario.headlineResult;
+  nodes["hero-copy"].textContent = state.scenario.summary;
+  nodes["scenario-transition"].hidden = state.scenario.transitionReason === null;
+  nodes["scenario-transition"].textContent = state.scenario.transitionReason ?? "";
+  const capacityShock = state.scenario.scenarioId === "capacity-shock";
+  nodes["basis-context"].textContent = capacityShock
+    ? "The authoritative spindle calibration hold reduces the plan by 10 production minutes; the old capacity-plan version is stale even though it was previously admissible."
+    : "The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.";
+  nodes["proposal-heading"].textContent = capacityShock ? "Planned quality-fixture batch" : "Original rush request";
+  nodes["activity-title"].textContent = capacityShock ? "Durable scenario activity" : "TrueForge activity";
+  nodes["runtime-heading"].textContent = capacityShock ? "Kernel & durable evidence" : "Sandbox & MCP evidence";
   nodes["start-button"].disabled = missionMutationInFlight || !state.run.canStart;
-  nodes["start-button"].textContent = state.run.status === "failed" ? "Resume safely" : "Start hero mission";
+  nodes["start-button"].textContent = state.run.status === "failed" ? "Resume safely" : state.scenario.startLabel;
   nodes["start-button"].classList.toggle("button-primary", state.run.canStart && !missionMutationInFlight);
   nodes["start-button"].classList.toggle("button-quiet", !state.run.canStart || missionMutationInFlight);
   nodes["reset-button"].disabled = missionMutationInFlight || !state.run.canReset;
-  nodes["basis-note"].innerHTML = state.run.status === "idle"
-    ? "<strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores."
-    : state.run.status === "verified"
-      ? "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence for the verified mission."
-      : state.run.status === "failed"
-        ? "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence. Resume safely continues against the same invocation-owned stores."
-        : "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence while the live mission runs against invocation-owned stores.";
+  nodes["basis-note"].innerHTML = state.scenario.scenarioId === "rush-order"
+    ? state.run.status === "idle"
+      ? "<strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores."
+      : state.run.status === "verified"
+        ? "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence for the verified mission."
+        : state.run.status === "failed"
+          ? "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence. Resume safely continues against the same invocation-owned stores."
+          : "<strong>Canonical basis:</strong> the precomputed evaluation above remains durable audit evidence while the live mission runs against invocation-owned stores."
+    : state.run.status === "idle"
+      ? "<strong>Before you start:</strong> capacity-plan/v1 was admissible; the view below is the authoritative capacity-plan/v2 replan basis."
+      : state.run.status === "verified"
+        ? "<strong>Current basis:</strong> capacity-plan/v2 and the stale v1 rejection remain durable audit evidence for the verified mission."
+        : "<strong>Current basis:</strong> capacity-plan/v2 remains authoritative while the mission advances.";
 }
 
 function setRecommendedAction(recommendedDecision) {
@@ -673,9 +724,9 @@ function renderApproval() {
   nodes["approval-subject"].textContent = approval.technicalSubject ?? "";
   nodes["approval-details"].hidden = false;
   nodes["approval-guidance"].textContent = approval.recommendedDecision === "deny"
-    ? "Recommended: Deny — 09:10–09:40 overlaps protected production work."
+    ? state.scenario.primaryGuidance
     : approval.phase === "consequential_effect"
-      ? `Recommended: Approve — 09:40–10:10 starts after the protected interval and fits the bound grant.${primaryDenial ? ` Primary denial rationale: ${primaryDenial.reason}.` : ""}`
+      ? `${state.scenario.scenarioId === "rush-order" ? originalHeroPresentation.alternativeGuidance : state.scenario.alternativeGuidance}${primaryDenial ? ` Primary denial rationale: ${primaryDenial.reason}.` : ""}`
       : "Recommended: Approve — this bounded step preserves the canonical promise basis.";
   setRecommendedAction(approval.recommendedDecision);
   const decisionPending = approvalMutationInFlight === approval.actionIdentity;
@@ -690,14 +741,18 @@ function renderApproval() {
 
 function renderHero() {
   nodes["basis-resolution"].textContent = state.run.status === "verified"
-    ? "Resolved through the safest workable plan (a bounded replan): the original over-capacity basis remains visible for audit, while the accepted alternative is verified."
-    : "The original rush basis needs the safest workable plan (a bounded replan) before any promise can be accepted.";
+    ? state.scenario.scenarioId === "rush-order"
+      ? originalHeroPresentation.resolvedBasis
+      : state.scenario.resolvedBasis
+    : state.scenario.scenarioId === "rush-order"
+      ? originalHeroPresentation.unresolvedBasis
+      : state.scenario.unresolvedBasis;
   nodes["basis-resolution"].classList.toggle("is-resolved", state.run.status === "verified");
   nodes["capacity-grid"].innerHTML = state.hero.capacity.map((item) => {
     const usedAfter = Math.max(0, item.existingUse + item.proposedConsumption);
     const progressValue = Math.min(item.declaredCapacity, usedAfter);
     const overBy = Math.max(0, usedAfter - item.declaredCapacity);
-    return `<article class="capacity-item ${escapeHtml(item.status)}"><header><h3>${escapeHtml(item.label)}</h3><span>${escapeHtml(item.unit.replaceAll("_", " "))}</span></header><strong class="remaining">${item.remainingCapacity} remaining</strong><progress class="capacity-baseline" max="${item.declaredCapacity}" value="${progressValue}" aria-label="${escapeHtml(item.label)}: ${usedAfter} of ${item.declaredCapacity} units requested">${progressValue}/${item.declaredCapacity}</progress><div class="capacity-breakdown"><span><small>Declared</small>${item.declaredCapacity}</span><span><small>Existing</small>${item.existingUse}</span><span><small>Rush</small>+${item.proposedConsumption}</span></div>${overBy > 0 ? `<p class="overage">Original basis exceeds capacity by ${overBy}.</p>` : ""}</article>`;
+    return `<article class="capacity-item ${escapeHtml(item.status)}"><header><h3>${escapeHtml(item.label)}</h3><span>${escapeHtml(item.unit.replaceAll("_", " "))}</span></header><strong class="remaining">${item.remainingCapacity} remaining</strong><progress class="capacity-baseline" max="${item.declaredCapacity}" value="${progressValue}" aria-label="${escapeHtml(item.label)}: ${usedAfter} of ${item.declaredCapacity} units requested">${progressValue}/${item.declaredCapacity}</progress><div class="capacity-breakdown"><span><small>Declared</small>${item.declaredCapacity}</span><span><small>Existing</small>${item.existingUse}</span><span><small>${escapeHtml(state.scenario.proposalCapacityLabel)}</small>+${item.proposedConsumption}</span></div>${overBy > 0 ? `<p class="overage">Original basis exceeds capacity by ${overBy}.</p>` : ""}</article>`;
   }).join("");
   const acceptedProposal = state.hero.obligations.some((item) => item.obligationId === state.hero.proposal.obligationId);
   const acceptedWork = state.hero.obligations.filter((item) => item.obligationId !== state.hero.proposal.obligationId);
@@ -718,7 +773,8 @@ function renderActivity() {
   const activity = state.activity;
   nodes["model-requests"].textContent = `${activity.modelRequests} model request${activity.modelRequests === 1 ? "" : "s"}`;
   const rootName = activity.rootAgent?.name ?? "TrueForge root agent";
-  const root = `<div class="agent-node"><span class="agent-icon root-icon" aria-hidden="true">R</span><div class="agent-copy"><strong class="agent-name">${escapeHtml(rootName)}</strong><span class="agent-role">Root mission agent</span></div><span class="agent-status status-chip${state.run.status === "verified" ? " status-complete" : ""}">${escapeHtml(truthfulAgentStatus())}</span></div>`;
+  const rootRole = state.scenario.scenarioId === "rush-order" ? "Root mission agent" : "Deterministic mission coordinator";
+  const root = `<div class="agent-node"><span class="agent-icon root-icon" aria-hidden="true">R</span><div class="agent-copy"><strong class="agent-name">${escapeHtml(rootName)}</strong><span class="agent-role">${rootRole}</span></div><span class="agent-status status-chip${state.run.status === "verified" ? " status-complete" : ""}">${escapeHtml(truthfulAgentStatus())}</span></div>`;
   const children = activity.subagents.map((item) => `<div class="agent-node child"><span class="agent-icon subagent-icon" aria-hidden="true">A</span><div class="agent-copy"><strong class="agent-name">${escapeHtml(item.title)}</strong><span class="agent-role">TrueForge subagent</span></div><span class="agent-status status-chip status-complete">Complete</span></div>`).join("");
   nodes["agent-tree"].innerHTML = root + children;
   const chips = [
@@ -777,7 +833,8 @@ function renderExecution() {
   nodes["readback-note"].textContent = result.independentReadBackObserved
     ? `Independent read-back verified ${formatFriendlyInterval(result.approvedInterval)} before terminal completion.`
     : "Independent read-back has not yet occurred.";
-  const evidenceReady = state.run.status === "verified" && verified && result.receiptCount === 1;
+  const evidenceReady = state.scenario.scenarioId === "rush-order" &&
+    state.run.status === "verified" && verified && result.receiptCount === 1;
   if (nodes["evidence-bundle"] && nodes["evidence-download"]) {
     nodes["evidence-bundle"].hidden = !evidenceReady;
     nodes["evidence-download"].setAttribute?.("aria-disabled", String(!evidenceReady));
@@ -847,6 +904,10 @@ function showError(message) {
 }
 
 nodes["timeline"].addEventListener("scroll", () => { timelinePinned = isTimelineNearLatest(); }, { passive: true });
+nodes["scenario-select"].addEventListener("change", () => {
+  const scenarioId = nodes["scenario-select"].value;
+  void mutate("/api/scenario", { scenarioId, requestId: requestId("scenario") });
+});
 nodes["start-button"].addEventListener("click", () => {
   nodes["approval-title"].focus?.({ preventScroll: true });
   void mutate("/api/mission", { operation: "start", requestId: requestId("start") });
@@ -867,7 +928,7 @@ nodes["allow-button"].addEventListener("click", () => {
 nodes["deny-button"].addEventListener("click", () => {
   if (!state?.pendingApproval) return;
   nodes["approval-title"].focus?.({ preventScroll: true });
-  void mutate("/api/approval", { missionId: state.pendingApproval.missionId, actionIdentity: state.pendingApproval.actionIdentity, decision: "deny", reason: "The primary interval conflicts with protected production commitments", requestId: requestId("deny") });
+  void mutate("/api/approval", { missionId: state.pendingApproval.missionId, actionIdentity: state.pendingApproval.actionIdentity, decision: "deny", reason: state.scenario.denialReason, requestId: requestId("deny") });
 });
 nodes["evidence-download"]?.addEventListener("click", (event) => {
   if (nodes["evidence-download"].getAttribute("aria-disabled") === "true") {

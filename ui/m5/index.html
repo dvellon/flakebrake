@@ -23,7 +23,7 @@
     </header>
 
     <main id="main">
-      <section class="guided-story" aria-labelledby="guided-heading">
+      <section id="guided-story" class="guided-story" aria-labelledby="guided-heading">
         <div class="guided-copy">
           <p class="eyebrow">The story so far</p>
           <h1 id="guided-heading">A rush order is waiting</h1>
@@ -67,7 +67,7 @@
         <p id="decision-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
       </section>
 
-      <section class="harness-ribbon" aria-labelledby="harness-title">
+      <section id="harness-ribbon" class="harness-ribbon" aria-labelledby="harness-title">
         <div class="harness-lockup">
           <span class="harness-mark" aria-hidden="true">TF</span>
           <div class="harness-name-block">
@@ -106,7 +106,7 @@
         </details>
       </section>
 
-      <section class="agent-trust" aria-labelledby="trust-heading">
+      <section id="agent-trust" class="agent-trust" aria-labelledby="trust-heading">
         <p class="eyebrow">Agents checking agents</p>
         <h2 id="trust-heading">No agent’s claim is trusted on its own word</h2>
         <p class="trust-primary">Agents can propose anything; they cannot make it true. Every consequential effect must pass current-state checks, authorization, fenced execution, and independent verification.</p>
@@ -129,12 +129,20 @@
 
       <section class="hero" aria-labelledby="hero-title">
         <div>
-          <p class="eyebrow">Deterministic TrueForge mission</p>
-          <p id="hero-title" class="hero-title"><span>A rush order.</span> <span class="hero-line">One safe promise.</span></p>
-          <p class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
+          <p id="hero-eyebrow" class="eyebrow">Deterministic TrueForge mission</p>
+          <p id="hero-title" class="hero-title"><span id="hero-lead">A rush order.</span> <span id="hero-result" class="hero-line">One safe promise.</span></p>
+          <p id="hero-copy" class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
           <p id="basis-note" class="basis-note"><strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores.</p>
+          <p id="scenario-transition" class="scenario-transition" hidden></p>
         </div>
         <div class="hero-actions">
+          <label class="scenario-selector" for="scenario-select">
+            <span>Scenario</span>
+            <select id="scenario-select" name="scenario">
+              <option value="rush-order" selected>Rush order · hero</option>
+              <option value="capacity-shock">Capacity shock · second scenario</option>
+            </select>
+          </label>
           <button id="start-button" class="button button-primary" type="button">Start hero mission</button>
           <button id="reset-button" class="button button-quiet" type="button">Reset demo</button>
         </div>
@@ -147,7 +155,7 @@
         <div><span>Outcome</span><strong id="outcome" class="tone-neutral">Waiting</strong></div>
       </section>
 
-      <section class="proof-center" aria-labelledby="proof-center-title">
+      <section id="proof-center" class="proof-center" aria-labelledby="proof-center-title">
         <div class="proof-center-heading">
           <div>
             <p class="eyebrow">Operator proof center</p>
@@ -214,12 +222,12 @@
             <div><p class="eyebrow">01 · Original promise basis</p><h2 id="promise-title">Capacity before commitment</h2></div>
             <span class="pill pill-denied">Doesn’t fit yet · <code class="tech-tag">REPLAN</code></span>
           </div>
-          <p class="context-note">The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.</p>
+          <p id="basis-context" class="context-note">The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.</p>
           <p id="basis-resolution" class="basis-resolution">The original rush basis needs the safest workable plan (a bounded replan) before any promise can be accepted.</p>
           <div id="capacity-grid" class="capacity-grid" role="group" aria-label="Capacity evaluation"></div>
           <div class="split-list">
             <div><h3>Accepted workload after the safest workable plan</h3><div id="obligations"></div></div>
-            <div><h3>Original rush request</h3><div id="proposal"></div></div>
+            <div><h3 id="proposal-heading">Original rush request</h3><div id="proposal"></div></div>
           </div>
         </section>
 
@@ -238,7 +246,7 @@
           </div>
           <div class="activity-layout">
             <div id="agent-tree" class="agent-tree"></div>
-            <div><h3>Sandbox & MCP evidence</h3><div id="runtime-chips" class="chip-list"></div></div>
+            <div><h3 id="runtime-heading">Sandbox & MCP evidence</h3><div id="runtime-chips" class="chip-list"></div></div>
           </div>
         </section>
 
@@ -268,7 +276,7 @@
         </section>
       </div>
 
-      <section class="challenge-lab" aria-labelledby="challenge-title">
+      <section id="challenge-lab" class="challenge-lab" aria-labelledby="challenge-title">
         <div class="challenge-intro">
           <div>
             <p class="eyebrow">Optional · deterministic assurance demonstration</p>

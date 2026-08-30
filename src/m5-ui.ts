@@ -26,6 +26,19 @@ import { fileURLToPath } from "node:url";
 
 import { canonicalSerialize } from "./canonical.js";
 import {
+  CAPACITY_SHOCK_ATTEMPT_ID,
+  CAPACITY_SHOCK_ENVIRONMENT_ID,
+  CAPACITY_SHOCK_HORIZON_END,
+  CAPACITY_SHOCK_MISSION_ID,
+  CAPACITY_SHOCK_SCENARIO_ID,
+  createCapacityShockEvaluationInput,
+  createCapacityShockInitialState,
+} from "./capacity-shock-fixture.js";
+import {
+  runCapacityShockMission,
+  type CapacityShockMissionResult,
+} from "./capacity-shock-runner.js";
+import {
   cleanupAdversarialChallengeLab,
   readAdversarialChallengeLab,
   runAdversarialChallengeLab,
@@ -92,6 +105,8 @@ type InternalEvidenceLifecycleOptions = {
   readonly [INTERNAL_EVIDENCE_LIFECYCLE]?: MissionEvidenceDatabaseLifecycle;
 };
 
+export type M5ScenarioId = "rush-order" | typeof CAPACITY_SHOCK_SCENARIO_ID;
+
 export type M5RunStatus =
   | "idle"
   | "running"
@@ -115,6 +130,27 @@ export interface M5PendingApproval {
 export interface M5JudgeState {
   readonly schemaVersion: typeof STATE_SCHEMA_VERSION;
   readonly revision: number;
+  readonly scenario: {
+    readonly scenarioId: M5ScenarioId;
+    readonly label: string;
+    readonly selectorEnabled: boolean;
+    readonly eyebrow: string;
+    readonly headlineLead: string;
+    readonly headlineResult: string;
+    readonly summary: string;
+    readonly startLabel: string;
+    readonly proposalCapacityLabel: string;
+    readonly unresolvedBasis: string;
+    readonly resolvedBasis: string;
+    readonly initialDecision: "ADMITTABLE" | "REPLAN";
+    readonly initialCapacityPlanVersion: string;
+    readonly currentCapacityPlanVersion: string;
+    readonly transitionReason: string | null;
+    readonly staleBasisRejectionCount: number;
+    readonly denialReason: string;
+    readonly primaryGuidance: string;
+    readonly alternativeGuidance: string;
+  };
   readonly run: {
     readonly status: M5RunStatus;
     readonly generation: number;
@@ -318,6 +354,16 @@ interface RecordedDecision {
   readonly canonicalInput: string;
 }
 
+interface ScenarioRuntimeProjection {
+  readonly decisionHistory: ReadonlyMap<string, RecordedDecision>;
+  readonly observedApprovals: readonly M4ApprovalRecord[];
+  readonly runtimeEvidence: M5JudgeState["evidenceTimeline"];
+  readonly status: M5RunStatus;
+  readonly errorCode: string | null;
+  readonly ownerCallsThisProcess: number;
+  readonly replayedTerminal: boolean;
+}
+
 interface DemoPaths {
   readonly m2: string;
   readonly factory: string;
@@ -341,7 +387,8 @@ export class M5RequestError extends Error {
 export class M5DemoCoordinator {
   readonly #dataRoot: string;
   readonly #cleanupDataOnClose: boolean;
-  readonly #paths: DemoPaths;
+  readonly #heroPaths: DemoPaths;
+  readonly #capacityShockPaths: DemoPaths;
   readonly #evidenceLifecycle: MissionEvidenceDatabaseLifecycle;
   readonly #decisionHistory = new Map<string, RecordedDecision>();
   readonly #observedApprovals: M4ApprovalRecord[] = [];
@@ -353,8 +400,10 @@ export class M5DemoCoordinator {
     technicalIdentity: string | null;
     status: M5JudgeState["evidenceTimeline"][number]["status"];
   }[] = [];
+  readonly #scenarioRuntime = new Map<M5ScenarioId, ScenarioRuntimeProjection>();
   #pendingApproval: PendingApprovalInternal | null = null;
   #result: DeterministicM4MissionResult | null = null;
+  #capacityShockResult: CapacityShockMissionResult | null = null;
   #runPromise: Promise<void> | null = null;
   #status: M5RunStatus = "idle";
   #errorCode: string | null = null;
@@ -364,6 +413,7 @@ export class M5DemoCoordinator {
   #revision = 0;
   #ownerCallsThisProcess = 0;
   #replayedTerminal = false;
+  #scenarioId: M5ScenarioId = "rush-order";
   #challengeStatus: M5JudgeState["challengeLab"]["status"] = "idle";
   #challengeResult: AdversarialChallengeLabResult | null = null;
   #challengePromise: Promise<void> | null = null;
@@ -379,13 +429,21 @@ export class M5DemoCoordinator {
     this.#evidenceLifecycle = (
       options as M5DemoCoordinatorOptions & InternalEvidenceLifecycleOptions
     )[INTERNAL_EVIDENCE_LIFECYCLE] ?? createMissionEvidenceDatabaseLifecycle();
-    this.#paths = {
+    this.#heroPaths = {
       m2: join(this.#dataRoot, "m2.sqlite"),
       factory: join(this.#dataRoot, "factory.sqlite"),
       mission: join(this.#dataRoot, "mission.sqlite"),
       trueforge: join(this.#dataRoot, "trueforge.sqlite"),
       sandboxes: join(this.#dataRoot, "trueforge-data"),
       sandboxEvidence: join(this.#dataRoot, "m5-sandbox-evidence.json"),
+    };
+    this.#capacityShockPaths = {
+      m2: join(this.#dataRoot, "capacity-shock-m2.sqlite"),
+      factory: join(this.#dataRoot, "capacity-shock-factory.sqlite"),
+      mission: join(this.#dataRoot, "capacity-shock-mission.sqlite"),
+      trueforge: join(this.#dataRoot, "capacity-shock-trueforge.sqlite"),
+      sandboxes: join(this.#dataRoot, "capacity-shock-trueforge-data"),
+      sandboxEvidence: join(this.#dataRoot, "capacity-shock-sandbox-evidence.json"),
     };
     establishOwnedDataRoot(this.#dataRoot);
     try {
@@ -411,12 +469,12 @@ export class M5DemoCoordinator {
    * session, or a malformed marker, fails closed and promotes nothing.
    */
   #restoreDurableSandboxEvidence(): void {
-    if (!existsSync(this.#paths.sandboxEvidence)) return;
+    if (!existsSync(this.#heroPaths.sandboxEvidence)) return;
     try {
       const marker = objectValue(
-        parseJsonRejectingDuplicateKeys(readFileSync(this.#paths.sandboxEvidence, "utf8")),
+        parseJsonRejectingDuplicateKeys(readFileSync(this.#heroPaths.sandboxEvidence, "utf8")),
       );
-      const snapshot = this.#readMissionSnapshot();
+      const snapshot = this.#readHeroMissionSnapshot();
       if (
         marker === null ||
         snapshot === null ||
@@ -442,7 +500,8 @@ export class M5DemoCoordinator {
   }
 
   #persistSandboxEvidence(): void {
-    const snapshot = this.#readMissionSnapshot();
+    if (this.#scenarioId !== "rush-order") return;
+    const snapshot = this.#readHeroMissionSnapshot();
     if (snapshot === null) return;
     try {
       const serialized = `${JSON.stringify({
@@ -462,7 +521,10 @@ export class M5DemoCoordinator {
       // diagnostic; no user-facing copy claims more than the marker's
       // file-level durability, so a Windows file-durable outcome needs no
       // presentation change.
-      this.#markerDurability = publishJsonFileAtomically(this.#paths.sandboxEvidence, serialized);
+      this.#markerDurability = publishJsonFileAtomically(
+        this.#heroPaths.sandboxEvidence,
+        serialized,
+      );
     } catch {
       this.#markerDurability = null;
       // Persistence is best effort; the live in-memory evidence still renders
@@ -486,6 +548,69 @@ export class M5DemoCoordinator {
     return this.#markerDurability;
   }
 
+  get #paths(): DemoPaths {
+    return this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+      ? this.#capacityShockPaths
+      : this.#heroPaths;
+  }
+
+  public scenarioId(): M5ScenarioId {
+    return this.#scenarioId;
+  }
+
+  public selectScenario(scenarioId: M5ScenarioId): M5JudgeState {
+    this.#assertOpen();
+    if (this.#runPromise !== null || this.#pendingApproval !== null) {
+      throw new M5RequestError(
+        409,
+        "mission_active",
+        "The active mission must reach a safe terminal state before changing scenarios",
+      );
+    }
+    if (scenarioId === this.#scenarioId) return this.state();
+    this.#storeScenarioRuntime();
+    this.#scenarioId = scenarioId;
+    this.#restoreScenarioRuntime(scenarioId);
+    this.#generation += 1;
+    this.#bumpRevision();
+    return this.state();
+  }
+
+  #storeScenarioRuntime(): void {
+    this.#scenarioRuntime.set(this.#scenarioId, {
+      decisionHistory: new Map(this.#decisionHistory),
+      observedApprovals: [...this.#observedApprovals],
+      runtimeEvidence: this.#runtimeEvidence.map((item) => ({ ...item })),
+      status: this.#status,
+      errorCode: this.#errorCode,
+      ownerCallsThisProcess: this.#ownerCallsThisProcess,
+      replayedTerminal: this.#replayedTerminal,
+    });
+  }
+
+  #restoreScenarioRuntime(scenarioId: M5ScenarioId): void {
+    this.#decisionHistory.clear();
+    this.#observedApprovals.length = 0;
+    this.#runtimeEvidence.length = 0;
+    const runtime = this.#scenarioRuntime.get(scenarioId);
+    if (runtime === undefined) {
+      this.#status = "idle";
+      this.#errorCode = null;
+      this.#ownerCallsThisProcess = 0;
+      this.#replayedTerminal = false;
+      return;
+    }
+    for (const [identity, decision] of runtime.decisionHistory) {
+      this.#decisionHistory.set(identity, decision);
+    }
+    this.#observedApprovals.push(...runtime.observedApprovals);
+    this.#runtimeEvidence.push(...runtime.runtimeEvidence.map((item) => ({ ...item })));
+    this.#status = runtime.status;
+    this.#errorCode = runtime.errorCode;
+    this.#ownerCallsThisProcess = runtime.ownerCallsThisProcess;
+    this.#replayedTerminal = runtime.replayedTerminal;
+  }
+
   public start(): M5JudgeState {
     this.#assertOpen();
     if (this.#runPromise !== null || this.#status === "verified") {
@@ -507,21 +632,35 @@ export class M5DemoCoordinator {
     this.#upsertEvidence(
       "mission",
       "Deterministic mission started",
-      "Canonical M1–M4 stores and TrueForge orchestration are starting.",
+      this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+        ? "The capacity-plan transition, M1–M3 stores, and durable scenario bridge are starting."
+        : "Canonical M1–M4 stores and TrueForge orchestration are starting.",
       "informational",
     );
-    const run = runDeterministicM4Mission({
-      m2DatabasePath: this.#paths.m2,
-      factoryDatabasePath: this.#paths.factory,
-      missionDatabasePath: this.#paths.mission,
-      trueforgeDatabasePath: this.#paths.trueforge,
-      localSandboxRootParent: this.#paths.sandboxes,
-      ownerDecisionProvider: (request) => this.#requestOwnerDecision(request),
-      checkpointObserver: (checkpoint) => this.#observeCheckpoint(checkpoint),
-    });
+    const run =
+      this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+        ? runCapacityShockMission({
+            m2DatabasePath: this.#paths.m2,
+            factoryDatabasePath: this.#paths.factory,
+            missionDatabasePath: this.#paths.mission,
+            ownerDecisionProvider: (request) => this.#requestOwnerDecision(request),
+            checkpointObserver: (checkpoint) => this.#observeCheckpoint(checkpoint),
+          }).then((result) => {
+            this.#capacityShockResult = result;
+          })
+        : runDeterministicM4Mission({
+            m2DatabasePath: this.#paths.m2,
+            factoryDatabasePath: this.#paths.factory,
+            missionDatabasePath: this.#paths.mission,
+            trueforgeDatabasePath: this.#paths.trueforge,
+            localSandboxRootParent: this.#paths.sandboxes,
+            ownerDecisionProvider: (request) => this.#requestOwnerDecision(request),
+            checkpointObserver: (checkpoint) => this.#observeCheckpoint(checkpoint),
+          }).then((result) => {
+            this.#result = result;
+          });
     this.#runPromise = run
-      .then((result) => {
-        this.#result = result;
+      .then(() => {
         this.#status = "verified";
         this.#pendingApproval = null;
         const completedExecution = this.#readExecution();
@@ -579,7 +718,9 @@ export class M5DemoCoordinator {
     this.#decisionHistory.clear();
     this.#observedApprovals.length = 0;
     this.#runtimeEvidence.length = 0;
-    this.#result = null;
+    if (this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID) this.#capacityShockResult = null;
+    else this.#result = null;
+    this.#scenarioRuntime.delete(this.#scenarioId);
     this.#status = "idle";
     this.#errorCode = null;
     this.#generation += 1;
@@ -656,6 +797,13 @@ export class M5DemoCoordinator {
 
   public startChallengeLab(): M5JudgeState {
     this.#assertOpen();
+    if (this.#scenarioId !== "rush-order") {
+      throw new M5RequestError(
+        409,
+        "challenge_unavailable_for_scenario",
+        "Challenge Lab is available only for the canonical rush-order mission",
+      );
+    }
     if (this.#challengePromise !== null || this.#challengeStatus !== "idle") {
       return this.state();
     }
@@ -679,16 +827,25 @@ export class M5DemoCoordinator {
   }
 
   public state(): M5JudgeState {
-    const evaluationInput = createHeroEvaluationInput();
+    const capacityShock = this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID;
+    const evaluationInput = capacityShock
+      ? createCapacityShockEvaluationInput()
+      : createHeroEvaluationInput();
     const direct = evaluateAdmission(evaluationInput);
     if (direct.decision !== "REPLAN" || direct.recommendedCandidate === null) {
-      throw new Error("The canonical deterministic hero no longer produces a REPLAN winner");
+      throw new Error(
+        capacityShock
+          ? "The deterministic capacity shock no longer produces a REPLAN winner"
+          : "The canonical deterministic hero no longer produces a REPLAN winner",
+      );
     }
-    const initial = createHeroInitialState();
+    const initial = capacityShock
+      ? createCapacityShockInitialState()
+      : createHeroInitialState();
     const portfolio = this.#readPortfolio() ?? {
       versions: evaluationInput.versions,
       acceptedObligations: initial.acceptedObligations,
-      resources: initial.resources,
+      resources: evaluationInput.resources,
       activeReservations: [],
     };
     const initialProtected = initial.acceptedObligations.find((item) => item.protected);
@@ -699,7 +856,15 @@ export class M5DemoCoordinator {
     const approvals = this.#currentApprovals(missionSnapshot);
     const execution = this.#readExecution();
     const result = this.#result;
-    const activity = result === null ? emptyActivity() : activityFromResult(result);
+    const capacityResult = this.#capacityShockResult;
+    const activeMissionResult = capacityShock ? capacityResult?.mission : result?.mission;
+    const activity = capacityShock
+      ? capacityResult === null
+        ? emptyActivity()
+        : capacityShockActivity(capacityResult)
+      : result === null
+        ? emptyActivity()
+        : activityFromResult(result);
     const timeline = this.#timeline(approvals);
     const ownerApprovals = approvals.filter((item) => item.source === "owner");
     const duplicateApprovals = approvals.length - new Set(approvals.map((item) => item.bridgeKey)).size;
@@ -714,6 +879,11 @@ export class M5DemoCoordinator {
     return {
       schemaVersion: STATE_SCHEMA_VERSION,
       revision: this.#revision,
+      scenario: scenarioProjection(
+        this.#scenarioId,
+        this.#runPromise === null,
+        capacityResult?.staleBasisRejectionCount ?? this.#readStaleBasisRejectionCount(),
+      ),
       run: {
         status: this.#status,
         generation: this.#generation,
@@ -733,12 +903,18 @@ export class M5DemoCoordinator {
         errorCode: this.#errorCode,
       },
       mission: {
-        missionId: M4_HERO_MISSION_ID,
-        sessionId: missionSnapshot?.mission.trueforgeSessionId ?? result?.mission.trueforgeSessionId ?? null,
-        currentTurnId: missionSnapshot?.mission.currentTurnId ?? result?.mission.finalTurnId ?? null,
-        terminalProjectionDigest: result?.mission.projectionDigest ?? null,
+        missionId: capacityShock ? CAPACITY_SHOCK_MISSION_ID : M4_HERO_MISSION_ID,
+        sessionId:
+          missionSnapshot?.mission.trueforgeSessionId ??
+          activeMissionResult?.trueforgeSessionId ??
+          null,
+        currentTurnId:
+          missionSnapshot?.mission.currentTurnId ??
+          activeMissionResult?.finalTurnId ??
+          null,
+        terminalProjectionDigest: activeMissionResult?.projectionDigest ?? null,
         disconnectedAndResumed:
-          (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
+          (activeMissionResult?.disconnectedAndResumed ?? false) || this.#replayedTerminal,
       },
       harness: HARNESS_PROJECTION,
       hero: {
@@ -848,27 +1024,29 @@ export class M5DemoCoordinator {
             : 0,
       },
       challengeLab: {
-        status: this.#challengeStatus,
-        canRun: this.#challengeStatus === "idle",
+        status: capacityShock ? "idle" : this.#challengeStatus,
+        canRun: !capacityShock && this.#challengeStatus === "idle",
         label: "Deterministic assurance demonstration",
-        allPassed: this.#challengeResult?.allPassed ?? null,
-        omitted: this.#challengeResult?.omitted ?? [],
-        challenges: this.#challengeResult?.challenges ?? [],
-        errorCode: this.#challengeErrorCode,
+        allPassed: capacityShock ? null : (this.#challengeResult?.allPassed ?? null),
+        omitted: capacityShock ? [] : (this.#challengeResult?.omitted ?? []),
+        challenges: capacityShock ? [] : (this.#challengeResult?.challenges ?? []),
+        errorCode: capacityShock ? null : this.#challengeErrorCode,
       },
-      agentTrust: agentTrustProjection({
-        approvals,
-        approvalEffectText: (approval) => approvalEffect(approval, missionSnapshot),
-        execution,
-        subagentTitles: activity.subagents.map((item) => item.title),
-        subagentThreadIds: activity.subagents.map((item) => item.threadId),
-        admission: this.#readReplanAdmission(),
-        sessionId:
-          missionSnapshot?.mission.trueforgeSessionId ?? result?.mission.trueforgeSessionId ?? null,
-        disconnectedAndResumed:
-          (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
-        runStatus: this.#status,
-      }),
+      agentTrust: capacityShock
+        ? { recommendationsRecorded: false, checks: [] }
+        : agentTrustProjection({
+            approvals,
+            approvalEffectText: (approval) => approvalEffect(approval, missionSnapshot),
+            execution,
+            subagentTitles: activity.subagents.map((item) => item.title),
+            subagentThreadIds: activity.subagents.map((item) => item.threadId),
+            admission: this.#readReplanAdmission(),
+            sessionId:
+              missionSnapshot?.mission.trueforgeSessionId ?? result?.mission.trueforgeSessionId ?? null,
+            disconnectedAndResumed:
+              (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
+            runStatus: this.#status,
+          }),
     };
   }
 
@@ -901,12 +1079,19 @@ export class M5DemoCoordinator {
   /** Canonical completed-mission evidence projected through read-only handles. */
   public evidenceBundle(): string {
     this.#assertOpen();
+    if (this.#scenarioId !== "rush-order") {
+      throw new M5RequestError(
+        409,
+        "evidence_unavailable_for_scenario",
+        "Canonical mission evidence is unavailable for the selected scenario",
+      );
+    }
     const options = {
       missionId: M4_HERO_MISSION_ID,
-      m2DatabasePath: this.#paths.m2,
-      factoryDatabasePath: this.#paths.factory,
-      missionDatabasePath: this.#paths.mission,
-      trueforgeDatabasePath: this.#paths.trueforge,
+      m2DatabasePath: this.#heroPaths.m2,
+      factoryDatabasePath: this.#heroPaths.factory,
+      missionDatabasePath: this.#heroPaths.mission,
+      trueforgeDatabasePath: this.#heroPaths.trueforge,
     } as const;
     if (!isMissionEvidenceReadyWithLifecycle(options, this.#evidenceLifecycle)) {
       throw new M5RequestError(
@@ -944,7 +1129,8 @@ export class M5DemoCoordinator {
     if (this.#cleanupDataOnClose) {
       for (const cleanup of [
         () => cleanupAdversarialChallengeLab(this.#dataRoot),
-        () => cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths),
+        () => cleanupOwnedDemoArtifacts(this.#dataRoot, this.#heroPaths),
+        () => cleanupOwnedDemoArtifacts(this.#dataRoot, this.#capacityShockPaths),
       ]) {
         try {
           cleanup();
@@ -1034,6 +1220,24 @@ export class M5DemoCoordinator {
     try {
       const store = new M4MissionStore({ path: this.#paths.mission });
       try {
+        return store.getSnapshotOrNull(
+          this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+            ? CAPACITY_SHOCK_MISSION_ID
+            : M4_HERO_MISSION_ID,
+        );
+      } finally {
+        store.close();
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  #readHeroMissionSnapshot(): M4MissionSnapshot | null {
+    if (!existsSync(this.#heroPaths.mission)) return null;
+    try {
+      const store = new M4MissionStore({ path: this.#heroPaths.mission });
+      try {
         return store.getSnapshotOrNull(M4_HERO_MISSION_ID);
       } finally {
         store.close();
@@ -1049,7 +1253,10 @@ export class M5DemoCoordinator {
       const store = createStore({
         path: this.#paths.m2,
         authoritativeFactoryDatabasePath: this.#paths.factory,
-        now: () => HERO_HORIZON_END,
+        now: () =>
+          this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+            ? CAPACITY_SHOCK_HORIZON_END
+            : HERO_HORIZON_END,
       });
       try {
         return store.getPortfolio();
@@ -1058,6 +1265,29 @@ export class M5DemoCoordinator {
       }
     } catch {
       return null;
+    }
+  }
+
+  #readStaleBasisRejectionCount(): number {
+    if (this.#scenarioId !== CAPACITY_SHOCK_SCENARIO_ID || !existsSync(this.#paths.m2)) {
+      return 0;
+    }
+    try {
+      const store = createStore({
+        path: this.#paths.m2,
+        authoritativeFactoryDatabasePath: this.#paths.factory,
+        now: () => CAPACITY_SHOCK_HORIZON_END,
+      });
+      try {
+        return store
+          .getAdmissionHistory()
+          .flatMap((item) => item.addenda)
+          .filter((item) => item.kind === "stale_superseded").length;
+      } finally {
+        store.close();
+      }
+    } catch {
+      return 0;
     }
   }
 
@@ -1082,11 +1312,20 @@ export class M5DemoCoordinator {
       const store = createStore({
         path: this.#paths.m2,
         authoritativeFactoryDatabasePath: this.#paths.factory,
-        now: () => HERO_HORIZON_END,
+        now: () =>
+          this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+            ? CAPACITY_SHOCK_HORIZON_END
+            : HERO_HORIZON_END,
       });
       const factory = new SyntheticFactoryEnvironment({
         path: this.#paths.factory,
-        now: () => HERO_HORIZON_END,
+        ...(this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+          ? { environmentId: CAPACITY_SHOCK_ENVIRONMENT_ID }
+          : {}),
+        now: () =>
+          this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+            ? CAPACITY_SHOCK_HORIZON_END
+            : HERO_HORIZON_END,
       });
       try {
         const addenda = store.getAdmissionHistory().flatMap((item) => item.addenda);
@@ -1096,7 +1335,11 @@ export class M5DemoCoordinator {
           .filter((item): item is NonNullable<typeof item> => item !== null);
         let attempt: ReturnType<typeof store.getExecutionAttempt> | null = null;
         try {
-          attempt = store.getExecutionAttempt(HERO_ATTEMPT_ID);
+          attempt = store.getExecutionAttempt(
+            this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+              ? CAPACITY_SHOCK_ATTEMPT_ID
+              : HERO_ATTEMPT_ID,
+          );
         } catch {
           attempt = null;
         }
@@ -1104,7 +1347,10 @@ export class M5DemoCoordinator {
           attempt === null
             ? null
             : readAuthoritativeFactoryExecution(this.#paths.factory, attempt.executionAttemptId);
-        const readBackObserved = this.#result === null ? false : readBackBeforeVerification(this.#result);
+        const readBackObserved =
+          this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+            ? this.#capacityShockResult !== null
+            : this.#result !== null && readBackBeforeVerification(this.#result);
         const attemptIds = new Set(
           addenda
             .filter((item) => item.kind === "execution_attempt")
@@ -1151,7 +1397,15 @@ export class M5DemoCoordinator {
   }
 
   #currentApprovals(snapshot: M4MissionSnapshot | null): readonly M4ApprovalRecord[] {
-    if (this.#result !== null) return this.#result.mission.approvals;
+    if (
+      this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID &&
+      this.#capacityShockResult !== null
+    ) {
+      return this.#capacityShockResult.mission.approvals;
+    }
+    if (this.#scenarioId === "rush-order" && this.#result !== null) {
+      return this.#result.mission.approvals;
+    }
     const fromSnapshot = snapshot?.bridgeOutcomes
       .filter((item) => item.status === "approval_bound")
       .map((item) => approvalRecordFromJson(item.result))
@@ -1184,16 +1438,50 @@ export class M5DemoCoordinator {
           ["receipt", "read-back", "terminal", "failure"].indexOf(left.kind) -
           ["receipt", "read-back", "terminal", "failure"].indexOf(right.kind),
       );
+    const basisItems =
+      this.#scenarioId === CAPACITY_SHOCK_SCENARIO_ID
+        ? [
+            {
+              sequence: 1,
+              kind: "initial-admission",
+              title: "Initial plan: ADMITTABLE",
+              detail: "The complete 96-minute portfolio fit capacity-plan/v1 with 4 production minutes remaining.",
+              technicalIdentity: "capacity-plan/v1",
+              status: "approved" as const,
+            },
+            {
+              sequence: 2,
+              kind: "capacity-transition",
+              title: "Capacity shock: 100 → 90 minutes",
+              detail: "An owner-authorized spindle calibration hold created capacity-plan/v2.",
+              technicalIdentity: "owner-decision/capacity-shock/capacity-plan-v2",
+              status: "informational" as const,
+            },
+            {
+              sequence: 3,
+              kind: "stale-rejection",
+              title: "Stale v1 action rejected",
+              detail: "The old capacity-plan version could no longer authorize acceptance; current readmission returned REPLAN at −6 minutes.",
+              technicalIdentity: "capacity_plan_version",
+              status: "denied" as const,
+            },
+          ]
+        : [
+            {
+              sequence: 1,
+              kind: "evaluation",
+              title: "Direct rush evaluation: REPLAN",
+              detail: "Canonical M1 evaluation found agent and human decision capacity violations.",
+              technicalIdentity: null,
+              status: "proposed" as const,
+            },
+          ];
     const items = [
-      {
-        sequence: 1,
-        kind: "evaluation",
-        title: "Direct rush evaluation: REPLAN",
-        detail: "Canonical M1 evaluation found agent and human decision capacity violations.",
-        technicalIdentity: null,
-        status: "proposed" as const,
-      },
-      ...orchestration.map((item, index) => ({ ...item, sequence: index + 2 })),
+      ...basisItems,
+      ...orchestration.map((item, index) => ({
+        ...item,
+        sequence: index + basisItems.length + 1,
+      })),
     ];
     for (const approval of approvals) {
       const detail = `${humanToolName(approval.toolName)} · ${approval.source === "owner" ? "external owner" : "active M2 denial"}`;
@@ -1390,6 +1678,32 @@ export async function startM5JudgeServer(
       sendJson(response, 200, coordinator.state());
       return;
     }
+    if (url.pathname === "/api/scenario") {
+      requireMethod(request, "POST");
+      const body = await readJsonObject(request);
+      assertAcceptingRequests();
+      validateExactKeys(body, ["scenarioId", "requestId"]);
+      const scenarioId = requireEnum(
+        body["scenarioId"],
+        ["rush-order", CAPACITY_SHOCK_SCENARIO_ID],
+        "scenarioId",
+      );
+      const requestId = requireRequestId(body["requestId"]);
+      const result = idempotentMutation(
+        idempotency,
+        `scenario:${requestId}`,
+        { route: url.pathname, body },
+        () => ({
+          statusCode: 200,
+          body: {
+            replayed: false,
+            state: coordinator.selectScenario(scenarioId),
+          },
+        }),
+      );
+      sendJson(response, result.statusCode, result.body);
+      return;
+    }
     if (url.pathname === "/api/evidence") {
       requireMethod(request, "GET");
       sendMissionEvidence(response, coordinator.evidenceBundle());
@@ -1404,7 +1718,7 @@ export async function startM5JudgeServer(
       const requestId = requireRequestId(body["requestId"]);
       const result = idempotentMutation(
         idempotency,
-        requestId,
+        `${coordinator.scenarioId()}:${requestId}`,
         { route: url.pathname, body },
         () => ({
           statusCode: 200,
@@ -1426,7 +1740,7 @@ export async function startM5JudgeServer(
       const requestId = requireRequestId(body["requestId"]);
       const result = idempotentMutation(
         idempotency,
-        requestId,
+        `${coordinator.scenarioId()}:challenge:${requestId}`,
         { route: url.pathname, body },
         () => ({
           statusCode: 200,
@@ -1464,7 +1778,7 @@ export async function startM5JudgeServer(
           : requireBoundedText(body["reason"], "reason", 300);
       const result = idempotentMutation(
         idempotency,
-        requestId,
+        `${coordinator.scenarioId()}:${requestId}`,
         { route: url.pathname, body },
         () => {
           const decisionResult = coordinator.decide({
@@ -1691,7 +2005,8 @@ function pendingApprovalState(request: M4OwnerApprovalRequest): M5PendingApprova
     toolName: request.toolName,
     expectedEffect,
     recommendedDecision:
-      request.phase === "consequential_effect" && expectedEffect.includes("09:10")
+      request.phase === "consequential_effect" &&
+      (expectedEffect.includes("09:10") || expectedEffect.includes("09:12"))
         ? "deny"
         : "allow",
     ownerSourceIdentity: OWNER_SOURCE_IDENTITY,
@@ -1704,7 +2019,11 @@ function pendingApprovalState(request: M4OwnerApprovalRequest): M5PendingApprova
 
 function expectedEffectForRequest(request: M4OwnerApprovalRequest): string {
   if (request.toolName === "select_portfolio_modification") {
-    const direct = evaluateAdmission(createHeroEvaluationInput());
+    const direct = evaluateAdmission(
+      request.missionId === CAPACITY_SHOCK_MISSION_ID
+        ? createCapacityShockEvaluationInput()
+        : createHeroEvaluationInput(),
+    );
     if (direct.decision !== "REPLAN" || direct.recommendedCandidate === null) {
       return "Select the canonical M1 replan winner";
     }
@@ -1720,7 +2039,11 @@ function expectedEffectForRequest(request: M4OwnerApprovalRequest): string {
   const start = stringValue(schedule?.["start"]) ?? stringValue(alternate?.["starts_at"]);
   const end = stringValue(schedule?.["end"]) ?? stringValue(alternate?.["ends_at"]);
   const order = stringValue(schedule?.["order_id"]) ?? stringValue(alternate?.["order_id"]);
-  return `Reserve ${order ?? "the rush order"} on cell-alpha, ${shortTime(start)}–${shortTime(end)}`;
+  const cell =
+    stringValue(schedule?.["production_cell_id"]) ??
+    stringValue(alternate?.["cell_id"]) ??
+    "cell-alpha";
+  return `Reserve ${order ?? "the rush order"} on ${cell}, ${shortTime(start)}–${shortTime(end)}`;
 }
 
 function approvalEffect(
@@ -2072,6 +2395,86 @@ function activityFromResult(result: DeterministicM4MissionResult): M5JudgeState[
     mcpServers: [...servers].sort(),
     toolCalls: [...tools].sort(),
     modelRequests: result.trueforgeModelRequests,
+  };
+}
+
+function capacityShockActivity(
+  result: CapacityShockMissionResult,
+): M5JudgeState["activity"] {
+  return {
+    rootAgent: { id: result.rootAgentId, name: result.rootAgentName },
+    subagents: [],
+    sandboxExecutions: 0,
+    mcpServers: [],
+    toolCalls: [
+      "capacity_plan_transition",
+      "stale_basis_rejection",
+      "select_portfolio_modification",
+      "accept_promise",
+      "create_schedule_reservation",
+      "independent_read_back",
+    ],
+    modelRequests: 0,
+  };
+}
+
+function scenarioProjection(
+  scenarioId: M5ScenarioId,
+  selectorEnabled: boolean,
+  staleBasisRejectionCount: number,
+): M5JudgeState["scenario"] {
+  if (scenarioId === CAPACITY_SHOCK_SCENARIO_ID) {
+    return {
+      scenarioId,
+      label: "Capacity shock",
+      selectorEnabled,
+      eyebrow: "Second deterministic scenario",
+      headlineLead: "A capacity shock.",
+      headlineResult: "One current basis.",
+      summary:
+        "See a safe 100-minute plan become stale when spindle calibration removes 10 minutes, then watch FlakeBrake reject the old basis and execute the deterministic current-plan winner.",
+      startLabel: "Start capacity shock",
+      proposalCapacityLabel: "Planned batch",
+      unresolvedBasis:
+        "Capacity-plan/v1 was ADMITTABLE; capacity-plan/v2 is 6 minutes over and requires a bounded replan before action.",
+      resolvedBasis:
+        "Resolved on capacity-plan/v2: the stale v1 authorization remains rejected while the current safe alternative is verified.",
+      initialDecision: "ADMITTABLE",
+      initialCapacityPlanVersion: "capacity-plan/v1",
+      currentCapacityPlanVersion: "capacity-plan/v2",
+      transitionReason: "Spindle calibration hold reduced production capacity from 100 to 90 minutes.",
+      staleBasisRejectionCount,
+      denialReason: "The primary interval overlaps the spindle calibration hold",
+      primaryGuidance:
+        "Recommended: Deny — 09:12–09:36 overlaps the spindle calibration hold.",
+      alternativeGuidance:
+        "Recommended: Approve — 09:36–10:00 starts after the hold and fits the bound grant.",
+    };
+  }
+  return {
+    scenarioId,
+    label: "Rush order",
+    selectorEnabled,
+    eyebrow: "Deterministic TrueForge mission",
+    headlineLead: "A rush order.",
+    headlineResult: "One safe promise.",
+    summary:
+      "See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.",
+    startLabel: "Start hero mission",
+    proposalCapacityLabel: "Rush",
+    unresolvedBasis:
+      "The original rush basis needs the safest workable plan (a bounded replan) before any promise can be accepted.",
+    resolvedBasis:
+      "Resolved through the safest workable plan (a bounded replan): the original over-capacity basis remains visible for audit, while the accepted alternative is verified.",
+    initialDecision: "REPLAN",
+    initialCapacityPlanVersion: "capacity-plan/v1",
+    currentCapacityPlanVersion: "capacity-plan/v1",
+    transitionReason: null,
+    staleBasisRejectionCount: 0,
+    denialReason: "The primary interval conflicts with protected production commitments",
+    primaryGuidance: "Recommended: Deny — 09:10–09:40 overlaps protected production work.",
+    alternativeGuidance:
+      "Recommended: Approve — 09:40–10:10 starts after the protected interval and fits the bound grant.",
   };
 }
 

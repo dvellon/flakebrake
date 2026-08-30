@@ -8,15 +8,13 @@ import { join } from "node:path";
 import { Builder, By, Key, until, type WebDriver, type WebElement } from "selenium-webdriver";
 import firefox from "selenium-webdriver/firefox.js";
 
-import { startM5JudgeServer } from "../src/m5-ui.js";
 import {
   armSessionErrorCapture,
   armSessionNetworkCapture,
   formatFailedResponse,
   type BrowserScriptErrorObserver,
-  type SessionErrorCapture,
-  type SessionNetworkCapture,
 } from "./m5-error-capture.js";
+import { startM5BrowserSmokeInvocation } from "./m5-browser-launcher.js";
 
 interface BidiNetworkModule {
   responseCompleted(callback: (event: { response?: { status?: number | string; url?: string } } | null) => void): Promise<void>;
@@ -29,42 +27,44 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
   Network(driver: WebDriver): Promise<BidiNetworkModule>;
 };
 
-const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
-const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
-const requestedPort = process.env["FLAKEBRAKE_M5_BROWSER_PORT"];
-const browserPort = requestedPort === undefined ? 0 : Number(requestedPort);
-if (
-  !Number.isSafeInteger(browserPort) ||
-  browserPort < 0 ||
-  browserPort > 65_535 ||
-  (requestedPort !== undefined && String(browserPort) !== requestedPort)
-) {
-  throw new TypeError("FLAKEBRAKE_M5_BROWSER_PORT must be a canonical TCP port");
-}
-const running = await startM5JudgeServer({
-  dataRoot: root,
-  port: browserPort,
-  cleanupDataOnClose: true,
-});
-const transportKillServer = createServer((socket) => socket.destroy());
-await new Promise<void>((resolveListen) => {
-  transportKillServer.listen(0, "127.0.0.1", resolveListen);
-});
-const transportKillAddress = transportKillServer.address();
-if (transportKillAddress === null || typeof transportKillAddress === "string") {
-  throw new Error("the transport-failure probe server did not expose a loopback port");
-}
-const transportProbeUrl = `http://127.0.0.1:${String(transportKillAddress.port)}/m5-controlled-transport-failure-probe`;
-const transportProbeDocument = `data:text/html;charset=utf-8,${encodeURIComponent(
-  `<script>fetch("${transportProbeUrl}", { cache: "no-store" }).catch(() => {});</script>`,
-)}`;
+const invocation = await startM5BrowserSmokeInvocation();
+const root = invocation.dataRoot;
 let driver: WebDriver | null = null;
-let capture: SessionErrorCapture | null = null;
-let networkCapture: SessionNetworkCapture | null = null;
 let smokeStage = "startup";
 let primaryError: unknown = null;
+let screenshotsCaptured = 0;
 
 try {
+  const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
+  invocation.own(async () => {
+    rmSync(screenshots, { recursive: true, force: true });
+  });
+  const transportKillServer = createServer((socket) => socket.destroy());
+  invocation.own(async () => {
+    if (!transportKillServer.listening) return;
+    await new Promise<void>((resolveClose, rejectClose) => {
+      transportKillServer.close((error) => {
+        if (error) rejectClose(error);
+        else resolveClose();
+      });
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error): void => rejectListen(error);
+    transportKillServer.once("error", onError);
+    transportKillServer.listen(0, "127.0.0.1", () => {
+      transportKillServer.off("error", onError);
+      resolveListen();
+    });
+  });
+  const transportKillAddress = transportKillServer.address();
+  if (transportKillAddress === null || typeof transportKillAddress === "string") {
+    throw new Error("the transport-failure probe server did not expose a loopback port");
+  }
+  const transportProbeUrl = `http://127.0.0.1:${String(transportKillAddress.port)}/m5-controlled-transport-failure-probe`;
+  const transportProbeDocument = `data:text/html;charset=utf-8,${encodeURIComponent(
+    `<script>fetch("${transportProbeUrl}", { cache: "no-store" }).catch(() => {});</script>`,
+  )}`;
   const options = new firefox.Options().addArguments("-headless");
   options.enableBidi();
   const explicitFirefox = process.env["FLAKEBRAKE_FIREFOX_BINARY"];
@@ -73,11 +73,21 @@ try {
   else if (existsSync(localSnapFirefox)) options.setBinary(localSnapFirefox);
   const browser = await new Builder().forBrowser("firefox").setFirefoxOptions(options).build();
   driver = browser;
+  invocation.own(async () => {
+    await browser.quit();
+    driver = null;
+    if (process.env["FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE"] === "1") {
+      throw new Error("injected Selenium shutdown failure");
+    }
+  });
+  if (process.env["FLAKEBRAKE_M5_CLEANUP_PROBE_ONLY"] === "1") {
+    throw new Error("controlled browser cleanup probe before the merged journey");
+  }
   const browserScript = (
     browser as WebDriver & { script(): BrowserScriptErrorObserver }
   ).script();
   await browser.manage().setTimeouts({ implicit: 0, pageLoad: 20_000, script: 10_000 });
-  await browser.manage().window().setRect({ width: 1440, height: 1000 });
+  await browser.manage().window().setRect({ width: 1280, height: 800 });
   const sessionBrowser = {
     get: async (url: string) => {
       await browser.get(url);
@@ -90,8 +100,8 @@ try {
     },
   };
   const bidiNetwork = await createBidiNetwork(browser);
-  const networkProbeUrl = `${running.url}/m5-controlled-missing-resource-probe`;
-  networkCapture = await armSessionNetworkCapture(
+  const networkProbeUrl = `${invocation.url}/m5-controlled-missing-resource-probe`;
+  const armedNetworkCapture = await armSessionNetworkCapture(
     {
       addFailedResponseHandler: async (callback) => {
         await bidiNetwork.responseCompleted((event) => {
@@ -119,11 +129,16 @@ try {
       },
     },
   );
-  const armedNetworkCapture = networkCapture;
+  invocation.own(async () => {
+    await armedNetworkCapture.dispose();
+  });
   const networkProbeEntry = formatFailedResponse(networkProbeUrl, 404);
   const transportProbePrefix = `${transportProbeUrl} transport=`;
-  capture = await armSessionErrorCapture(browserScript, sessionBrowser);
-  await capture.openApplication(running.url);
+  const armedErrorCapture = await armSessionErrorCapture(browserScript, sessionBrowser);
+  invocation.own(async () => {
+    await armedErrorCapture.dispose();
+  });
+  await armedErrorCapture.openApplication(invocation.url);
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
   await waitText(browser, By.css(".pill-denied"), "REPLAN");
   await waitText(browser, By.id("proof-direct-result"), "Doesn’t fit yet");
@@ -210,10 +225,8 @@ try {
   assert.match(capacityProof, /criticality-weighted service degradation:[\s\S]*2\/5[\s\S]*versus[\s\S]*5/u);
   await screenshot(browser, join(screenshots, "02-proof-center-capacity.png"));
   await browser.executeScript("document.getElementById('proof-capacity-details').open = false; window.scrollTo(0, 0);");
-  await browser.manage().window().setRect({ width: 1024, height: 768 });
   assert.equal(await hasHorizontalOverflow(browser), false);
-  await screenshot(browser, join(screenshots, "03-1024x768-idle.png"));
-  await browser.manage().window().setRect({ width: 1440, height: 900 });
+  await screenshot(browser, join(screenshots, "03-1280x800-idle.png"));
 
   const start = await browser.findElement(By.id("start-button"));
   await browser.executeScript("document.getElementById('start-button').focus();");
@@ -289,7 +302,10 @@ try {
       assert.match(pendingTrustRows, /BLOCKED/u, "the mechanical handoff renders its Blocked result");
     }
     const foldViewports = [
-      [1440, 900], [1280, 800], [1120, 800], [1024, 768],
+      [1440, 900],
+      [1280, 800],
+      [1120, 800],
+      [1024, 768],
     ] as const;
     for (const [foldWidth, foldHeight] of foldViewports) {
       await browser.manage().window().setRect({ width: foldWidth, height: foldHeight });
@@ -598,17 +614,174 @@ try {
     "refresh/reconnect preserves the byte-identical canonical hero Evidence Bundle",
   );
 
-  const viewports = [[1440, 900], [820, 1180]] as const;
+  const viewports = [[1280, 800], [820, 1180]] as const;
   for (const [width, height] of viewports) {
     await browser.manage().window().setRect({ width, height });
     await browser.executeScript("window.scrollTo(0, 0);");
     assert.equal(await hasHorizontalOverflow(browser), false, `${String(width)}x${String(height)} overflow`);
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
-  await browser.executeScript("document.getElementById('challenge-title').scrollIntoView({block: 'start'});");
-  await screenshot(browser, join(screenshots, "10-challenge-tablet-820x1180.png"));
+  await screenshot(browser, join(screenshots, "10-tablet-820x1180.png"));
+  await browser.executeScript("document.getElementById('scenario-select').scrollIntoView({block: 'center'});");
+  await browser.executeScript("document.getElementById('scenario-select').focus();");
   assert.equal(
-    capture.capturedErrorCount(),
+    await browser.executeScript(
+      "return document.activeElement === document.getElementById('scenario-select');",
+    ),
+    true,
+    "the scenario selector is keyboard focusable",
+  );
+  await browser.findElement(By.id("scenario-select")).sendKeys(Key.END);
+  smokeStage = "capacity_scenario_selected";
+  await waitText(browser, By.id("hero-title"), "A capacity shock.", 30_000);
+  await waitText(browser, By.id("start-button"), "Start capacity shock", 30_000);
+  await waitText(browser, By.id("scenario-transition"), "100 to 90 minutes", 30_000);
+  assert.equal(
+    await browser.findElement(By.id("scenario-select")).getAttribute("value"),
+    "capacity-shock",
+  );
+  assert.match(await browser.findElement(By.id("basis-resolution")).getText(), /Capacity-plan\/v1/u);
+  assert.equal(await browser.findElement(By.id("guided-story")).isDisplayed(), false);
+  assert.equal(await browser.findElement(By.id("harness-ribbon")).isDisplayed(), false);
+  assert.equal(await browser.findElement(By.id("agent-trust")).isDisplayed(), false);
+  assert.equal(await browser.findElement(By.id("proof-center")).isDisplayed(), false);
+  assert.equal(await browser.findElement(By.id("challenge-lab")).isDisplayed(), false);
+  assert.equal(await browser.findElement(By.id("evidence-download")).isDisplayed(), false);
+  const capacityEvidenceResponse = await fetch(`${invocation.url}/api/evidence`);
+  assert.equal(capacityEvidenceResponse.status, 409);
+  assert.equal(
+    (await capacityEvidenceResponse.json() as { readonly error: string }).error,
+    "evidence_unavailable_for_scenario",
+  );
+  const capacityChallengeResponse = await fetch(`${invocation.url}/api/challenge`, {
+    method: "POST",
+    headers: { "content-type": "application/json", Origin: invocation.url },
+    body: JSON.stringify({ operation: "run", requestId: "browser-capacity-challenge-inert" }),
+  });
+  assert.equal(capacityChallengeResponse.status, 409);
+  assert.equal(
+    (await capacityChallengeResponse.json() as { readonly error: string }).error,
+    "challenge_unavailable_for_scenario",
+  );
+  assert.equal(await hasHorizontalOverflow(browser), false);
+  await screenshot(browser, join(screenshots, "08-capacity-shock-idle.png"));
+
+  await browser.findElement(By.id("start-button")).click();
+  const capacityDigests = new Set<string>();
+  for (let ownerCall = 1; ownerCall <= 4; ownerCall += 1) {
+    const panel = await browser.findElement(By.id("approval-panel"));
+    await browser.wait(
+      async () => {
+        const className = await panel.getAttribute("class");
+        const digest =
+          (await browser.findElement(By.id("approval-digest")).getAttribute("textContent")) ?? "";
+        return (
+          !className?.includes("is-continuing") &&
+          /^(?:m4-bridge\/)?sha256:[a-f0-9]{64}$/u.test(digest)
+        );
+      },
+      60_000,
+    );
+    const digest =
+      (await browser.findElement(By.id("approval-digest")).getAttribute("textContent")) ?? "";
+    assert.equal(capacityDigests.has(digest), false);
+    capacityDigests.add(digest);
+    const guidance = await browser.findElement(By.id("approval-guidance")).getText();
+    const button = await browser.findElement(
+      By.id(guidance.toLowerCase().includes("deny") ? "deny-button" : "allow-button"),
+    );
+    assert.equal(await button.isEnabled(), true);
+    await button.click();
+    smokeStage = `capacity_owner_${ownerCall}_clicked`;
+    await browser.wait(
+      async () => {
+        const outcome = await browser.findElement(By.id("outcome")).getText();
+        if (outcome === "Verified success" || outcome === "Stopped safely") return true;
+        const nextDigest =
+          (await browser.findElement(By.id("approval-digest")).getAttribute("textContent")) ?? "";
+        return nextDigest !== digest;
+      },
+      60_000,
+    );
+  }
+  await waitText(browser, By.id("outcome"), "Verified success", 60_000);
+  const capacityDocument = await browser.findElement(By.css("body")).getText();
+  assert.match(capacityDocument, /Initial plan: ADMITTABLE/u);
+  assert.match(capacityDocument, /Capacity shock: 100 → 90 minutes/u);
+  assert.match(capacityDocument, /Stale v1 action rejected/u);
+  assert.match(capacityDocument, /09:36–10:00/u);
+  assert.match(capacityDocument, /Agent work[\s\S]*3/u);
+  assert.match(capacityDocument, /Production cell[\s\S]*24/u);
+  assert.match(capacityDocument, /order\/best-effort-training-trays/u);
+  assert.match(await browser.findElement(By.id("winning-change")).getText(), /Quantity 10 → 8/u);
+  assert.doesNotMatch(capacityDocument, /Agents checking agents|Operator proof center|TrueForge harness/u);
+  assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
+  assert.deepEqual(
+    await Promise.all(
+      (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
+    ),
+    ["1", "1", "1", "1"],
+  );
+  const capacityBeforeReplay = await fetch(`${invocation.url}/api/state`).then(
+    (response) => response.json(),
+  ) as CapacitySmokeState;
+  assert.equal(capacityBeforeReplay.scenario.staleBasisRejectionCount, 1);
+  assert.equal(capacityBeforeReplay.safety.ownerCallCount, 4);
+  assert.equal(capacityBeforeReplay.safety.mechanicalDenialCount, 1);
+  assert.equal(capacityBeforeReplay.execution.acceptanceCount, 1);
+  assert.equal(capacityBeforeReplay.execution.attemptCount, 1);
+  assert.equal(capacityBeforeReplay.execution.mutationCount, 1);
+  assert.equal(capacityBeforeReplay.execution.receiptCount, 1);
+  assert.equal(capacityBeforeReplay.execution.terminalEventCount, 1);
+  assert.equal(capacityBeforeReplay.execution.actualFactCount, 2);
+  assert.equal(capacityBeforeReplay.challengeLab.status, "idle");
+  assert.equal(capacityBeforeReplay.challengeLab.canRun, false);
+  assert.equal(capacityBeforeReplay.agentTrust.checks.length, 0);
+  const capacitySession = await browser.findElement(By.id("session-id")).getText();
+  await screenshot(browser, join(screenshots, "09-capacity-shock-verified.png"));
+  await browser.navigate().refresh();
+  await waitText(browser, By.id("outcome"), "Verified success", 60_000);
+  assert.equal(await browser.findElement(By.id("session-id")).getText(), capacitySession);
+  assert.equal(
+    await browser.findElement(By.id("scenario-select")).getAttribute("value"),
+    "capacity-shock",
+  );
+  const capacityAfterReplay = await fetch(`${invocation.url}/api/state`).then(
+    (response) => response.json(),
+  ) as CapacitySmokeState;
+  assert.equal(
+    capacityAfterReplay.run.ownerCallsThisProcess,
+    capacityBeforeReplay.run.ownerCallsThisProcess,
+  );
+  assert.deepEqual(capacityAfterReplay.execution, capacityBeforeReplay.execution);
+  assert.equal(capacityAfterReplay.safety.ownerCallCount, 4);
+  assert.equal(capacityAfterReplay.safety.mechanicalDenialCount, 1);
+
+  await browser.executeScript("document.getElementById('scenario-select').scrollIntoView({block: 'center'});");
+  await browser.findElement(By.id("scenario-select")).sendKeys(Key.HOME);
+  smokeStage = "hero_restored";
+  await waitText(browser, By.id("hero-title"), "A rush order.", 30_000);
+  await waitText(browser, By.id("outcome"), "Verified success", 30_000);
+  await waitText(browser, By.id("challenge-status"), "6 / 6 passed", 30_000);
+  assert.equal(await browser.findElement(By.id("scenario-select")).getAttribute("value"), "rush-order");
+  assert.equal(await browser.findElement(By.id("guided-story")).isDisplayed(), true);
+  assert.equal(await browser.findElement(By.id("harness-ribbon")).isDisplayed(), true);
+  assert.equal(await browser.findElement(By.id("agent-trust")).isDisplayed(), true);
+  assert.equal(await browser.findElement(By.id("proof-center")).isDisplayed(), true);
+  assert.equal(await browser.findElement(By.id("challenge-lab")).isDisplayed(), true);
+  assert.equal(await browser.findElement(By.id("evidence-download")).isDisplayed(), true);
+  assert.deepEqual(
+    await readHeroProjection(browser),
+    heroBeforeChallenge,
+    "switching back restores the byte-identical canonical hero projection",
+  );
+  assert.equal(
+    await fetch(`${invocation.url}/api/evidence`).then((response) => response.text()),
+    evidenceBeforeChallenge,
+    "switching back restores the byte-identical canonical Mission Evidence Bundle",
+  );
+  assert.equal(
+    armedErrorCapture.capturedErrorCount(),
     0,
     "the session-level observer captured no JavaScript errors across application loads",
   );
@@ -645,7 +818,7 @@ try {
   // cancellation as NS_BINDING_ABORTED. Only that exact self-inflicted
   // signature is exempt — every other failed request still fails the smoke.
   const navigationAbortedPoll = (entry: string): boolean =>
-    entry.startsWith(`${running.url}/api/`) && entry.endsWith("transport=NS_BINDING_ABORTED");
+    entry.startsWith(`${invocation.url}/api/`) && entry.endsWith("transport=NS_BINDING_ABORTED");
   assert.deepEqual(
     sessionFailures.filter(
       (entry) =>
@@ -666,9 +839,8 @@ try {
     true,
     "the controlled end-of-session transport failure was observed by the session channel",
   );
-  process.stdout.write(`M5_BROWSER_SMOKE=PASS\nM5_SCREENSHOTS=${screenshots}\n`);
 } catch (error: unknown) {
-  const durable = await fetch(`${running.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
+  const durable = await fetch(`${invocation.url}/api/state`).then((response) => response.json()).catch(() => ({})) as {
     readonly run?: { readonly status?: string; readonly errorCode?: string | null };
     readonly pendingApproval?: { readonly toolName?: string } | null;
     readonly approvals?: readonly unknown[];
@@ -692,65 +864,15 @@ try {
   );
 }
 
-const cleanupErrors: unknown[] = [];
-try {
-  if (capture !== null) {
-    await capture.dispose();
-    capture = null;
-  }
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  if (networkCapture !== null) {
-    await networkCapture.dispose();
-    networkCapture = null;
-  }
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  await new Promise<void>((resolveClose, rejectClose) => {
-    transportKillServer.close((error) => {
-      if (error) rejectClose(error);
-      else resolveClose();
-    });
-  });
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  await driver?.quit();
-  if (process.env["FLAKEBRAKE_M5_INJECT_DRIVER_QUIT_FAILURE"] === "1") {
-    throw new Error("injected Selenium shutdown failure");
-  }
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  await running.close();
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-try {
-  rmSync(root, { recursive: true, force: true });
-} catch (error: unknown) {
-  cleanupErrors.push(error);
-}
-
 if (primaryError !== null) {
-  if (cleanupErrors.length > 0) {
-    throw new AggregateError([primaryError, ...cleanupErrors], "M5 browser smoke and cleanup failed", {
-      cause: primaryError instanceof Error ? primaryError : undefined,
-    });
-  }
-  throw primaryError;
+  await invocation.fail(primaryError);
 }
-if (cleanupErrors.length > 0) {
-  throw new AggregateError(cleanupErrors, "M5 browser smoke cleanup failed");
-}
+await invocation.close();
 
-await assert.rejects(fetch(running.url), /fetch failed|ECONNREFUSED/u);
+await assert.rejects(fetch(invocation.url), /fetch failed|ECONNREFUSED/u);
+process.stdout.write(
+  `M5_BROWSER_SMOKE=PASS\nM5_BROWSER_SMOKE_PORT=${String(invocation.port)}\nM5_SCREENSHOTS_CAPTURED=${String(screenshotsCaptured)}\n`,
+);
 
 async function waitText(
   driver: WebDriver,
@@ -788,10 +910,28 @@ async function readHeroProjection(driver: WebDriver): Promise<Record<string, unk
 async function screenshot(driver: WebDriver, path: string): Promise<void> {
   const encoded = await driver.takeScreenshot();
   writeFileSync(path, encoded, "base64");
+  screenshotsCaptured += 1;
 }
 
 async function hasHorizontalOverflow(driver: WebDriver): Promise<boolean> {
   return await driver.executeScript<boolean>(
     "return document.documentElement.scrollWidth > document.documentElement.clientWidth;",
   );
+}
+
+interface CapacitySmokeState {
+  readonly scenario: { readonly staleBasisRejectionCount: number };
+  readonly run: { readonly ownerCallsThisProcess: number };
+  readonly safety: { readonly ownerCallCount: number; readonly mechanicalDenialCount: number };
+  readonly execution: {
+    readonly acceptanceCount: number;
+    readonly attemptCount: number;
+    readonly mutationCount: number;
+    readonly receiptCount: number;
+    readonly terminalEventCount: number;
+    readonly actualFactCount: number;
+    readonly [key: string]: unknown;
+  };
+  readonly challengeLab: { readonly status: string; readonly canRun: boolean };
+  readonly agentTrust: { readonly checks: readonly unknown[] };
 }

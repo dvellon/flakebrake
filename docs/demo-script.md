@@ -106,6 +106,30 @@ corrections.”
 - Refresh changes none of those counts.
 - Press `Ctrl+C` after the demo and confirm clean shutdown.
 
+## Optional 1:45 capacity-shock extension
+
+After the hero, choose **Capacity shock · second scenario**. This selection is
+optional and does not change the default three-minute flow.
+
+1. Point out that `capacity-plan/v1` was `ADMITTABLE`: agent 10/10, human 3/4,
+   and production 96/100.
+2. Show the spindle calibration transition to `capacity-plan/v2`, where only
+   production capacity changes from 100 to 90. Explain that the exact v1 action
+   is rejected because its `capacity_plan_version` is stale; it cannot authorize
+   work against the owner-approved current plan.
+3. Show the current `REPLAN` at production 96/90. Both single-change candidates
+   land at 90/90; existing comparison rules choose best-effort training trays
+   10 → 8 over reducing the important planned batch 8 → 6. Protected cold-chain
+   work remains unchanged.
+4. Approve the replan and fresh promise, deny 09:12–09:36, then approve
+   09:36–10:00. Point out the equivalent adapter's mechanical denial.
+5. Show exact terminal counts: one acceptance, attempt, mutation, and receipt;
+   two actual facts (agent 3 and production 24); independent read-back; and one
+   stale-basis rejection.
+6. Refresh to show the same capacity-shock session and terminal projection with
+   no duplicate effect. Switching back to **Rush order · hero** restores the
+   original untouched projection from its separate state.
+
 ## Optional 60–90 seconds — Challenge FlakeBrake
 
 After the normal hero story, scroll to **Challenge FlakeBrake** and activate
@@ -126,4 +150,4 @@ none**.
 
 **Say:** “Invalid identity, stale basis, attempt conflict, forged receipt, and
 alternate representation after denial all fail closed. The one valid replay
-returns prior evidence without executing twice.”
+returns prior evidence without executing twice."
