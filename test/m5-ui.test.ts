@@ -818,6 +818,312 @@ interface MarkerSeamLike {
   readonly rmSync: (path: string, options?: { readonly force?: boolean }) => void;
 }
 
+describe("Qodo PR16 Round 5: collision-safe temporaries and the platform durability contract", () => {
+  const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
+  const MARKER_NAME = "m5-sandbox-evidence.json";
+  const roots: string[] = [];
+
+  after(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  const newRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-round5-"));
+    roots.push(root);
+    return root;
+  };
+
+  const ownRoot = async (root: string): Promise<void> => {
+    const owner = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    await owner.close();
+  };
+
+  const bindHeroMission = async (root: string, sessionId: string): Promise<void> => {
+    const { M4MissionStore } = await import("../src/m4-mission-store.js");
+    const store = new M4MissionStore({ path: join(root, "mission.sqlite") });
+    try {
+      store.bindMission({
+        missionId: HERO_MISSION_ID,
+        environmentId: "env/hero-microfactory",
+        trueforgeAgentId: "agent/test",
+        trueforgeSessionId: sessionId,
+        m2EnvironmentIdentity: "m2/test",
+        factoryEnvironmentIdentity: "factory/test",
+      });
+    } finally {
+      store.close();
+    }
+  };
+
+  const validMarker = (sessionId: string): string =>
+    `${JSON.stringify({ missionId: HERO_MISSION_ID, trueforgeSessionId: sessionId, trueforgeTurnId: "turn/test" })}\n`;
+
+  type PublishResult = string | undefined;
+
+  const loadPublisher = async (): Promise<
+    (destination: string, serialized: string, filesystem?: Record<string, unknown>) => PublishResult
+  > => {
+    const module_ = (await import("../src/m5-ui.js")) as Record<string, unknown>;
+    const publisher = module_["publishJsonFileAtomically"];
+    assert.equal(typeof publisher, "function");
+    return publisher as (
+      destination: string,
+      serialized: string,
+      filesystem?: Record<string, unknown>,
+    ) => PublishResult;
+  };
+
+  interface Round5Seam {
+    readonly seam: Record<string, unknown>;
+    readonly log: string[];
+    readonly suffixCalls: () => number;
+    readonly createdTemporaries: () => readonly string[];
+    readonly directoryDescriptor: () => number | null;
+  }
+
+  const round5Seam = (
+    root: string,
+    options?: {
+      readonly suffixes?: readonly string[];
+      readonly platform?: string;
+      readonly directoryFsyncError?: () => Error;
+      readonly renameError?: () => Error;
+    },
+  ): Round5Seam => {
+    const log: string[] = [];
+    let suffixIndex = 0;
+    let directoryDescriptor: number | null = null;
+    const created: string[] = [];
+    const seam: Record<string, unknown> = {
+      openSync: (path: string, flags: string, mode?: number) => {
+        if (resolve(path) === resolve(root)) {
+          const descriptor = openSync(path, flags, mode);
+          directoryDescriptor = descriptor;
+          log.push("open-directory");
+          return descriptor;
+        }
+        const descriptor = openSync(path, flags, mode);
+        if (flags === "wx") {
+          created.push(path);
+          log.push(`create:${path}`);
+        }
+        return descriptor;
+      },
+      writeSync: (descriptor: number, payload: Uint8Array, offset?: number) => writeSync(descriptor, payload, offset),
+      fsyncSync: (descriptor: number) => {
+        if (descriptor === directoryDescriptor) {
+          log.push("fsync-directory");
+          const failure = options?.directoryFsyncError?.();
+          if (failure !== undefined) throw failure;
+          fsyncSync(descriptor);
+          return;
+        }
+        fsyncSync(descriptor);
+      },
+      closeSync: (descriptor: number) => closeSync(descriptor),
+      renameSync: (from: string, to: string) => {
+        const failure = options?.renameError?.();
+        if (failure !== undefined) throw failure;
+        log.push(`rename:${from}`);
+        renameSync(from, to);
+      },
+      rmSync: (path: string, removeOptions?: { readonly force?: boolean }) => {
+        log.push(`rm:${path}`);
+        rmSync(path, removeOptions);
+      },
+      randomSuffix: () => {
+        const suffixes = options?.suffixes ?? [];
+        const value = suffixes[suffixIndex] ?? `fallback-${String(suffixIndex)}`;
+        suffixIndex += 1;
+        return value;
+      },
+    };
+    if (options?.platform !== undefined) seam["platform"] = options.platform;
+    return {
+      seam,
+      log,
+      suffixCalls: () => suffixIndex,
+      createdTemporaries: () => created,
+      directoryDescriptor: () => directoryDescriptor,
+    };
+  };
+
+  const errnoError = (code: string, message: string): Error => {
+    const error = new Error(message) as NodeJS.ErrnoException;
+    error.code = code;
+    return error;
+  };
+
+  test("reproduction 1: a colliding crash orphan must not drop the checkpoint or be deleted", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    // Learn the exact candidate name the current scheme will choose next, so
+    // the crash orphan collides deterministically on the legacy pid.sequence
+    // naming; under the injected-suffix contract the stub's first identity is
+    // pre-created instead.
+    const learn = round5Seam(root, { suffixes: ["learn-1"] });
+    publish(join(root, "learning.json"), validMarker("session/current"), learn.seam);
+    const learned = learn.createdTemporaries()[0] ?? "";
+    const legacyMatch = /\.(\d+)\.(\d+)\.tmp$/u.exec(learned);
+    const predicted =
+      legacyMatch === null
+        ? `${destination}.collide-1.tmp`
+        : `${destination}.${legacyMatch[1] ?? ""}.${String(Number(legacyMatch[2] ?? "0") + 1)}.tmp`;
+    const foreignContent = "another writer's in-flight publication";
+    writeFileSync(predicted, foreignContent);
+    const recorder = round5Seam(root, { suffixes: ["collide-1", "collide-2"] });
+    assert.doesNotThrow(
+      () => publish(destination, validMarker("session/current"), recorder.seam),
+      "a collision with a crash orphan must retry a fresh identity instead of dropping the checkpoint",
+    );
+    assert.equal(
+      readFileSync(predicted, "utf8"),
+      foreignContent,
+      "the pre-existing colliding file stays byte-identical — never deleted by an invocation that did not create it",
+    );
+    assert.equal(readFileSync(destination, "utf8"), validMarker("session/current"));
+    assert.ok(recorder.suffixCalls() >= 2, "the injected randomness seam supplies each candidate identity");
+  });
+
+  test("reproduction 2: the Windows unsupported directory-sync signature must not reject publication", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    const recorder = round5Seam(root, {
+      suffixes: ["win-1"],
+      platform: "win32",
+      directoryFsyncError: () => errnoError("EPERM", "EPERM: operation not permitted, fsync"),
+    });
+    let result: PublishResult;
+    assert.doesNotThrow(() => {
+      result = publish(destination, validMarker("session/current"), recorder.seam);
+    }, "Windows's authoritative unsupported directory-fsync signature must not reject an otherwise complete publication");
+    assert.equal(
+      result,
+      "file-durable-atomic-replacement",
+      "the narrower established guarantee is represented explicitly instead of claiming full directory durability",
+    );
+    assert.equal(readFileSync(destination, "utf8"), validMarker("session/current"));
+  });
+
+  test("bounded collisions advance identities and exhaustion fails closed without deleting foreign files", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    for (const suffix of ["c-1", "c-2", "c-3"]) {
+      writeFileSync(`${destination}.${suffix}.tmp`, `foreign ${suffix}`);
+    }
+    const advancing = round5Seam(root, { suffixes: ["c-1", "c-2", "c-3", "c-4"] });
+    publish(destination, validMarker("session/current"), advancing.seam);
+    assert.equal(advancing.suffixCalls(), 4, "each collision advances to a new identity under the bound");
+    for (const suffix of ["c-1", "c-2", "c-3"]) {
+      assert.equal(readFileSync(`${destination}.${suffix}.tmp`, "utf8"), `foreign ${suffix}`);
+    }
+    assert.equal(readFileSync(destination, "utf8"), validMarker("session/current"));
+
+    const exhaustedRoot = newRoot();
+    const exhaustedDestination = join(exhaustedRoot, MARKER_NAME);
+    writeFileSync(`${exhaustedDestination}.same.tmp`, "foreign same");
+    const constant = round5Seam(exhaustedRoot, {
+      suffixes: ["same", "same", "same", "same", "same", "same", "same", "same"],
+    });
+    assert.throws(
+      () => publish(exhaustedDestination, validMarker("session/current"), constant.seam),
+      "exhausting the collision bound fails closed",
+    );
+    assert.equal(readFileSync(`${exhaustedDestination}.same.tmp`, "utf8"), "foreign same");
+    assert.equal(existsSync(exhaustedDestination), false);
+    assert.equal(
+      constant.log.some((entry) => entry.startsWith("rm:")),
+      false,
+      "exhaustion deletes nothing — no foreign file was created by this invocation",
+    );
+  });
+
+  test("failure cleanup removes only a temporary this invocation created", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    writeFileSync(`${destination}.bystander.tmp`, "foreign bystander");
+    const failing = round5Seam(root, {
+      suffixes: ["mine-1"],
+      renameError: () => errnoError("EIO", "injected rename failure"),
+    });
+    assert.throws(() => publish(destination, validMarker("session/current"), failing.seam));
+    const removed = failing.log.filter((entry) => entry.startsWith("rm:"));
+    assert.deepEqual(
+      removed,
+      [`rm:${destination}.mine-1.tmp`],
+      "cleanup targets exactly the invocation-owned temporary",
+    );
+    assert.equal(readFileSync(`${destination}.bystander.tmp`, "utf8"), "foreign bystander");
+  });
+
+  test("the platform durability contract distinguishes unsupported signatures from genuine failures", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const fullResult = publish(join(root, "full.json"), validMarker("session/current"), round5Seam(root, { suffixes: ["f-1"] }).seam);
+    assert.equal(fullResult, "directory-durable", "a supported-platform directory fsync yields the full durability result");
+
+    const linuxEperm = round5Seam(root, {
+      suffixes: ["l-1"],
+      platform: "linux",
+      directoryFsyncError: () => errnoError("EPERM", "EPERM on a supported platform"),
+    });
+    assert.throws(
+      () => publish(join(root, "linux-eperm.json"), validMarker("session/current"), linuxEperm.seam),
+      "EPERM on a supported platform remains fail-closed and never bypasses durability",
+    );
+
+    const windowsEio = round5Seam(root, {
+      suffixes: ["w-1"],
+      platform: "win32",
+      directoryFsyncError: () => errnoError("EIO", "genuine I/O failure on Windows"),
+    });
+    assert.throws(
+      () => publish(join(root, "win-eio.json"), validMarker("session/current"), windowsEio.seam),
+      "genuine I/O errors remain failures on every platform",
+    );
+  });
+
+  test("restart restores the committed observation under both durability outcomes", async () => {
+    const publish = await loadPublisher();
+    const directoryDurableRoot = newRoot();
+    await ownRoot(directoryDurableRoot);
+    await bindHeroMission(directoryDurableRoot, "session/current");
+    publish(
+      join(directoryDurableRoot, MARKER_NAME),
+      validMarker("session/current"),
+      round5Seam(directoryDurableRoot, { suffixes: ["dd-1"] }).seam,
+    );
+    const fileDurableRoot = newRoot();
+    await ownRoot(fileDurableRoot);
+    await bindHeroMission(fileDurableRoot, "session/current");
+    publish(
+      join(fileDurableRoot, MARKER_NAME),
+      validMarker("session/current"),
+      round5Seam(fileDurableRoot, {
+        suffixes: ["fd-1"],
+        platform: "win32",
+        directoryFsyncError: () => errnoError("EPERM", "EPERM: operation not permitted, fsync"),
+      }).seam,
+    );
+    for (const root of [directoryDurableRoot, fileDurableRoot]) {
+      const coordinator = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+      try {
+        assert.equal(
+          coordinator.state().evidenceTimeline.some((item) => item.kind === "sandbox"),
+          true,
+          "the committed mission/session-bound observation restores after restart",
+        );
+      } finally {
+        await coordinator.close();
+      }
+    }
+  });
+});
+
 describe("Qodo PR16 Round 4: crash-durable publication and temporary ownership", () => {
   const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
   const MARKER_NAME = "m5-sandbox-evidence.json";

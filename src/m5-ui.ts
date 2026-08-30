@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   createReadStream,
@@ -333,6 +333,7 @@ export class M5DemoCoordinator {
   #revision = 0;
   #ownerCallsThisProcess = 0;
   #replayedTerminal = false;
+  #markerDurability: MarkerPublicationDurability | null = null;
 
   public constructor(options: M5DemoCoordinatorOptions) {
     if (!isAbsolute(options.dataRoot)) {
@@ -409,8 +410,13 @@ export class M5DemoCoordinator {
       ) {
         return;
       }
-      publishJsonFileAtomically(this.#paths.sandboxEvidence, serialized);
+      // The durability level actually established is kept as an internal
+      // diagnostic; no user-facing copy claims more than the marker's
+      // file-level durability, so a Windows file-durable outcome needs no
+      // presentation change.
+      this.#markerDurability = publishJsonFileAtomically(this.#paths.sandboxEvidence, serialized);
     } catch {
+      this.#markerDurability = null;
       // Persistence is best effort; the live in-memory evidence still renders
       // and any previously committed marker remains untouched on disk.
     }
@@ -420,6 +426,17 @@ export class M5DemoCoordinator {
   // process's in-flight publication, and deleting it would break that
   // writer's atomic rename. Restoration reads only the committed marker
   // path, so crash-orphaned temporaries are inert.
+
+  /**
+   * Internal diagnostic only: the durability level the last sandbox-marker
+   * publication actually established ("directory-durable", the narrower
+   * "file-durable-atomic-replacement" on platforms that cannot fsync a
+   * directory, or null when no publication succeeded). Never projected into
+   * judge-facing state, which claims no more than the marker's existence.
+   */
+  public markerDurabilityDiagnostic(): MarkerPublicationDurability | null {
+    return this.#markerDurability;
+  }
 
   public start(): M5JudgeState {
     this.#assertOpen();
@@ -1597,8 +1614,6 @@ function winningModification(candidate: {
   };
 }
 
-let markerPublicationSequence = 0;
-
 export interface MarkerFilesystem {
   readonly openSync: (path: string, flags: string, mode?: number) => number;
   readonly writeSync: (descriptor: number, payload: Uint8Array, offset?: number) => number;
@@ -1606,6 +1621,8 @@ export interface MarkerFilesystem {
   readonly closeSync: (descriptor: number) => void;
   readonly renameSync: (from: string, to: string) => void;
   readonly rmSync: (path: string, options?: { readonly force?: boolean }) => void;
+  readonly randomSuffix?: () => string;
+  readonly platform?: NodeJS.Platform;
 }
 
 const REAL_MARKER_FILESYSTEM: MarkerFilesystem = {
@@ -1617,33 +1634,68 @@ const REAL_MARKER_FILESYSTEM: MarkerFilesystem = {
   rmSync,
 };
 
+export type MarkerPublicationDurability = "directory-durable" | "file-durable-atomic-replacement";
+
+const MARKER_COLLISION_ATTEMPTS = 5;
+
+// Windows cannot fsync a directory handle: Node reports EPERM (and directory
+// opens can report EISDIR/ENOTSUP). Only these signatures, and only on
+// win32, downgrade to the narrower file-durability result; the same codes on
+// a supported platform — and genuine I/O errors everywhere — stay failures.
+const WINDOWS_DIRECTORY_SYNC_UNSUPPORTED_CODES = new Set(["EPERM", "EISDIR", "ENOTSUP"]);
+
+function errnoCode(error: unknown): string | null {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof code === "string" ? code : null;
+}
+
 /**
- * Crash-durable marker publication. The complete payload is written to a
- * unique invocation-owned temporary file in the destination directory
- * (exclusive creation, 0o600), flushed to disk, and closed before an atomic
- * same-directory rename publishes it over the committed path; the containing
- * directory is then opened, fsynced, and closed so the rename's directory
- * entry itself is durable before success is reported. The committed path is
- * never opened or truncated in place, so the last valid marker survives any
- * failure before publication. Failures before the rename remove only this
- * invocation's temporary file without masking the primary error; failures
- * establishing directory durability propagate — on a platform where the
- * containing directory cannot be opened or fsynced, publication fails closed
- * rather than silently claiming crash durability — and when a secondary
- * cleanup step also fails, both diagnostics are reported with the primary
- * error first.
+ * Crash-durable marker publication. The complete payload is written to an
+ * invocation-owned temporary file in the destination directory whose identity
+ * comes from a high-entropy random suffix (exclusive creation, 0o600, no
+ * mission or session content in the name); an EEXIST collision retries a
+ * fresh identity under a small explicit bound and never touches the
+ * pre-existing file, and exhausting the bound fails closed without deleting
+ * anything foreign. The payload is fully written, fsynced, and closed before
+ * an atomic same-directory rename publishes it — the committed path is never
+ * opened or truncated in place. After the rename the containing directory is
+ * opened, fsynced, and closed; on platforms that support it this is required
+ * before the full "directory-durable" result is reported, while Windows's
+ * authoritative unsupported signature yields the explicit narrower
+ * "file-durable-atomic-replacement" result instead of a false durability
+ * claim. Pre-rename failures clean only the temporary this invocation
+ * actually created, preserving the primary error and attaching cleanup
+ * diagnostics secondarily.
  */
 export function publishJsonFileAtomically(
   destination: string,
   serialized: string,
   filesystem: MarkerFilesystem = REAL_MARKER_FILESYSTEM,
-): void {
-  markerPublicationSequence += 1;
-  const temporary = `${destination}.${String(process.pid)}.${String(markerPublicationSequence)}.tmp`;
+): MarkerPublicationDurability {
+  const nextSuffix = filesystem.randomSuffix ?? ((): string => randomUUID());
+  const platform = filesystem.platform ?? process.platform;
   let descriptor: number | null = null;
+  let temporary: string | null = null;
+  let collision: unknown = null;
+  for (let attempt = 0; attempt < MARKER_COLLISION_ATTEMPTS && descriptor === null; attempt += 1) {
+    const candidate = `${destination}.${nextSuffix()}.tmp`;
+    try {
+      descriptor = filesystem.openSync(candidate, "wx", 0o600);
+      temporary = candidate;
+    } catch (error: unknown) {
+      if (errnoCode(error) !== "EEXIST") throw error;
+      collision = error;
+    }
+  }
+  if (descriptor === null || temporary === null) {
+    throw new Error(
+      `Marker publication exhausted ${String(MARKER_COLLISION_ATTEMPTS)} unique temporary identities`,
+      { cause: collision },
+    );
+  }
+  const owned = temporary;
   let renamed = false;
   try {
-    descriptor = filesystem.openSync(temporary, "wx", 0o600);
     const payload = Buffer.from(serialized, "utf8");
     let written = 0;
     while (written < payload.length) {
@@ -1652,15 +1704,21 @@ export function publishJsonFileAtomically(
     filesystem.fsyncSync(descriptor);
     filesystem.closeSync(descriptor);
     descriptor = null;
-    filesystem.renameSync(temporary, destination);
+    filesystem.renameSync(owned, destination);
     renamed = true;
     let directoryDescriptor: number | null = null;
     let durabilityFailure: unknown = null;
+    let directoryDurable = true;
     try {
       directoryDescriptor = filesystem.openSync(dirname(destination), "r");
       filesystem.fsyncSync(directoryDescriptor);
     } catch (error: unknown) {
-      durabilityFailure = error;
+      const code = errnoCode(error);
+      if (platform === "win32" && code !== null && WINDOWS_DIRECTORY_SYNC_UNSUPPORTED_CODES.has(code)) {
+        directoryDurable = false;
+      } else {
+        durabilityFailure = error;
+      }
     }
     if (directoryDescriptor !== null) {
       try {
@@ -1675,6 +1733,7 @@ export function publishJsonFileAtomically(
       }
     }
     if (durabilityFailure !== null) throw durabilityFailure;
+    return directoryDurable ? "directory-durable" : "file-durable-atomic-replacement";
   } catch (error: unknown) {
     if (renamed) throw error;
     const cleanupFailures: unknown[] = [];
@@ -1687,7 +1746,7 @@ export function publishJsonFileAtomically(
       descriptor = null;
     }
     try {
-      filesystem.rmSync(temporary, { force: true });
+      filesystem.rmSync(owned, { force: true });
     } catch (removeError: unknown) {
       cleanupFailures.push(removeError);
     }
