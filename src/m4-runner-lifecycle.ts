@@ -1,3 +1,6 @@
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import type { Socket } from "node:net";
+
 interface OwnedResource {
   readonly close: () => Promise<void>;
   closeFailureReported: boolean;
@@ -8,6 +11,307 @@ export interface M4RunnerLifecycleError extends Error {
 }
 
 const CLEANUP_FAILURE_SOURCES = new WeakMap<Error, (readonly unknown[])[]>();
+
+interface OwnedHttpHandler {
+  readonly request: IncomingMessage;
+  readonly response: ServerResponse;
+  readonly done: Promise<void>;
+  readonly resolveDone: () => void;
+}
+
+interface OwnedHttpSocket {
+  readonly done: Promise<void>;
+  readonly resolveDone: () => void;
+}
+
+export interface OwnedHttpServerLifecycleOptions {
+  readonly signal?: AbortSignal;
+  readonly drainTimeoutMs: number;
+  readonly forceSettlementTimeoutMs: number;
+  readonly incompleteRequestMessage: string;
+  readonly closeFailureMessage: string;
+}
+
+type ListenerState = "idle" | "starting" | "listening" | "failed" | "stopped";
+
+/**
+ * One invocation-local owner for a listening HTTP server, its handlers, and
+ * every accepted socket. Abort and explicit teardown always join the same
+ * retryable close attempt.
+ */
+export class OwnedHttpServerLifecycle {
+  readonly #server: Server;
+  readonly #options: OwnedHttpServerLifecycleOptions;
+  readonly #handlers = new Set<OwnedHttpHandler>();
+  readonly #sockets = new Map<Socket, OwnedHttpSocket>();
+  #listenerState: ListenerState = "idle";
+  #underlyingListenSettled: Promise<void> = Promise.resolve();
+  #rejectStartupAbort: ((reason: unknown) => void) | undefined;
+  #abortListener: (() => void) | undefined;
+  #closePromise: Promise<void> | undefined;
+  #serverStopPromise: Promise<void> | undefined;
+  #serverCloseObserved = false;
+  #closing = false;
+  #closed = false;
+
+  public constructor(server: Server, options: OwnedHttpServerLifecycleOptions) {
+    this.#server = server;
+    this.#options = options;
+    server.on("connection", this.#trackSocket);
+    server.once("close", this.#observeServerClose);
+  }
+
+  public get closing(): boolean {
+    return this.#closing;
+  }
+
+  public listen(host: string, port: number): Promise<void> {
+    if (this.#listenerState !== "idle") {
+      throw new Error("HTTP server lifecycle listen may only be called once");
+    }
+    const signal = this.#options.signal;
+    this.#listenerState = "starting";
+    let settleUnderlying: (() => void) | undefined;
+    this.#underlyingListenSettled = new Promise<void>((resolve) => {
+      settleUnderlying = resolve;
+    });
+    const aborted = new Promise<never>((_resolve, reject) => {
+      this.#rejectStartupAbort = reject;
+    });
+    this.#armAbort(signal);
+    if (signal?.aborted === true) {
+      this.#listenerState = "failed";
+      settleUnderlying?.();
+      return aborted.finally(() => {
+        this.#rejectStartupAbort = undefined;
+      });
+    }
+    const underlying = new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => {
+        this.#server.off("listening", onListening);
+        this.#listenerState = "failed";
+        settleUnderlying?.();
+        reject(error);
+      };
+      const onListening = (): void => {
+        this.#server.off("error", onError);
+        this.#listenerState = "listening";
+        settleUnderlying?.();
+        resolve();
+      };
+      this.#server.once("error", onError);
+      this.#server.once("listening", onListening);
+      try {
+        this.#server.listen({ host, port });
+      } catch (error: unknown) {
+        this.#server.off("error", onError);
+        this.#server.off("listening", onListening);
+        this.#listenerState = "failed";
+        settleUnderlying?.();
+        reject(error);
+      }
+    });
+    // The underlying listener result remains observed if abort wins first.
+    void underlying.catch(() => undefined);
+    return Promise.race([underlying, aborted]).finally(() => {
+      this.#rejectStartupAbort = undefined;
+    });
+  }
+
+  public runHandler(
+    request: IncomingMessage,
+    response: ServerResponse,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    let resolveDone: (() => void) | undefined;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const handler: OwnedHttpHandler = {
+      request,
+      response,
+      done,
+      resolveDone: () => resolveDone?.(),
+    };
+    this.#handlers.add(handler);
+    return Promise.resolve()
+      .then(operation)
+      .finally(() => {
+        this.#handlers.delete(handler);
+        handler.resolveDone();
+      });
+  }
+
+  public close(): Promise<void> {
+    if (this.#closed) return Promise.resolve();
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    this.#closing = true;
+    const attempt = this.#closeAttempt();
+    this.#closePromise = attempt;
+    void attempt.then(
+      () => {
+        this.#closed = true;
+        this.#disarmAbort();
+      },
+      () => {
+        if (this.#closePromise === attempt) this.#closePromise = undefined;
+      },
+    );
+    return attempt;
+  }
+
+  async #closeAttempt(): Promise<void> {
+    const failures: unknown[] = [];
+    const stopped = this.#stopAdmission();
+    try {
+      this.#server.closeIdleConnections();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+
+    const drained = await waitForOwnedSettlement(
+      () => [...this.#handlers].map((handler) => handler.done),
+      this.#options.drainTimeoutMs,
+    );
+    if (!drained) {
+      for (const handler of this.#handlers) {
+        const error = new Error(this.#options.incompleteRequestMessage);
+        handler.request.destroy(error);
+        handler.response.destroy(error);
+      }
+    }
+
+    try {
+      this.#server.closeAllConnections();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+    for (const socket of this.#sockets.keys()) socket.destroy();
+
+    const handlersSettled = await waitForOwnedSettlement(
+      () => [...this.#handlers].map((handler) => handler.done),
+      this.#options.forceSettlementTimeoutMs,
+    );
+    const socketsSettled = await waitForOwnedSettlement(
+      () => [...this.#sockets.values()].map((socket) => socket.done),
+      this.#options.forceSettlementTimeoutMs,
+    );
+    let stopFailure: unknown;
+    try {
+      await stopped;
+    } catch (error: unknown) {
+      stopFailure = error;
+    }
+    if (
+      stopFailure !== undefined &&
+      !(
+        isServerNotRunningError(stopFailure) &&
+        this.#serverCloseObserved &&
+        this.#handlers.size === 0 &&
+        this.#sockets.size === 0
+      )
+    ) {
+      failures.push(stopFailure);
+    }
+    if (!handlersSettled || this.#handlers.size > 0) {
+      failures.push(
+        new Error(
+          `HTTP server teardown retained ${String(this.#handlers.size)} handler(s)`,
+        ),
+      );
+    }
+    if (!socketsSettled || this.#sockets.size > 0) {
+      failures.push(
+        new Error(
+          `HTTP server teardown retained ${String(this.#sockets.size)} socket(s)`,
+        ),
+      );
+    }
+    if (failures.length > 0) {
+      throw failures.length === 1
+        ? failures[0]
+        : new AggregateError(failures, this.#options.closeFailureMessage);
+    }
+    this.#listenerState = "stopped";
+  }
+
+  #stopAdmission(): Promise<void> {
+    if (this.#serverStopPromise !== undefined) return this.#serverStopPromise;
+    const attempt = this.#stopAdmissionAttempt();
+    this.#serverStopPromise = attempt;
+    void attempt.catch(() => {
+      if (this.#serverStopPromise === attempt) this.#serverStopPromise = undefined;
+    });
+    return attempt;
+  }
+
+  async #stopAdmissionAttempt(): Promise<void> {
+    if (this.#listenerState === "starting") {
+      await this.#underlyingListenSettled;
+    }
+    if (
+      this.#listenerState === "idle" ||
+      this.#listenerState === "failed" ||
+      this.#listenerState === "stopped" ||
+      this.#serverCloseObserved
+    ) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      try {
+        this.#server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      } catch (error: unknown) {
+        reject(error);
+      }
+    });
+  }
+
+  #armAbort(signal: AbortSignal | undefined): void {
+    if (signal === undefined || this.#abortListener !== undefined) return;
+    const onAbort = (): void => {
+      this.#closing = true;
+      this.#rejectStartupAbort?.(abortReason(signal));
+      // This observer prevents an abort-triggered cleanup rejection from
+      // becoming unhandled. A concurrent explicit close joins this attempt;
+      // a later close retries after failure.
+      void this.close().catch(() => undefined);
+    };
+    this.#abortListener = onAbort;
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  }
+
+  #disarmAbort(): void {
+    if (this.#abortListener === undefined) return;
+    this.#options.signal?.removeEventListener("abort", this.#abortListener);
+    this.#abortListener = undefined;
+  }
+
+  readonly #trackSocket = (socket: Socket): void => {
+    let resolveDone: (() => void) | undefined;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const owned: OwnedHttpSocket = {
+      done,
+      resolveDone: () => resolveDone?.(),
+    };
+    this.#sockets.set(socket, owned);
+    socket.once("close", () => {
+      this.#sockets.delete(socket);
+      owned.resolveDone();
+    });
+    if (this.#closing) socket.destroy();
+  };
+
+  readonly #observeServerClose = (): void => {
+    this.#serverCloseObserved = true;
+    this.#listenerState = "stopped";
+  };
+}
 
 /**
  * Invocation-local ownership for the deterministic M4 runner. It deliberately
@@ -145,6 +449,44 @@ function ownedResource<T>(
     },
     closeFailureReported: false,
   };
+}
+
+async function waitForOwnedSettlement(
+  owned: () => readonly Promise<void>[],
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (owned().length > 0) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    const settled = await settlesBefore(
+      Promise.allSettled(owned()).then(() => undefined),
+      remaining,
+    );
+    if (!settled) return false;
+  }
+  return true;
+}
+
+function settlesBefore(operation: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  return Promise.race([
+    operation.then(() => true),
+    new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+function isServerNotRunningError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as Error & { readonly code?: unknown }).code ===
+      "ERR_SERVER_NOT_RUNNING"
+  );
 }
 
 function abortReason(signal: AbortSignal): unknown {

@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 
 import { canonicalSerialize } from "./canonical.js";
 import type { JsonValue } from "./domain.js";
@@ -28,7 +28,10 @@ import type {
   ClaimExecutionInput,
   EffectFingerprint,
 } from "./stateful-domain.js";
-import { retainM4RunnerCleanupDiagnostics } from "./m4-runner-lifecycle.js";
+import {
+  OwnedHttpServerLifecycle,
+  retainM4RunnerCleanupDiagnostics,
+} from "./m4-runner-lifecycle.js";
 
 const PRIMARY_START = "2026-08-26T09:10:00.000Z";
 const PRIMARY_END = "2026-08-26T09:40:00.000Z";
@@ -43,6 +46,8 @@ const BUNDLE_ID = "bundle/m4-hero-schedule";
 const APPROVED_ATTEMPT_ID = "attempt/m4-approved-alternative";
 const HERO_WINNER_PLAN_ID =
   "replan-plan/sha256:68fe99d3402893002930fa143b1089629e4722215d1624af5924d628430aafe2";
+const MODEL_DRAIN_TIMEOUT_MS = 500;
+const MODEL_FORCE_SETTLEMENT_TIMEOUT_MS = 500;
 
 export interface DeterministicM4ModelOptions {
   readonly m2DatabasePath: string;
@@ -100,41 +105,63 @@ export async function startDeterministicM4Model(
     throw new TypeError("Model port is invalid");
   }
   let requests = 0;
+  let lifecycle: OwnedHttpServerLifecycle;
   const server = createServer((request, response) => {
-    void (async () => {
-      if (
-        request.method !== "POST" ||
-        new URL(request.url ?? "/", `http://${host}`).pathname !==
-          "/v1/chat/completions"
-      ) {
-        response.writeHead(404).end();
-        return;
-      }
-      const parsed = parseJsonRejectingDuplicateKeys(
-        await readBody(request),
-      ) as ChatRequest;
-      const messages = requireMessages(parsed.messages);
-      requests += 1;
-      const reply = deterministicReply(messages, options);
-      writeCompletion(response, requests, reply);
-    })().catch((error: unknown) => {
-      response.writeHead(500, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          error: {
-            message: error instanceof Error ? error.message : String(error),
-            type: "deterministic_model_error",
-          },
-        }),
-      );
-    });
+    void lifecycle
+      .runHandler(request, response, async () => {
+        try {
+          if (lifecycle.closing) {
+            response.writeHead(503, { connection: "close" }).end();
+            return;
+          }
+          if (
+            request.method !== "POST" ||
+            new URL(request.url ?? "/", `http://${host}`).pathname !==
+              "/v1/chat/completions"
+          ) {
+            response.writeHead(404).end();
+            return;
+          }
+          const parsed = parseJsonRejectingDuplicateKeys(
+            await readBody(request),
+          ) as ChatRequest;
+          const messages = requireMessages(parsed.messages);
+          requests += 1;
+          const reply = deterministicReply(messages, options);
+          writeCompletion(response, requests, reply);
+        } catch (error: unknown) {
+          if (response.destroyed) return;
+          try {
+            response.writeHead(500, { "content-type": "application/json" });
+            response.end(
+              JSON.stringify({
+                error: {
+                  message: error instanceof Error ? error.message : String(error),
+                  type: "deterministic_model_error",
+                },
+              }),
+            );
+          } catch {
+            response.destroy();
+          }
+        }
+      })
+      .catch(() => response.destroy());
+  });
+  lifecycle = new OwnedHttpServerLifecycle(server, {
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    drainTimeoutMs: MODEL_DRAIN_TIMEOUT_MS,
+    forceSettlementTimeoutMs: MODEL_FORCE_SETTLEMENT_TIMEOUT_MS,
+    incompleteRequestMessage:
+      "Deterministic model shutdown aborted an incomplete request",
+    closeFailureMessage: "Deterministic model teardown failed",
   });
   try {
-    await listen(server, host, port, options.signal);
+    await lifecycle.listen(host, port);
   } catch (error: unknown) {
     const cleanupFailures: unknown[] = [];
     try {
-      await closeServer(server);
+      await lifecycle.close();
     } catch (cleanupError: unknown) {
       cleanupFailures.push(cleanupError);
     }
@@ -145,18 +172,15 @@ export async function startDeterministicM4Model(
   }
   const address = server.address();
   if (address === null || typeof address === "string") {
+    await lifecycle.close();
     throw new Error("Deterministic model did not bind a TCP address");
   }
-  let closePromise: Promise<void> | undefined;
   return {
     host,
     port: address.port,
     baseUrl: `http://${host}:${String(address.port)}/v1`,
     requestCount: () => requests,
-    close: async () => {
-      closePromise ??= closeServer(server);
-      await closePromise;
-    },
+    close: () => lifecycle.close(),
   };
 }
 
@@ -1077,48 +1101,6 @@ async function readBody(request: IncomingMessage): Promise<string> {
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
-}
-
-function listen(
-  server: Server,
-  host: string,
-  port: number,
-  signal?: AbortSignal,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const settle = (outcome: "resolve" | "reject", error?: unknown): void => {
-      if (settled) return;
-      settled = true;
-      server.off("error", onError);
-      signal?.removeEventListener("abort", onAbort);
-      if (outcome === "resolve") resolve();
-      else reject(error);
-    };
-    const onError = (error: Error): void => settle("reject", error);
-    const onAbort = (): void =>
-      settle(
-        "reject",
-        signal?.reason ?? new DOMException("The operation was aborted", "AbortError"),
-      );
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted === true) {
-      onAbort();
-      return;
-    }
-    server.once("error", onError);
-    server.listen(
-      { host, port, ...(signal === undefined ? {} : { signal }) },
-      () => settle("resolve"),
-    );
-  });
-}
-
-function closeServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-    server.closeAllConnections();
-  });
 }
 
 function object(value: unknown, field: string): Record<string, unknown> {
