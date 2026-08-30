@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#09100c">
-  <title>FlakeBrake — a human-governed TrueForge agent that proves its promises</title>
-  <meta name="description" content="FlakeBrake is a human-governed TrueForge agent that replans constrained work, pauses for exact authorization, mechanically blocks equivalent denied actions, executes one fenced mutation, verifies the result independently, and reconnects without repeating owner decisions or effects.">
+  <title>FlakeBrake — a commitment firewall for humans and agents</title>
+  <meta name="description" content="FlakeBrake is a commitment firewall for humans and agents. TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay before anyone must rely on the claim.">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="FlakeBrake — a human-governed TrueForge agent that proves its promises">
-  <meta property="og:description" content="Replan constrained work, pause for exact authorization, block equivalent denied actions mechanically, execute one fenced mutation, verify it independently, reconnect without repeating a thing. Built on TrueForge 0.1.4.">
+  <meta property="og:title" content="FlakeBrake — a commitment firewall for humans and agents">
+  <meta property="og:description" content="TrueForge coordinates the agents; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay. Built on TrueForge 0.1.4.">
   <meta property="og:site_name" content="FlakeBrake">
   <!-- Update the og:image/og:url origin below if the site is published somewhere other than the default GitHub Pages origin. -->
   <meta property="og:url" content="https://dvellon.github.io/flakebrake/">
@@ -33,6 +33,7 @@
       <nav class="topnav" aria-label="Site">
         <a href="#problem">Problem</a>
         <a href="#trueforge">TrueForge</a>
+        <a href="#honest">Firewall</a>
         <a href="#scenario">Story</a>
         <a href="#proof">Proof Center</a>
         <a href="#architecture">Architecture</a>
@@ -54,7 +55,8 @@
         <li>MIT licensed</li>
       </ul>
       <h1 id="hero-title">A rush order. One safe promise. <span class="accent">Proof all the way down.</span></h1>
-      <p class="lede">FlakeBrake is a <strong>human-governed TrueForge agent</strong> that replans constrained work, pauses for exact authorization, mechanically blocks equivalent denied actions, executes <strong>one fenced mutation</strong>, verifies the result independently, and reconnects without repeating a single owner decision or effect.</p>
+      <p class="category">FlakeBrake is a <span class="accent">commitment firewall</span> for humans and agents.</p>
+      <p class="lede">A <strong>human-governed TrueForge agent</strong> that replans constrained work, pauses for exact authorization, mechanically blocks equivalent denied actions, executes <strong>one fenced mutation</strong>, verifies the result independently, and reconnects without repeating a single owner decision or effect.</p>
       <div class="hero-actions">
         <a class="button button-primary" href="#scenario">Follow the three-minute story</a>
         <a class="button button-quiet" href="https://github.com/dvellon/flakebrake">View the repository</a>
@@ -165,10 +167,83 @@
       </div>
     </section>
 
+    <!-- ============================== FIREWALL ============================== -->
+    <section id="honest" class="section" aria-labelledby="honest-title">
+      <div class="wrap">
+        <p class="eyebrow"><span class="idx">03</span>The commitment firewall</p>
+        <h2 id="honest-title">How agents keep each other honest</h2>
+        <div class="prose">
+          <p>TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect. <strong>FlakeBrake sits behind the consequential MCP boundaries</strong> and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay — before another agent, or a human, must rely on the claim.</p>
+          <p>In the current mission the three specialists investigate and recommend, but only the root agent acts — and the root <strong>rechecks every specialist recommendation through MCP</strong> before acting on it. To be precise about what that means: FlakeBrake doesn't referee arbitrary prose between agents, and it isn't deception detection. Its job is narrower and mechanical — an <em>unsupported, stale, conflicting, duplicated, or unverified</em> consequential claim simply cannot pass the boundary.</p>
+        </div>
+
+        <ul class="checks">
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"This replan fits."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>Capacity recommendations are recomputed against the authoritative versioned basis — the deterministic kernel re-evaluates the complete portfolio at the MCP boundary, and the assurance engineer independently recomputes demand, ranking, and protected-order preservation in the sandbox.</p>
+              <code>M1 kernel · versioned Promise Basis</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"The earlier evaluation is still good."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>A stale basis cannot be treated as current. Acceptance atomically compares the complete evaluated version tuple; once portfolio v2 is durable, the v1 REPLAN can never be accepted.</p>
+              <code>M2 ledger · version compare-and-swap</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"This is a different action now."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>A differently worded denied action remains denied. Typed effect normalization matches the material effect across tool names and schemas, so the active denial blocks the equivalent representation — no new owner call, no mutation.</p>
+              <code>M2 ledger · typed denial equivalence</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"The tool returned a receipt — done."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>An executor cannot declare success merely because it returned a receipt. Independent read-back of authoritative factory state and a terminal verification event stand between the mutation and the word "success".</p>
+              <code>M3 boundary · independent read-back</code>
+            </div>
+          </li>
+          <li>
+            <div class="check-claim"><span class="check-label">An agent claims</span>"I restarted, so I'll run it again."</div>
+            <div class="check-fire"><span class="check-label">The firewall</span>
+              <p>A restarted agent cannot repeat an already completed effect. Attempts are fenced and idempotent: replay converges on the original durable result and creates no second mutation.</p>
+              <code>M2/M3 · fenced idempotent attempts</code>
+            </div>
+          </li>
+        </ul>
+
+        <div class="prose">
+          <p>Routine inter-agent checks are <strong>automatic</strong> — nobody is interrupted while the firewall recomputes, matches versions, or converges a replay. Humans enter exactly where policy says a consequence needs an owner: the four approval-gated change-control tools that pause the TrueForge turn.</p>
+        </div>
+
+        <div class="chain chain-firewall" role="group" aria-label="The commitment-firewall architecture sequence">
+          <p class="chain-title"><span class="chain-mark">Architecture sequence</span> <span class="chain-note">the amber station is the only one that costs a human interruption — and only when policy requires it</span></p>
+          <ol class="chain-track chain-steps-7">
+            <li class="chain-step"><span class="k">Specialist recommendation</span><span class="v">three subagents investigate &amp; propose</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step"><span class="k">TrueForge root turn</span><span class="v">only the root acts on a recommendation</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-fb"><span class="k">FlakeBrake MCP check</span><span class="v">basis, authorization, equivalence, identity</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-human"><span class="k">Human approval when required</span><span class="v">the four gated tools pause the turn</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-fb"><span class="k">Fenced execution</span><span class="v">one claimed, idempotent attempt</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-fb"><span class="k">Independent read-back</span><span class="v">authoritative state, read separately</span></li>
+            <li class="chain-sep" aria-hidden="true">→</li>
+            <li class="chain-step chain-step-verified"><span class="k">Evidence-bound result</span><span class="v">durable, replayable, verified</span></li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
     <!-- ============================== SCENARIO ============================== -->
     <section id="scenario" class="section" aria-labelledby="scenario-title">
       <div class="wrap">
-        <p class="eyebrow"><span class="idx">03</span>The deterministic hero scenario</p>
+        <p class="eyebrow"><span class="idx">04</span>The deterministic hero scenario</p>
         <h2 id="scenario-title">Ten steps from overload to proven, in about three minutes.</h2>
         <div class="prose">
           <p>A rush order arrives at a synthetic microfactory whose protected, important, and best-effort orders already consume finite human-review, agent-work, and production-cell capacity. Every run of the story below is the same, end to end, because the basis is canonical and the code is deterministic — which is exactly what makes it checkable.</p>
@@ -260,7 +335,7 @@
     <!-- ============================== BOUNDARY ============================== -->
     <section id="boundary" class="section" aria-labelledby="boundary-title">
       <div class="wrap">
-        <p class="eyebrow"><span class="idx">04</span>The owner boundary</p>
+        <p class="eyebrow"><span class="idx">05</span>The owner boundary</p>
         <h2 id="boundary-title">Denied once by a human. Denied again by the ledger.</h2>
         <div class="prose">
           <p>These are two different safety properties, and FlakeBrake demonstrates both in the same run. Conflating them is how agent demos oversell — a human "no" that evaporates on the next rephrase isn't governance.</p>
@@ -293,7 +368,7 @@
     <!-- ============================== EXACTLY ONCE ============================== -->
     <section id="once" class="section" aria-labelledby="once-title">
       <div class="wrap">
-        <p class="eyebrow"><span class="idx">05</span>Exactly once, then proven</p>
+        <p class="eyebrow"><span class="idx">06</span>Exactly once, then proven</p>
         <h2 id="once-title">The whole run fits in eight numbers.</h2>
         <div class="ledger" role="group" aria-label="Durable counts from the deterministic hero run">
           <div><strong>4</strong><span>owner calls</span></div>
@@ -330,7 +405,7 @@
     <!-- ============================== RECONNECT ============================== -->
     <section id="reconnect" class="section" aria-labelledby="reconnect-title">
       <div class="wrap">
-        <p class="eyebrow"><span class="idx">06</span>Reconnect without regret</p>
+        <p class="eyebrow"><span class="idx">07</span>Reconnect without regret</p>
         <h2 id="reconnect-title">Refresh the browser. Nothing happens twice.</h2>
         <div class="prose">
           <p>Mission identity, the TrueForge session and turn graph, approvals, tool results, and the terminal projection are all durable. A refresh calls the read-only state API and <strong>replays that projection</strong> — it does not restart the mission, reopen an approval, or repeat an effect. The harness ribbon labels the state plainly: <em>Durable session replayed</em>.</p>
@@ -342,7 +417,7 @@
     <!-- ============================== PROOF CENTER ============================== -->
     <section id="proof" class="section" aria-labelledby="proof-title">
       <div class="wrap">
-        <p class="eyebrow"><span class="idx">07</span>Operator proof center</p>
+        <p class="eyebrow"><span class="idx">08</span>Operator proof center</p>
         <h2 id="proof-title">Safety and impact, from the record — not from the narrator.</h2>
         <div class="prose">
           <p>Judges shouldn't have to reconstruct the causal chain from a timeline. The Operator Proof Center sits at the top of the judge UI and answers the four operator questions at a glance — direct plan, safe winner, owner boundary, durable outcome — then backs each answer with disclosure drawers built from the same canonical projection the ledger holds: exact control decisions, capacity before/after impact, durable proof and replay, and optional technical identities.</p>

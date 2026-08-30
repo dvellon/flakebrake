@@ -13,7 +13,8 @@ FlakeBrake
 
 ## Tagline / one-liner
 
-A human-governed TrueForge agent that proves the one promise it keeps.
+A commitment firewall for humans and agents — a human-governed TrueForge agent
+that proves the one promise it keeps.
 
 ---
 
@@ -21,7 +22,10 @@ A human-governed TrueForge agent that proves the one promise it keeps.
 
 **Default**
 
-FlakeBrake is obligation admission control for autonomous agents. A rush order
+FlakeBrake is a commitment firewall for humans and agents: it sits behind the
+consequential MCP boundaries and checks capacity, authorization, denied-effect
+equivalence, execution identity, factory results, and replay before another
+agent or a human must rely on the claim. A rush order
 hits a synthetic microfactory whose protected, important, and best-effort work
 already consumes finite human-review, agent-work, and production-cell capacity.
 Instead of letting the agent say yes, FlakeBrake evaluates the complete
@@ -37,8 +41,10 @@ the browser replays durable state without repeating any owner call or effect.
 
 **Reserve**
 
-FlakeBrake makes promise acceptance an admission decision instead of a model
-assertion. A deterministic kernel evaluates every new commitment against the
+FlakeBrake is a commitment firewall for humans and agents: it makes promise
+acceptance an admission decision instead of a model assertion, and it will not
+let an unsupported, stale, conflicting, duplicated, or unverified consequential
+claim cross an MCP boundary. A deterministic kernel evaluates every new commitment against the
 complete, versioned obligation portfolio and declared multi-resource capacity;
 an immutable SQLite ledger records admissions, owner decisions, typed denials,
 grants, fenced attempts, receipts, and actual-consumption facts. In the
