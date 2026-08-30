@@ -2,7 +2,7 @@
 
 Polished answers for the competition submission form. Each narrative field has a
 **Default** (concise, recommended) and a **Reserve** (slightly longer, if the
-form allows more room). Replace the `⟨…⟩` tokens before submitting. Do not add
+form allows more room). Every field below is final. Do not add
 personal email addresses or credentials anywhere on the form.
 
 ---
@@ -145,11 +145,11 @@ approval.
 
 | Field | Value |
 | --- | --- |
-| Team name | `⟨TEAM NAME⟩` — if submitting alone, enter `SOLO` (or your handle) per the form's guidance |
+| Team name | FlakeBrake |
 | GitHub URL | `https://github.com/dvellon/flakebrake` |
-| Deployed URL (optional) | `⟨PAGES URL — e.g. https://dvellon.github.io/flakebrake/ once Pages is enabled⟩` |
+| Deployed URL (optional) | https://dvellon.github.io/flakebrake/ |
 | YouTube URL (required) | https://www.youtube.com/watch?v=E00_3udo804 |
-| Blog URL (optional) | `⟨PAGES URL⟩/blog.html` (or the GitHub blob URL for `docs/blog.html`) |
+| Blog URL (optional) | https://dvellon.github.io/flakebrake/blog.html |
 
 ## Tracks — select all four
 
@@ -160,7 +160,7 @@ approval.
 
 ## Pre-submit checklist
 
-- [ ] Replace every `⟨…⟩` token above.
+- [x] Every field above is final — no placeholder tokens remain.
 - [ ] Confirm the YouTube video is public/unlisted and under three minutes.
 - [ ] Confirm the repository is visible to judges before the deadline.
 - [ ] No personal email addresses, credentials, or private paths in any field.

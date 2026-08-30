@@ -395,13 +395,22 @@ docs/submission.md                  submission-form-ready project summary
   distributed deployment, real factory integration, learned forecasting, and
   generalized domains are explicitly deferred.
 
+## Demo, site, and blog
+
+- Three-minute demo video: https://www.youtube.com/watch?v=E00_3udo804
+- Project site: https://dvellon.github.io/flakebrake/
+- Blog post: https://dvellon.github.io/flakebrake/blog.html
+
 ## Qodo Code Review Evidence
 
-FlakeBrake's implementation PRs were reviewed by the GitHub Qodo application,
-remediated with focused regressions, re-reviewed at exact heads, and merged only
-after a separate human adjudication. The links below are the public audit trail;
-they are evidence of the review process, not a claim that automated review can
-replace testing or human approval.
+FlakeBrake went through sixteen Qodo-reviewed pull requests — #2 through #17 —
+with more than fifty findings addressed and resolved, and zero unresolved Qodo
+findings on the merged release. Each PR was reviewed by the GitHub Qodo
+application, remediated with focused regressions, re-reviewed at exact heads,
+and merged only after a separate human adjudication. The links below are the
+public audit trail; they are evidence of the review process, not a claim that
+automated review can replace testing or human approval — and not a claim that
+the software is bug-free or that review authenticates evidence.
 
 ### PR #5 — M4 TrueForge mission orchestration
 
@@ -455,6 +464,21 @@ replace testing or human approval.
   [final adjudication](https://github.com/dvellon/flakebrake/pull/7#issuecomment-5460262808), and
   [merge commit](https://github.com/dvellon/flakebrake/commit/6829ae2cc87a9fd34d28026cf7cbf822cefd9c2a).
 
+The later public trails —
+[PR #10](https://github.com/dvellon/flakebrake/pull/10),
+[PR #11](https://github.com/dvellon/flakebrake/pull/11),
+[PR #12](https://github.com/dvellon/flakebrake/pull/12),
+[PR #13](https://github.com/dvellon/flakebrake/pull/13),
+[PR #15](https://github.com/dvellon/flakebrake/pull/15),
+[PR #16](https://github.com/dvellon/flakebrake/pull/16), and
+[PR #17](https://github.com/dvellon/flakebrake/pull/17) — carried the same
+discipline through TrueForge cancellation and MCP teardown, Mission Evidence
+bundle integrity, Recovery Lab lifecycle behavior, Challenge evidence
+boundaries, scenario isolation, Guided Mode truthfulness and durability, and
+the final business-language UI, alongside
+[PR #8](https://github.com/dvellon/flakebrake/pull/8) (submission readiness),
+[PR #9](https://github.com/dvellon/flakebrake/pull/9) (M5 judge polish), and
+[PR #14](https://github.com/dvellon/flakebrake/pull/14) (Judge Clarity).
 Earlier milestone review trails remain available in merged
 [PR #2](https://github.com/dvellon/flakebrake/pull/2),
 [PR #3](https://github.com/dvellon/flakebrake/pull/3), and

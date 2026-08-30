@@ -150,7 +150,7 @@ effect.
 Deterministic judge profile — no OpenAI or Daytona credentials required.
 
 Repository: https://github.com/dvellon/flakebrake
-⟨PAGES URL, once enabled⟩ · ⟨BLOG URL⟩
+https://dvellon.github.io/flakebrake/ · https://dvellon.github.io/flakebrake/blog.html
 
 Chapters:
 0:00 The problem: agents that over-promise
@@ -190,6 +190,6 @@ blue `#72c9ff` for the TrueForge line, big mono numerals if used.
       1 factory reallocation, 1 factory change record, 2 measured resource facts.
 - [ ] Capture the refresh beat in the same take (it's the proof).
 - [ ] Runtime check before upload: **under 3:00**, narration 2:40–2:55.
-- [x] After upload: the final URL is installed in the site's video panel
-      (see the comment in `docs/index.html`), `docs/submission-form.md`, and
-      the YouTube description placeholders above.
+- [x] After upload: the final URL is installed in the site's video panel,
+      `docs/submission-form.md`, and this package — and the prepared
+      description above now carries the final Pages and blog URLs.
