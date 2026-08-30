@@ -1610,9 +1610,11 @@ export function agentTrustProjection(input: AgentTrustEvidence): M5JudgeState["a
     });
   }
   if (input.execution.mutationCount > 0) {
+    // Only the exact terminal_verified claim state is verified success;
+    // terminal_reconciled and terminal failures stay unverified claims.
     const verified =
       input.execution.independentReadBackObserved &&
-      input.execution.terminalStatus?.startsWith("terminal_") === true;
+      input.execution.terminalStatus === "terminal_verified";
     const executionIdentity = [
       ...(input.execution.attemptId === null ? [] : [`attempt ${input.execution.attemptId}`]),
       ...(input.execution.receiptId === null ? [] : [`receipt ${input.execution.receiptId}`]),

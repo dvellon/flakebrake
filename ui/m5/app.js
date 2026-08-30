@@ -230,6 +230,26 @@ function renderAgentTrust() {
     .join("");
 }
 
+// Single presentation classifier over authoritative durable facts. Precedence:
+// verified > mutation-pending-verification > failed-without-mutation >
+// approval-pending > running > idle. A committed mutation therefore always
+// outranks a stopped run, so failure copy can never hide durable effects.
+function classifyMissionPhase() {
+  if (state.run.status === "verified") return "verified";
+  if (state.execution.mutationCount > 0) return "mutation_pending";
+  if (state.run.status === "failed") return "failed";
+  if (state.pendingApproval !== null) return "approval_pending";
+  if (state.run.status === "idle") return "idle";
+  return "running";
+}
+
+// The only verified-success discriminant: the durable reservation reached
+// exactly terminal_verified. terminal_* alone includes reconciled and failed
+// terminals and must never be presented as verified completion.
+function verifiedCompletionEvidence() {
+  return state.execution.terminalStatus === "terminal_verified";
+}
+
 function renderGuidedStory() {
   const winner = state.hero.winningModification;
   const protectedObligation = state.hero.obligations.find((item) => item.protected);
@@ -243,17 +263,35 @@ function renderGuidedStory() {
   const pending = state.pendingApproval;
   const saferPlan = `FlakeBrake found a safer plan: reduce the lower-priority display order from ${winner.fromQuantity} to ${winner.toQuantity}, while the protected medical order and the rush-order quantity stay unchanged.`;
   const doesNotFit = `This rush order doesn’t fit yet: it needs ${agentShort} more agent-work units and ${humanShort} more human decision${humanShort === 1 ? "" : "s"} than are currently available — production minutes alone are not the only constraint.`;
+  const phase = classifyMissionPhase();
   let heading;
   let what;
   let why;
   let next;
-  if (verified) {
+  if (phase === "verified") {
     heading = "Done—and independently verified";
     what = `The lower-priority display order changed ${winner.fromQuantity} → ${winner.toQuantity}; the protected medical and rush work stayed intact; exactly one factory mutation occurred and was independently read back.`;
     why = replayEvidence
       ? "You are viewing the same completed TrueForge session — no decisions, owner calls, or factory effects were repeated."
       : "Refresh or restart will not repeat owner decisions or factory effects.";
     next = "Open the proofs below for the exact evidence, or reset to run it again.";
+  } else if (phase === "mutation_pending") {
+    const stopped = state.run.status === "failed";
+    heading = "The change is recorded—but it is not verified yet";
+    what = stopped
+      ? "The run stopped before independent verification completed — one factory change was already recorded durably."
+      : "One authorized factory change and its receipt are saved durably.";
+    why = stopped
+      ? "A recorded change is not success. No further change happened, and nothing is presented as complete until FlakeBrake verifies the recorded one independently."
+      : "A recorded change is not success — FlakeBrake is independently reading the factory state back before declaring it.";
+    next = stopped
+      ? "Choose Resume safely to continue the same mission and finish verification."
+      : "No action needed — verification runs automatically.";
+  } else if (phase === "failed") {
+    heading = "The mission stopped safely";
+    what = "A controlled problem stopped the run before any unsafe effect.";
+    why = "No consequential change was recorded, and every decision so far is saved durably.";
+    next = "Choose Resume safely to continue the same mission.";
   } else if (pending && pending.toolName === "select_portfolio_modification") {
     heading = "Your approval is required";
     what = `Approving changes the lower-priority display order from ${winner.fromQuantity} to ${winner.toQuantity} — nothing else.`;
@@ -274,16 +312,6 @@ function renderGuidedStory() {
     what = "The 09:40–10:10 slot starts after the protected commitment ends and fits the approved grant.";
     why = "Approving authorizes exactly one factory reservation in that slot — nothing else.";
     next = "Approve action authorizes the safe reservation.";
-  } else if (state.run.status === "failed") {
-    heading = "The mission stopped safely";
-    what = "A controlled problem stopped the run before any unsafe effect.";
-    why = "Nothing was mutated, and every decision so far is saved durably.";
-    next = "Choose Resume safely to continue the same mission.";
-  } else if (state.execution.mutationCount > 0) {
-    heading = "The change is recorded—but it is not verified yet";
-    what = "One authorized factory change and its receipt are saved durably.";
-    why = "A recorded change is not success — FlakeBrake is independently reading the factory state back before declaring it.";
-    next = "No action needed — verification runs automatically.";
   } else if (state.run.status === "idle") {
     heading = "A rush order is waiting";
     what = "A rush aerospace order wants space in the factory schedule. FlakeBrake will check whether it fits without disrupting protected work.";
@@ -313,9 +341,11 @@ function renderGuidedStory() {
   nodes["guided-number-display"].textContent = `${winner.fromQuantity} → ${winner.toQuantity}`;
   nodes["guided-number-protected"].textContent = String(protectedObligation?.quantity ?? "—");
   nodes["guided-number-mutations"].textContent = String(state.execution.mutationCount);
-  nodes["guided-number-mutations-note"].textContent = verified
+  nodes["guided-number-mutations-note"].textContent = verified && verifiedCompletionEvidence()
     ? "verified"
-    : state.execution.mutationCount > 0 ? "recorded — verifying" : "none yet";
+    : state.execution.mutationCount > 0
+      ? state.run.status === "failed" ? "recorded — not verified" : "recorded — verifying"
+      : "none yet";
 }
 
 function renderHarness() {
@@ -367,11 +397,20 @@ function renderHarness() {
     nodes[id].textContent = status;
     nodes[id].className = `chain-${status === "Verified" ? "verified" : status === "Observed" ? "observed" : status === "Configured" ? "configured" : "waiting"}`;
   };
+  // Station evidence is durable/authoritative only: approval-bridge records
+  // prove factory-change-control tool use and human pauses across restarts,
+  // and the TrueForge sandbox checkpoint proves sandbox use mid-run. The
+  // process-local owner-call counter and elapsed UI state promote nothing.
+  const durablePauseEvidence = state.pendingApproval !== null || state.safety.ownerCallCount > 0;
+  const factoryToolEvidence =
+    reachedServices > 0 || state.approvals.length > 0 || state.pendingApproval !== null;
+  const sandboxObserved =
+    sandboxEvidence > 0 || state.evidenceTimeline.some((item) => item.kind === "sandbox");
   setChain("chain-mission", verifiedNow ? "Verified" : missionObserved ? "Observed" : "Configured");
   setChain("chain-agents", subagentEvidence > 0 ? "Observed" : "Configured");
-  setChain("chain-tools", reachedServices > 0 ? "Observed" : "Configured");
-  setChain("chain-sandbox", sandboxEvidence > 0 ? "Observed" : "Configured");
-  setChain("chain-pause", state.pendingApproval !== null || state.run.ownerCallsThisProcess > 0 ? "Observed" : "Configured");
+  setChain("chain-tools", factoryToolEvidence ? "Observed" : "Configured");
+  setChain("chain-sandbox", sandboxObserved ? "Observed" : "Configured");
+  setChain("chain-pause", durablePauseEvidence ? "Observed" : "Configured");
   setChain("chain-resume", replayEvidence ? "Observed" : "Configured");
   setChain("chain-verified", verifiedNow ? "Verified" : "—");
   if (verifiedNow) {
@@ -440,7 +479,7 @@ function renderProofCenter() {
   nodes["proof-outcome-result"].textContent = verified
     ? `${state.execution.mutationCount} mutation · verified`
     : state.execution.mutationCount > 0 ? `${state.execution.mutationCount} mutation · not yet success` : "No factory effect";
-  nodes["proof-outcome-note"].textContent = `${state.execution.receiptCount} receipt · ${state.execution.terminalEventCount} verified completion · ${state.execution.actualFactCount} measured facts`;
+  nodes["proof-outcome-note"].textContent = `${state.execution.receiptCount} receipt · ${state.execution.terminalEventCount} ${verifiedCompletionEvidence() ? "verified completion" : "terminal event"} · ${state.execution.actualFactCount} measured facts`;
 
   renderProofDecisions(ownerDecisions, mechanicalDenials);
   renderProofCapacity(winnerCandidate, directViolations);
@@ -480,14 +519,14 @@ function renderProofCapacity(winnerCandidate, directViolations) {
 function renderDurableProof(verified, replayed) {
   const result = state.execution;
   nodes["proof-durable-summary"].textContent = verified
-    ? `${result.mutationCount} mutation · ${result.receiptCount} receipt · ${result.terminalEventCount} verified completion · ${result.actualFactCount} measured facts`
+    ? `${result.mutationCount} mutation · ${result.receiptCount} receipt · ${result.terminalEventCount} ${verifiedCompletionEvidence() ? "verified completion" : "terminal event"} · ${result.actualFactCount} measured facts`
     : result.receiptCount > 0 ? "Receipt present · independent verification still required" : "Mutation is not verified success";
   const readBackStatus = result.independentReadBackObserved ? "Observed before terminal completion" : "Not yet observed";
   const terminalStatus = result.terminalStatus === "terminal_verified" ? "terminal_verified recorded" : "Not recorded";
   const replayCopy = verified
     ? `${replayed ? "This browser is attached to a durable replay." : "The verified projection is durable across refresh and restart."} This process made ${state.run.ownerCallsThisProcess} owner call${state.run.ownerCallsThisProcess === 1 ? "" : "s"}; the durable effect count remains ${result.mutationCount}.`
     : "Refresh and recovery read the same durable records; neither may turn a receipt into success or repeat an effect.";
-  nodes["proof-durable-proof"].innerHTML = `<div class="proof-counts"><div><strong>${result.mutationCount}</strong><span>Mutation</span></div><div><strong>${result.receiptCount}</strong><span>Receipt</span></div><div><strong>${result.terminalEventCount}</strong><span>Verified completion</span></div><div><strong>${result.actualFactCount}</strong><span>Measured facts</span></div></div><ol class="durable-chain"><li class="${result.receiptCount ? "complete" : "waiting"}"><span>1</span><div><strong>Mutation receipt</strong><p>A receipt proves the fenced factory command committed. By itself, it is not verified success.</p></div></li><li class="${result.independentReadBackObserved ? "complete" : result.receiptCount ? "active" : "waiting"}"><span>2</span><div><strong>Independent read-back</strong><p>${readBackStatus}${result.approvedInterval ? ` · ${escapeHtml(formatFriendlyInterval(result.approvedInterval))}` : ""}</p></div></li><li class="${verified ? "complete" : "waiting"}"><span>3</span><div><strong>Verified completion</strong><p>${terminalStatus}. Only this state is presented as success.</p></div></li></ol><p class="replay-proof">${escapeHtml(replayCopy)}</p>`;
+  nodes["proof-durable-proof"].innerHTML = `<div class="proof-counts"><div><strong>${result.mutationCount}</strong><span>Mutation</span></div><div><strong>${result.receiptCount}</strong><span>Receipt</span></div><div><strong>${result.terminalEventCount}</strong><span>${verifiedCompletionEvidence() ? "Verified completion" : "Terminal event"}</span></div><div><strong>${result.actualFactCount}</strong><span>Measured facts</span></div></div><ol class="durable-chain"><li class="${result.receiptCount ? "complete" : "waiting"}"><span>1</span><div><strong>Mutation receipt</strong><p>A receipt proves the fenced factory command committed. By itself, it is not verified success.</p></div></li><li class="${result.independentReadBackObserved ? "complete" : result.receiptCount ? "active" : "waiting"}"><span>2</span><div><strong>Independent read-back</strong><p>${readBackStatus}${result.approvedInterval ? ` · ${escapeHtml(formatFriendlyInterval(result.approvedInterval))}` : ""}</p></div></li><li class="${verified ? "complete" : "waiting"}"><span>3</span><div><strong>Verified completion</strong><p>${terminalStatus}. Only this state is presented as success.</p></div></li></ol><p class="replay-proof">${escapeHtml(replayCopy)}</p>`;
 }
 
 function renderTechnicalProof(winnerCandidate) {

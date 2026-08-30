@@ -796,6 +796,211 @@ describe("M5 agent trust — agents checking agents", () => {
   });
 });
 
+describe("Qodo PR16 Round 1: truthful failure, terminal, and chain evidence", () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-round1-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const ownerApproval = (actionIdentity: string): M5JudgeState["approvals"][number] => ({
+    toolName: "select_portfolio_modification",
+    decision: "allow",
+    source: "owner",
+    ownerSourceIdentity: "owner/judge-ui",
+    actionIdentity,
+    effect: "Modify order/best-effort-display: quantity 10 → 8",
+    reason: "owner approved",
+    denialId: null,
+  });
+
+  test("finding 1: a failure after a committed mutation never claims nothing was mutated", async () => {
+    const failedAfterMutation: M5JudgeState = {
+      ...idle,
+      revision: 3,
+      run: { ...idle.run, status: "failed", canStart: true },
+      execution: {
+        ...idle.execution,
+        acceptanceCount: 1,
+        attemptCount: 1,
+        mutationCount: 1,
+        receiptCount: 1,
+        attemptId: "attempt/m4-approved-alternative",
+      },
+    };
+    const harness = await createPollingHarness(failedAfterMutation, []);
+    assert.doesNotMatch(harness.text("guided-why"), /Nothing was mutated/u);
+    assert.doesNotMatch(harness.text("guided-what"), /before any unsafe effect/u);
+    assert.equal(
+      harness.text("guided-heading"),
+      "The change is recorded—but it is not verified yet",
+      "a committed mutation outranks the stopped-run story",
+    );
+    assert.match(harness.text("guided-what"), /stopped before independent verification/u);
+    assert.match(harness.text("guided-what"), /already recorded durably/u);
+    assert.match(harness.text("guided-why"), /recorded change is not success/iu);
+    assert.match(harness.text("guided-next"), /Resume safely/u);
+    assert.equal(harness.text("guided-number-mutations"), "1");
+    assert.equal(harness.text("guided-number-mutations-note"), "recorded — not verified");
+    const failedClean: M5JudgeState = {
+      ...idle,
+      revision: 4,
+      run: { ...idle.run, status: "failed", canStart: true },
+    };
+    const clean = await createPollingHarness(failedClean, []);
+    assert.equal(clean.text("guided-heading"), "The mission stopped safely");
+    assert.match(clean.text("guided-why"), /No consequential change was recorded/u);
+  });
+
+  test("finding 2: terminal counts render verified completion only for terminal_verified", async () => {
+    const reconciledFailure: M5JudgeState = {
+      ...idle,
+      revision: 5,
+      run: { ...idle.run, status: "failed" },
+      execution: {
+        ...idle.execution,
+        mutationCount: 1,
+        receiptCount: 1,
+        terminalEventCount: 1,
+        terminalStatus: "terminal_reconciled",
+      },
+    };
+    const harness = await createPollingHarness(reconciledFailure, []);
+    assert.doesNotMatch(
+      harness.text("proof-outcome-note"),
+      /verified completion/u,
+      "a non-verified terminal event must not be labeled a verified completion",
+    );
+    assert.match(harness.text("proof-outcome-note"), /1 terminal event/u);
+    const durable = harness.evaluate<string>("document.getElementById('proof-durable-proof').innerHTML");
+    assert.doesNotMatch(durable, /<strong>1<\/strong><span>Verified completion<\/span>/u);
+    assert.match(durable, /<strong>1<\/strong><span>Terminal event<\/span>/u);
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const verified: M5JudgeState = {
+      ...verifiedBase,
+      execution: {
+        ...verifiedBase.execution,
+        independentReadBackObserved: true,
+        terminalEventCount: 1,
+      },
+    };
+    const done = await createPollingHarness(verified, []);
+    assert.match(done.text("proof-outcome-note"), /1 verified completion/u);
+    assert.match(
+      done.evaluate<string>("document.getElementById('proof-durable-proof').innerHTML"),
+      /<strong>1<\/strong><span>Verified completion<\/span>/u,
+    );
+  });
+
+  test("finding 3: agent-trust verified result requires the exact terminal_verified discriminant", async () => {
+    const module_ = (await import("../src/m5-ui.js")) as Record<string, unknown>;
+    const agentTrustProjection = module_["agentTrustProjection"] as (
+      input: Record<string, unknown>,
+    ) => { readonly checks: readonly { readonly kind: string; readonly result: string }[] };
+    assert.equal(typeof agentTrustProjection, "function");
+    const projectionFor = (terminalStatus: string | null): string | undefined =>
+      agentTrustProjection({
+        approvals: [],
+        approvalEffectText: () => "effect",
+        execution: {
+          ...idle.execution,
+          mutationCount: 1,
+          receiptCount: 1,
+          independentReadBackObserved: true,
+          terminalStatus,
+        },
+        subagentTitles: [],
+        subagentThreadIds: [],
+        admission: null,
+        sessionId: null,
+        disconnectedAndResumed: false,
+        runStatus: "verifying",
+      }).checks.find((row) => row.kind === "execution")?.result;
+    assert.equal(projectionFor("terminal_reconciled"), "pending_verification", "terminal_reconciled is not verified success");
+    assert.equal(projectionFor("terminal_failed"), "pending_verification", "a terminal failure is not verified success");
+    assert.equal(projectionFor("claimed_pending"), "pending_verification", "an incomplete claim is not verified success");
+    assert.equal(projectionFor(null), "pending_verification");
+    assert.equal(projectionFor("terminal_verified"), "verified");
+  });
+
+  test("finding 4: the human-pause station relies on durable approvals, not the process counter", async () => {
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const restartedReplay: M5JudgeState = {
+      ...verifiedBase,
+      run: { ...verifiedBase.run, ownerCallsThisProcess: 0 },
+      approvals: [ownerApproval("sha256:restart-durable-approval")],
+      safety: { ...idle.safety, ownerCallCount: 1 },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const harness = await createPollingHarness(restartedReplay, []);
+    assert.equal(
+      harness.text("chain-pause"),
+      "Observed",
+      "durable approvals keep the pause station Observed after a zero-owner-call restart",
+    );
+    const inventedTerminal: M5JudgeState = {
+      ...uiProjection(idle, 7, "verified"),
+      run: { ...verifiedBase.run, ownerCallsThisProcess: 0 },
+      approvals: [],
+      safety: { ...idle.safety, ownerCallCount: 0 },
+    };
+    const invented = await createPollingHarness(inventedTerminal, []);
+    assert.equal(
+      invented.text("chain-pause"),
+      "Configured",
+      "a generic terminal state must not invent approval evidence",
+    );
+  });
+
+  test("finding 5: tool and sandbox stations observe authoritative mid-run evidence", async () => {
+    const pendingBase = uiProjection(idle, 5, "awaiting_approval");
+    const midRun: M5JudgeState = {
+      ...pendingBase,
+      approvals: [ownerApproval("sha256:mid-run-durable-approval")],
+      safety: { ...idle.safety, ownerCallCount: 1 },
+      evidenceTimeline: [
+        ...idle.evidenceTimeline,
+        {
+          sequence: idle.evidenceTimeline.length + 1,
+          kind: "sandbox",
+          title: "Assurance sandbox created",
+          detail: "TrueForge Code Mode opened an isolated deterministic assurance run.",
+          technicalIdentity: null,
+          status: "informational",
+        },
+      ],
+    };
+    const harness = await createPollingHarness(midRun, []);
+    assert.equal(
+      harness.text("chain-tools"),
+      "Observed",
+      "durable approval-bridge records prove factory tool use before the terminal projection exists",
+    );
+    assert.equal(
+      harness.text("chain-sandbox"),
+      "Observed",
+      "the authoritative sandbox checkpoint proves sandbox use mid-run",
+    );
+    assert.equal(
+      harness.text("chain-agents"),
+      "Configured",
+      "no mid-run thread evidence exists, so the agents station honestly stays Configured",
+    );
+    const idleHarness = await createPollingHarness(idle, []);
+    assert.equal(idleHarness.text("chain-tools"), "Configured");
+    assert.equal(idleHarness.text("chain-sandbox"), "Configured");
+    assert.equal(idleHarness.text("chain-pause"), "Configured");
+  });
+});
+
 describe("M5 TrueForge harness ribbon", () => {
   const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
   const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
