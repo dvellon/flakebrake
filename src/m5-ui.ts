@@ -47,6 +47,14 @@ import {
   type DeterministicM4MissionResult,
 } from "./m4-runner.js";
 import { createStore } from "./store.js";
+import {
+  DETERMINISTIC_MODEL_NAME,
+  DETERMINISTIC_MODEL_PROVIDER_NAME,
+  FLAKEBRAKE_ROOT_AGENT_NAME,
+  flakeBrakeRootAgentSpec,
+  TRUEFORGE_SDK_VERSION,
+  TRUEFORGE_SERVER_VERSION,
+} from "./trueforge-runtime.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const OWNER_SOURCE_IDENTITY = "owner/judge-ui";
@@ -96,6 +104,18 @@ export interface M5JudgeState {
     readonly terminalProjectionDigest: string | null;
     readonly disconnectedAndResumed: boolean;
   };
+  readonly harness: {
+    readonly framework: "TrueForge";
+    readonly serverVersion: string;
+    readonly sdkVersion: string;
+    readonly providerProfile: "Deterministic judge profile";
+    readonly modelName: string;
+    readonly rootAgentName: string;
+    readonly mcpConfigured: readonly string[];
+    readonly sandboxConfigured: boolean;
+    readonly dynamicSubagentsConfigured: boolean;
+    readonly approvalGatedToolCount: number;
+  };
   readonly hero: {
     readonly directDecision: "REPLAN";
     readonly portfolioVersion: string;
@@ -126,7 +146,25 @@ export interface M5JudgeState {
       readonly candidatePlanId: string;
       readonly strategy: string;
       readonly changedObligations: readonly string[];
+      readonly changes: readonly {
+        readonly obligationId: string;
+        readonly optionId: string;
+        readonly criticality: string;
+        readonly fromQuantity: number;
+        readonly toQuantity: number;
+        readonly serviceLoss: { readonly numerator: number; readonly denominator: number };
+      }[];
       readonly remainingCapacity: readonly { readonly resourceKey: string; readonly value: number }[];
+      readonly requiredOwnerApprovalCount: number;
+      readonly rank: {
+        readonly protectedObligationViolations: number;
+        readonly criticalityWeightedServiceDegradation: {
+          readonly numerator: number;
+          readonly denominator: number;
+        };
+        readonly previouslyAcceptedObligationsChanged: number;
+        readonly bottleneckSlack: { readonly numerator: number; readonly denominator: number };
+      };
       readonly recommended: boolean;
     }[];
     readonly winningModification: {
@@ -171,6 +209,7 @@ export interface M5JudgeState {
     readonly attemptCount: number;
     readonly mutationCount: number;
     readonly receiptCount: number;
+    readonly terminalEventCount: number;
     readonly actualFactCount: number;
     readonly actualFacts: readonly {
       readonly resourceKey: string;
@@ -192,6 +231,27 @@ export interface M5JudgeState {
     readonly unauthorizedMutationCount: number;
   };
 }
+
+const HARNESS_PROJECTION: M5JudgeState["harness"] = (() => {
+  const qualifiedModelName = `${DETERMINISTIC_MODEL_PROVIDER_NAME}/${DETERMINISTIC_MODEL_NAME}`;
+  const spec = flakeBrakeRootAgentSpec(qualifiedModelName);
+  const mcpServers = spec.mcpServers ?? [];
+  return {
+    framework: "TrueForge",
+    serverVersion: TRUEFORGE_SERVER_VERSION,
+    sdkVersion: TRUEFORGE_SDK_VERSION,
+    providerProfile: "Deterministic judge profile",
+    modelName: qualifiedModelName,
+    rootAgentName: FLAKEBRAKE_ROOT_AGENT_NAME,
+    mcpConfigured: mcpServers.map((server) => server.name),
+    sandboxConfigured: spec.config?.sandbox?.enabled === true,
+    dynamicSubagentsConfigured: spec.config?.dynamicSubAgents?.enabled === true,
+    approvalGatedToolCount: mcpServers.reduce(
+      (total, server) => total + (server.requireApprovalForTools?.length ?? 0),
+      0,
+    ),
+  };
+})();
 
 export interface M5DemoCoordinatorOptions {
   readonly dataRoot: string;
@@ -500,6 +560,7 @@ export class M5DemoCoordinator {
         disconnectedAndResumed:
           (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
       },
+      harness: HARNESS_PROJECTION,
       hero: {
         directDecision: direct.decision,
         portfolioVersion: portfolio.versions.portfolioVersion,
@@ -539,7 +600,35 @@ export class M5DemoCoordinator {
           candidatePlanId: candidate.candidatePlanId,
           strategy: candidate.strategy,
           changedObligations: candidate.affectedObligations.map((item) => item.obligationId),
+          changes: candidate.affectedObligations.map((item) => {
+            const obligation = [
+              ...evaluationInput.acceptedObligations,
+              evaluationInput.proposal,
+            ].find((candidateObligation) => candidateObligation.obligationId === item.obligationId);
+            const before = item.previousServiceLevel.find((value) => value.field === "quantity");
+            const after = item.proposedServiceLevel.find((value) => value.field === "quantity");
+            if (obligation === undefined || before === undefined || after === undefined) {
+              throw new Error("The canonical hero candidate has an incomplete quantity change");
+            }
+            return {
+              obligationId: item.obligationId,
+              optionId: item.optionId,
+              criticality: obligation.criticality,
+              fromQuantity: before.value,
+              toQuantity: after.value,
+              serviceLoss: item.obligationServiceLoss,
+            };
+          }),
           remainingCapacity: candidate.capacity.capacityAfter,
+          requiredOwnerApprovalCount: candidate.requiredOwnerApprovals.length,
+          rank: {
+            protectedObligationViolations: candidate.score.protectedObligationViolations,
+            criticalityWeightedServiceDegradation:
+              candidate.score.criticalityWeightedServiceDegradation,
+            previouslyAcceptedObligationsChanged:
+              candidate.score.previouslyAcceptedObligationsChanged,
+            bottleneckSlack: candidate.score.bottleneckSlack,
+          },
           recommended: candidate.candidatePlanId === direct.recommendedCandidate?.candidatePlanId,
         })),
         winningModification: winningModification(direct.recommendedCandidate),
@@ -710,6 +799,7 @@ export class M5DemoCoordinator {
       attemptCount: 0,
       mutationCount: 0,
       receiptCount: 0,
+      terminalEventCount: 0,
       actualFactCount: 0,
       actualFacts: [],
       attemptId: null,
@@ -766,6 +856,11 @@ export class M5DemoCoordinator {
           attemptCount: attemptIds.size,
           mutationCount: factory.getMutationCount(),
           receiptCount: addenda.filter((item) => item.kind === "receipt_reference").length,
+          terminalEventCount: addenda.filter((item) => {
+            if (item.kind !== "reservation_transition") return false;
+            const claimState = stringValue(objectValue(item.body)?.["claimState"]);
+            return claimState?.startsWith("terminal_") === true;
+          }).length,
           actualFactCount: actualFacts.length,
           actualFacts,
           attemptId: attempt?.executionAttemptId ?? null,

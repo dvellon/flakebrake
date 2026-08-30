@@ -7,7 +7,15 @@ const nodes = Object.fromEntries(
     "approval-guidance", "decision-announcer", "policy-decision", "capacity-grid", "obligations",
     "proposal", "basis-note", "basis-resolution", "winning-change", "candidate-list", "model-requests",
     "agent-tree", "runtime-chips", "timeline", "verification-pill", "result-metrics",
-    "actual-facts", "proof-stages", "readback-note", "toast",
+    "actual-facts", "proof-stages", "readback-note", "proof-center-lead",
+    "proof-center-status", "proof-direct-result", "proof-direct-note", "proof-winner-result",
+    "proof-winner-note", "proof-owner-result", "proof-owner-note", "proof-outcome-result",
+    "proof-outcome-note", "proof-control-summary", "proof-decisions", "proof-capacity-summary",
+    "proof-capacity-impact", "proof-durable-summary", "proof-durable-proof",
+    "proof-technical-evidence", "counterfactual-copy", "harness-state", "harness-provider",
+    "harness-session", "harness-turn", "harness-runtime", "harness-mcp", "harness-sandbox",
+    "harness-subagents", "harness-gate", "harness-replay-row", "harness-replay",
+    "harness-pause", "toast",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -182,11 +190,176 @@ function applyState(candidate, token) {
 function render() {
   if (!state) return;
   renderHeader();
+  renderHarness();
+  renderProofCenter();
   renderApproval();
   renderHero();
   renderActivity();
   renderTimeline();
   renderExecution();
+}
+
+function renderHarness() {
+  const harness = state.harness;
+  const stateLabels = {
+    idle: "Ready",
+    running: "Running",
+    awaiting_approval: "Paused for human",
+    verifying: "Running",
+    verified: "Verified",
+    failed: "Failed",
+    closed: "Closed",
+  };
+  const active = ["running", "awaiting_approval", "verifying"].includes(state.run.status);
+  nodes["harness-state"].textContent = stateLabels[state.run.status] ?? "Ready";
+  nodes["harness-state"].className = `pill harness-state ${state.run.status === "verified" ? "pill-verified" : state.run.status === "failed" ? "pill-denied" : active ? "pill-pending" : "pill-neutral"}`;
+  nodes["harness-provider"].textContent = harness.providerProfile;
+  nodes["harness-session"].textContent = state.mission.sessionId ?? "Not started";
+  nodes["harness-turn"].textContent = state.mission.currentTurnId ?? "—";
+  nodes["harness-runtime"].textContent = `TrueForge ${harness.serverVersion} · SDK ${harness.sdkVersion}`;
+  const reachedServices = state.activity.mcpServers.length;
+  nodes["harness-mcp"].textContent = reachedServices > 0
+    ? `${reachedServices}/${harness.mcpConfigured.length} services reached`
+    : `${harness.mcpConfigured.length} services configured`;
+  nodes["harness-sandbox"].textContent = state.activity.sandboxExecutions > 0
+    ? `${state.activity.sandboxExecutions} executed`
+    : harness.sandboxConfigured ? "Configured" : "—";
+  nodes["harness-subagents"].textContent = state.activity.subagents.length > 0
+    ? `${state.activity.subagents.length} threads evidenced`
+    : harness.dynamicSubagentsConfigured ? "Dynamic · configured" : "—";
+  nodes["harness-gate"].textContent = state.pendingApproval
+    ? "Holding this turn"
+    : state.run.ownerCallsThisProcess > 0
+      ? `Native · ${state.run.ownerCallsThisProcess} owner call${state.run.ownerCallsThisProcess === 1 ? "" : "s"}`
+      : `Native · ${harness.approvalGatedToolCount} gated tool${harness.approvalGatedToolCount === 1 ? "" : "s"}`;
+  const replayEvidence = state.mission.disconnectedAndResumed || state.run.connection === "replayed" ||
+    (state.run.status === "verified" && reattachedTerminal);
+  nodes["harness-replay-row"].hidden = !replayEvidence;
+  nodes["harness-replay"].textContent = !replayEvidence
+    ? "—"
+    : state.mission.disconnectedAndResumed ? "Durable session replayed" : "Reconnected to durable session";
+  nodes["harness-pause"].hidden = state.pendingApproval === null;
+}
+
+function rationalText(value) {
+  if (!value) return "—";
+  return value.denominator === 1 ? String(value.numerator) : `${value.numerator}/${value.denominator}`;
+}
+
+function actionLabel(toolName) {
+  const labels = {
+    select_portfolio_modification: "Select the exact portfolio modification",
+    accept_promise: "Accept the fresh capacity-safe promise",
+    create_schedule_reservation: "Create the bound schedule reservation",
+    submit_schedule_change: "Submit the alternate schedule representation",
+  };
+  return labels[toolName] ?? toolName.replaceAll("_", " ");
+}
+
+function renderProofCenter() {
+  const winner = state.hero.winningModification;
+  const winnerCandidate = state.hero.candidates.find((item) => item.candidatePlanId === winner.candidatePlanId);
+  const winnerObligation = state.hero.obligations.find((item) => item.obligationId === winner.obligationId);
+  const winnerObjective = winnerObligation?.objective ?? winner.obligationId;
+  const directViolations = state.hero.capacity.filter((item) => item.remainingCapacity < 0);
+  const ownerDecisions = state.approvals.filter((item) => item.source === "owner");
+  const ownerAllowed = ownerDecisions.filter((item) => item.decision === "allow");
+  const ownerDenied = ownerDecisions.filter((item) => item.decision === "deny");
+  const mechanicalDenials = state.approvals.filter((item) => item.source === "active_m2_denial");
+  const verified = state.execution.terminalStatus === "terminal_verified" && state.execution.independentReadBackObserved;
+  const replayed = verified &&
+    (state.run.connection === "replayed" || state.mission.disconnectedAndResumed || reattachedTerminal);
+
+  nodes["proof-center-status"].className = `pill ${verified ? "pill-verified" : state.execution.mutationCount > 0 ? "pill-pending" : "pill-neutral"}`;
+  nodes["proof-center-status"].textContent = verified ? "Verified record" : state.execution.mutationCount > 0 ? "Read-back pending" : "Canonical basis";
+  nodes["proof-center-lead"].textContent = verified
+    ? `The direct promise stayed blocked, the bounded ${winner.fromQuantity}→${winner.toQuantity} change to “${winnerObjective}” was authorized, and exactly ${state.execution.mutationCount} factory mutation was independently verified.`
+    : `The direct rush plan is blocked on ${directViolations.length} finite capacity limits. The safe basis changes “${winnerObjective}” from ${winner.fromQuantity} to ${winner.toQuantity} and leaves protected work unchanged.`;
+
+  nodes["proof-direct-result"].textContent = state.hero.directDecision;
+  nodes["proof-direct-note"].textContent = directViolations.map((item) => `${item.label} over by ${Math.abs(item.remainingCapacity)}`).join(" · ");
+  nodes["proof-winner-result"].textContent = `${winner.fromQuantity} → ${winner.toQuantity}`;
+  nodes["proof-winner-note"].textContent = `${winnerObjective} · protected work ${state.hero.protectedWorkUnchanged ? "unchanged" : "changed"}`;
+  nodes["proof-owner-result"].textContent = ownerDecisions.length
+    ? `${ownerAllowed.length} allowed · ${ownerDenied.length} denied`
+    : state.pendingApproval ? "Decision required" : "0 recorded";
+  nodes["proof-owner-note"].textContent = mechanicalDenials.length
+    ? `${mechanicalDenials.length} equivalent action mechanically blocked`
+    : state.pendingApproval ? actionLabel(state.pendingApproval.toolName) : "Exact action ledger populates during the mission";
+  nodes["proof-outcome-result"].textContent = verified
+    ? `${state.execution.mutationCount} mutation · verified`
+    : state.execution.mutationCount > 0 ? `${state.execution.mutationCount} mutation · not yet success` : "No factory effect";
+  nodes["proof-outcome-note"].textContent = `${state.execution.receiptCount} receipt · ${state.execution.terminalEventCount} terminal event · ${state.execution.actualFactCount} actual facts`;
+
+  renderProofDecisions(ownerDecisions, mechanicalDenials);
+  renderProofCapacity(winnerCandidate, directViolations);
+  renderDurableProof(verified, replayed);
+  renderTechnicalProof(winnerCandidate);
+  renderCounterfactual(ownerDenied, mechanicalDenials, verified);
+}
+
+function renderProofDecisions(ownerDecisions, mechanicalDenials) {
+  const pending = state.pendingApproval;
+  nodes["proof-control-summary"].textContent = `${ownerDecisions.length} owner decision${ownerDecisions.length === 1 ? "" : "s"} · ${mechanicalDenials.length} mechanical block${mechanicalDenials.length === 1 ? "" : "s"}`;
+  const recorded = ownerDecisions.map((item, index) => `<article class="proof-decision ${escapeHtml(item.decision)}"><span class="decision-index">${index + 1}</span><div><p>${item.decision === "allow" ? "Owner allowed" : "Owner denied"}</p><strong>${escapeHtml(actionLabel(item.toolName))}</strong><span>${escapeHtml(item.effect)}</span>${item.decision === "deny" ? `<small>Reason: ${escapeHtml(item.reason)}</small>` : ""}<details><summary>Exact action identity</summary><code>${escapeHtml(item.actionIdentity)}</code></details></div><span class="pill ${item.decision === "allow" ? "pill-approved" : "pill-denied"}">${escapeHtml(item.decision)}</span></article>`).join("");
+  const waiting = pending && !ownerDecisions.some((item) => item.actionIdentity === pending.actionIdentity)
+    ? `<article class="proof-decision pending"><span class="decision-index">${ownerDecisions.length + 1}</span><div><p>Owner decision required now</p><strong>${escapeHtml(actionLabel(pending.toolName))}</strong><span>${escapeHtml(pending.expectedEffect)}</span><details><summary>Exact action identity</summary><code>${escapeHtml(pending.actionIdentity)}</code></details></div><span class="pill pill-pending">pending</span></article>`
+    : "";
+  const mechanical = mechanicalDenials.map((item) => `<article class="mechanical-proof"><span aria-hidden="true">↳</span><div><p>Mechanically blocked · no owner decision</p><strong>${escapeHtml(actionLabel(item.toolName))}</strong><span>${escapeHtml(item.effect)}. The active denial bound the equivalent representation without another owner call.</span><code>${escapeHtml(item.actionIdentity)}</code></div></article>`).join("");
+  assignPreservingDisclosure(nodes["proof-decisions"], recorded + waiting + mechanical || `<p class="proof-empty">No owner action has been presented yet. Start the mission to populate the exact allow/deny ledger.</p>`);
+}
+
+function renderProofCapacity(winnerCandidate, directViolations) {
+  const safeRemaining = new Map((winnerCandidate?.remainingCapacity ?? []).map((item) => [item.resourceKey, item.value]));
+  nodes["proof-capacity-summary"].textContent = directViolations.map((item) => `${item.label} −${Math.abs(item.remainingCapacity)}`).join(" · ");
+  const rows = state.hero.capacity.map((item) => {
+    const beforeRush = item.declaredCapacity - item.existingUse;
+    const overBy = Math.max(0, -item.remainingCapacity);
+    const safeAfter = safeRemaining.get(item.resourceKey);
+    return `<div class="proof-capacity-row" role="row"><strong role="cell">${escapeHtml(item.label)}</strong><span role="cell"><small>Before rush</small>${beforeRush}</span><span role="cell"><small>Direct plan</small><b class="${item.remainingCapacity < 0 ? "tone-denied" : "tone-neutral"}">${item.remainingCapacity}</b></span><span role="cell"><small>Over limit</small>${overBy || "—"}</span><span role="cell"><small>Safe winner</small><b class="tone-verified">${safeAfter ?? "—"}</b></span></div>`;
+  }).join("");
+  const alternative = state.hero.candidates.find((item) => item.strategy === "modify_proposal");
+  const allProtect = state.hero.candidates.every((item) => item.rank.protectedObligationViolations === 0);
+  const rankReason = winnerCandidate && alternative
+    ? `<div class="rank-explanation"><p class="eyebrow">Why this wins lexicographically</p><p>${allProtect ? "Every feasible candidate preserves all protected obligations." : "Protected-obligation preservation differs between candidates."} The first differentiating coordinate is exact criticality-weighted service degradation: <strong>${rationalText(winnerCandidate.rank.criticalityWeightedServiceDegradation)}</strong> for the best-effort display change versus <strong>${rationalText(alternative.rank.criticalityWeightedServiceDegradation)}</strong> for reducing the important rush order. That criterion is evaluated before existing promises changed (${winnerCandidate.rank.previouslyAcceptedObligationsChanged} versus ${alternative.rank.previouslyAcceptedObligationsChanged}).</p></div>`
+    : "";
+  nodes["proof-capacity-impact"].innerHTML = `<p class="proof-explanation">The direct basis requests more agent work and owner-decision capacity than declared. Production remains within its aggregate limit; the separate interval conflict is enforced at the owner boundary.</p><div class="proof-capacity-table" role="table" aria-label="Remaining capacity before the rush order, under the direct plan, and after the safe winner"><div class="proof-capacity-header" role="row"><span role="columnheader">Resource</span><span role="columnheader">Before rush</span><span role="columnheader">Direct plan</span><span role="columnheader">Over limit</span><span role="columnheader">Safe winner</span></div>${rows}</div>${rankReason}`;
+}
+
+function renderDurableProof(verified, replayed) {
+  const result = state.execution;
+  nodes["proof-durable-summary"].textContent = verified
+    ? `${result.mutationCount} mutation · ${result.receiptCount} receipt · ${result.terminalEventCount} terminal event · ${result.actualFactCount} facts`
+    : result.receiptCount > 0 ? "Receipt present · independent verification still required" : "Mutation is not verified success";
+  const readBackStatus = result.independentReadBackObserved ? "Observed before terminal completion" : "Not yet observed";
+  const terminalStatus = result.terminalStatus === "terminal_verified" ? "terminal_verified recorded" : "Not recorded";
+  const replayCopy = verified
+    ? `${replayed ? "This browser is attached to a durable replay." : "The verified projection is durable across refresh and restart."} This process made ${state.run.ownerCallsThisProcess} owner call${state.run.ownerCallsThisProcess === 1 ? "" : "s"}; the durable effect count remains ${result.mutationCount}.`
+    : "Refresh and recovery read the same durable records; neither may turn a receipt into success or repeat an effect.";
+  nodes["proof-durable-proof"].innerHTML = `<div class="proof-counts"><div><strong>${result.mutationCount}</strong><span>Mutation</span></div><div><strong>${result.receiptCount}</strong><span>Receipt</span></div><div><strong>${result.terminalEventCount}</strong><span>Terminal event</span></div><div><strong>${result.actualFactCount}</strong><span>Actual facts</span></div></div><ol class="durable-chain"><li class="${result.receiptCount ? "complete" : "waiting"}"><span>1</span><div><strong>Mutation receipt</strong><p>A receipt proves the fenced factory command committed. By itself, it is not verified success.</p></div></li><li class="${result.independentReadBackObserved ? "complete" : result.receiptCount ? "active" : "waiting"}"><span>2</span><div><strong>Independent read-back</strong><p>${readBackStatus}${result.approvedInterval ? ` · ${escapeHtml(formatFriendlyInterval(result.approvedInterval))}` : ""}</p></div></li><li class="${verified ? "complete" : "waiting"}"><span>3</span><div><strong>Verified terminal event</strong><p>${terminalStatus}. Only this state is presented as success.</p></div></li></ol><p class="replay-proof">${escapeHtml(replayCopy)}</p>`;
+}
+
+function renderTechnicalProof(winnerCandidate) {
+  const candidateRows = state.hero.candidates.map((item) => `<div class="technical-candidate"><strong>${item.recommended ? "Winner" : "Candidate"} · ${escapeHtml(item.strategy)}</strong><code>${escapeHtml(item.candidatePlanId)}</code><span>protected violations ${item.rank.protectedObligationViolations} · weighted degradation ${rationalText(item.rank.criticalityWeightedServiceDegradation)} · accepted obligations changed ${item.rank.previouslyAcceptedObligationsChanged} · bottleneck slack ${rationalText(item.rank.bottleneckSlack)} · owner approvals required ${item.requiredOwnerApprovalCount}</span></div>`).join("");
+  const identities = [
+    ["Portfolio version", state.hero.portfolioVersion],
+    ["Selected plan", winnerCandidate?.candidatePlanId ?? null],
+    ["Execution attempt", state.execution.attemptId],
+    ["Mutation receipt", state.execution.receiptId],
+    ["Terminal projection", state.mission.terminalProjectionDigest],
+  ];
+  nodes["proof-technical-evidence"].innerHTML = `<dl class="technical-proof-grid">${identities.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value ?? "Not recorded")}</dd></div>`).join("")}</dl><div class="technical-candidates">${candidateRows}</div>`;
+}
+
+function renderCounterfactual(ownerDenied, mechanicalDenials, verified) {
+  const overages = state.hero.capacity.filter((item) => item.remainingCapacity < 0).map((item) => `${item.label} by ${Math.abs(item.remainingCapacity)}`);
+  let copy = `Accepting the direct basis would exceed ${overages.join(" and ")}. The selected replan keeps the protected medical order at quantity 10 and changes the best-effort display order from 10 to 8.`;
+  if (ownerDenied.length && mechanicalDenials.length) {
+    copy += verified
+      ? ` The denied 09:10–09:40 interval and its equivalent alternate representation did not become the factory result; the only mutation is the approved ${formatFriendlyInterval(state.execution.approvedInterval)} interval.`
+      : " The denied 09:10–09:40 interval and its equivalent alternate representation remain blocked without a second owner decision.";
+  }
+  nodes["counterfactual-copy"].textContent = copy;
 }
 
 function renderHeader() {

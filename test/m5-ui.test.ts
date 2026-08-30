@@ -157,6 +157,168 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
   });
 });
 
+describe("M5 operator proof center", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+
+  test("keeps the executive proof visible and progressively discloses exact evidence", () => {
+    assert.match(document, /Operator proof center/u);
+    assert.match(document, /aria-label="Executive proof summary"/u);
+    assert.match(document, /Exact control decisions/u);
+    assert.match(document, /Capacity and before\/after impact/u);
+    assert.match(document, /Durable proof and replay/u);
+    assert.match(document, /Technical evidence/u);
+    assert.match(document, /What FlakeBrake prevented/u);
+  });
+
+  test("derives proof claims from state without adding a mutating endpoint", () => {
+    assert.match(application, /criticalityWeightedServiceDegradation/u);
+    assert.match(application, /terminalEventCount/u);
+    assert.match(application, /state\.approvals\.filter/u);
+    assert.match(application, /state\.hero\.capacity\.filter/u);
+    assert.doesNotMatch(application, /api\/proof/u);
+  });
+
+  test("states the receipt, verification, and replay boundary directly", () => {
+    assert.match(application, /By itself, it is not verified success/u);
+    assert.match(application, /Only this state is presented as success/u);
+    assert.match(application, /durable effect count remains/u);
+  });
+});
+
+describe("M5 TrueForge harness ribbon", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-harness-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  test("names the harness, the pause, and the ownership boundary without unsupported claims", () => {
+    assert.match(document, /class="harness-name">TrueForge harness</u);
+    assert.match(document, /id="harness-pause"[^>]*hidden>TrueForge paused this turn for your decision\.</u);
+    assert.match(document, /Why TrueForge matters/u);
+    assert.match(
+      document,
+      /TrueForge owns sessions and turns, MCP routing, sandbox execution, subagents, approval pauses, and reconnect\. FlakeBrake owns admission policy, exact authorization, mechanical alternate-representation denial, fenced mutation, and independent verification\./u,
+    );
+    assert.doesNotMatch(document, /OpenAI|Daytona/u);
+    assert.doesNotMatch(application, /OpenAI|Daytona/u);
+    assert.match(application, /services configured/u);
+    assert.match(application, /services reached/u);
+  });
+
+  test("projects only authoritative harness facts", () => {
+    assert.deepEqual(idle.harness, {
+      framework: "TrueForge",
+      serverVersion: "0.1.4",
+      sdkVersion: "0.1.3",
+      providerProfile: "Deterministic judge profile",
+      modelName: "flakebrake-deterministic/m4-mission",
+      rootAgentName: "flakebrake-root-obligation-commander",
+      mcpConfigured: [
+        "factory-orders",
+        "factory-capacity",
+        "factory-simulator",
+        "factory-change-control",
+      ],
+      sandboxConfigured: true,
+      dynamicSubagentsConfigured: true,
+      approvalGatedToolCount: 4,
+    });
+  });
+
+  test("reports state, pause, and configured-versus-evidenced wording from state alone", async () => {
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const verifiedBase = uiProjection(idle, 3, "verified");
+    const terminal: M5JudgeState = {
+      ...verifiedBase,
+      run: { ...verifiedBase.run, ownerCallsThisProcess: 4 },
+      activity: {
+        ...idle.activity,
+        mcpServers: [...idle.harness.mcpConfigured].sort(),
+        sandboxExecutions: 1,
+        subagents: [
+          { threadId: "thread/a", title: "Portfolio and order analyst", status: "done" },
+          { threadId: "thread/b", title: "Capacity and schedule analyst", status: "done" },
+          { threadId: "thread/c", title: "Assurance and simulation engineer", status: "done" },
+        ],
+      },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const replayed: M5JudgeState = {
+      ...terminal,
+      revision: 4,
+      mission: { ...terminal.mission, disconnectedAndResumed: true },
+    };
+    const harness = await createPollingHarness(idle, [
+      Promise.resolve(pending),
+      Promise.resolve(terminal),
+      Promise.resolve(replayed),
+    ]);
+    assert.equal(harness.text("harness-state"), "Ready");
+    assert.equal(harness.text("harness-mcp"), "4 services configured");
+    assert.equal(harness.text("harness-sandbox"), "Configured");
+    assert.equal(harness.text("harness-subagents"), "Dynamic · configured");
+    assert.equal(harness.text("harness-gate"), "Native · 4 gated tools");
+    assert.equal(harness.evaluate("document.getElementById('harness-pause').hidden"), true);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("harness-state"), "Paused for human");
+    assert.equal(harness.text("harness-gate"), "Holding this turn");
+    assert.equal(harness.evaluate("document.getElementById('harness-pause').hidden"), false);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("harness-state"), "Verified");
+    assert.equal(harness.text("harness-mcp"), "4/4 services reached");
+    assert.equal(harness.text("harness-sandbox"), "1 executed");
+    assert.equal(harness.text("harness-subagents"), "3 threads evidenced");
+    assert.equal(harness.text("harness-gate"), "Native · 4 owner calls");
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.evaluate("document.getElementById('harness-replay-row').hidden"), false);
+    assert.equal(harness.text("harness-replay"), "Durable session replayed");
+
+    const failedState: M5JudgeState = {
+      ...idle,
+      revision: 2,
+      run: { ...idle.run, status: "failed", generation: 1, errorCode: "controlled_failure" },
+    };
+    const failedHarness = await createPollingHarness(failedState, []);
+    assert.equal(failedHarness.text("harness-state"), "Failed");
+  });
+
+  test("the proof center counts a genuine disconnect-resume as replay evidence", async () => {
+    const verifiedBase = uiProjection(idle, 2, "verified");
+    const resumedTerminal: M5JudgeState = {
+      ...verifiedBase,
+      mission: { ...verifiedBase.mission, disconnectedAndResumed: true },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const resumed = await createPollingHarness(resumedTerminal, []);
+    assert.match(
+      resumed.evaluate<string>("document.getElementById('proof-durable-proof').innerHTML"),
+      /attached to a durable replay/u,
+      "server-side disconnect-and-resume evidence marks continuity as observed",
+    );
+
+    const liveTerminal: M5JudgeState = {
+      ...verifiedBase,
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const live = await createPollingHarness(liveTerminal, []);
+    const liveProof = live.evaluate<string>("document.getElementById('proof-durable-proof').innerHTML");
+    assert.doesNotMatch(liveProof, /attached to a durable replay/u, "a live completion does not invent a disconnect");
+    assert.match(liveProof, /durable across refresh and restart/u);
+  });
+});
+
 describe("Qodo Round 2: executable session error-capture arming", () => {
   test("arming registers the observer before any navigation and clears the probe", async () => {
     const session = createFakeBrowserSession();
@@ -1069,6 +1231,33 @@ describe("M5 judge UI", { concurrency: false }, () => {
       [initial.hero.winningModification.fromQuantity, initial.hero.winningModification.toQuantity],
       [10, 8],
     );
+    const winner = initial.hero.candidates.find((item) => item.recommended);
+    const proposalAlternative = initial.hero.candidates.find((item) => item.strategy === "modify_proposal");
+    assert.ok(winner);
+    assert.ok(proposalAlternative);
+    assert.deepEqual(winner.changes, [{
+      obligationId: "order/best-effort-display",
+      optionId: "best-effort-order/reduce-to-8",
+      criticality: "best_effort",
+      fromQuantity: 10,
+      toQuantity: 8,
+      serviceLoss: { numerator: 2, denominator: 5 },
+    }]);
+    assert.deepEqual(winner.rank, {
+      protectedObligationViolations: 0,
+      criticalityWeightedServiceDegradation: { numerator: 2, denominator: 5 },
+      previouslyAcceptedObligationsChanged: 1,
+      bottleneckSlack: { numerator: 0, denominator: 1 },
+    });
+    assert.deepEqual(proposalAlternative.rank.criticalityWeightedServiceDegradation, {
+      numerator: 5,
+      denominator: 1,
+    });
+    assert.deepEqual(winner.remainingCapacity, [
+      { resourceKey: "agent_work_units", value: 1 },
+      { resourceKey: "human_review_decisions", value: 0 },
+      { resourceKey: "production_cell_minutes", value: 20 },
+    ]);
     assert.equal(initial.hero.protectedWorkUnchanged, true);
   });
 
@@ -1171,6 +1360,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
         attempt: terminal.execution.attemptCount,
         mutation: terminal.execution.mutationCount,
         receipt: terminal.execution.receiptCount,
+        terminalEvents: terminal.execution.terminalEventCount,
         actuals: terminal.execution.actualFactCount,
         terminal: terminal.execution.terminalStatus,
       },
@@ -1179,6 +1369,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
         attempt: 1,
         mutation: 1,
         receipt: 1,
+        terminalEvents: 1,
         actuals: 2,
         terminal: "terminal_verified",
       },
@@ -1196,6 +1387,11 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(terminal.activity.subagents.length, 3);
     assert.equal(terminal.activity.sandboxExecutions, 1);
     assert.equal(terminal.activity.mcpServers.length, 4);
+    assert.deepEqual(
+      [...terminal.activity.mcpServers].sort(),
+      [...terminal.harness.mcpConfigured].sort(),
+      "every configured MCP service is evidenced as reached at terminal",
+    );
     const decisionEvidence = terminal.evidenceTimeline.filter((item) => item.kind.startsWith("approval:"));
     assert.equal(decisionEvidence.length, terminal.approvals.length);
     assert.equal(decisionEvidence.some((item) => item.status === "pending"), false);
@@ -1219,6 +1415,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(refreshed.mission.sessionId, sessionId);
     assert.equal(refreshed.mission.terminalProjectionDigest, projectionDigest);
     assert.equal(refreshed.execution.mutationCount, 1);
+    assert.equal(refreshed.execution.terminalEventCount, 1);
     assert.equal(refreshed.run.ownerCallsThisProcess, 4);
   });
 
@@ -1277,6 +1474,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(replay.mission.disconnectedAndResumed, true);
     assert.equal(replay.execution.mutationCount, 1);
     assert.equal(replay.execution.receiptCount, 1);
+    assert.equal(replay.execution.terminalEventCount, 1);
     assert.equal(replay.execution.attemptCount, 1);
   });
 
