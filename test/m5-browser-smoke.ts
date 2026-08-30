@@ -31,9 +31,13 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
 
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
+const browserPort = Number(process.env["FLAKEBRAKE_M5_BROWSER_PORT"] ?? "0");
+if (!Number.isSafeInteger(browserPort) || browserPort < 0 || browserPort > 65_535) {
+  throw new Error("FLAKEBRAKE_M5_BROWSER_PORT must be an integer from 0 through 65535");
+}
 const running = await startM5JudgeServer({
   dataRoot: root,
-  port: 0,
+  port: browserPort,
   cleanupDataOnClose: true,
 });
 const transportKillServer = createServer((socket) => socket.destroy());
@@ -116,6 +120,57 @@ try {
   await capture.openApplication(running.url);
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
   await waitText(browser, By.css(".pill-denied"), "REPLAN");
+  await waitText(browser, By.id("proof-direct-result"), "Doesn’t fit yet");
+  await waitText(browser, By.id("proof-winner-result"), "10 → 8");
+  assert.match(await browser.findElement(By.id("proof-winner-note")).getText(), /Deliver best-effort display stands/u);
+  assert.match(await browser.findElement(By.id("proof-direct-note")).getText(), /Agent work over by 2.*Human decisions over by 1/u);
+  await waitText(browser, By.id("harness-state"), "Ready");
+  await waitText(browser, By.id("guided-heading"), "A rush order is waiting");
+  assert.match(
+    await browser.findElement(By.id("guided-why")).getText(),
+    /This rush order doesn’t fit yet[\s\S]*FlakeBrake found a safer plan/u,
+  );
+  assert.equal(
+    await browser.findElement(By.id("harness-plain")).getText(),
+    "TrueForge is ready to coordinate specialist agents, connect 4 factory tools, run a sandbox check, and pause for your decisions.",
+  );
+  assert.equal(await browser.findElement(By.id("chain-mission")).getText(), "CONFIGURED");
+  const readTextContent = async (id: string): Promise<string> =>
+    (await browser.findElement(By.id(id)).getAttribute("textContent")) ?? "";
+  assert.equal(await readTextContent("harness-mcp"), "4 services configured");
+  assert.equal(await readTextContent("harness-sandbox"), "Configured");
+  assert.equal(await readTextContent("harness-subagents"), "Dynamic · configured");
+  assert.equal(await readTextContent("harness-runtime"), "TrueForge 0.1.4 · SDK 0.1.3");
+  assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), false, "the pause line stays hidden while idle");
+  assert.equal(
+    await browser.executeScript("return document.querySelector('.harness-why').open;"),
+    false,
+    "the TrueForge disclosure starts collapsed",
+  );
+  assert.equal(
+    await browser.executeScript("return document.querySelector('.harness-technical').open;"),
+    false,
+    "raw TrueForge identifiers start behind the collapsed technical disclosure",
+  );
+  assert.equal(
+    await browser.findElement(By.id("harness-mcp")).isDisplayed(),
+    false,
+    "technical harness facts are not visible until the disclosure opens",
+  );
+  assert.equal(
+    await browser.executeScript("return document.querySelector('.trust-technical').open;"),
+    false,
+    "agent-trust identifiers start behind the collapsed technical disclosure",
+  );
+  assert.match(
+    await browser.findElement(By.css(".trust-primary")).getText(),
+    /Agents can propose anything; they cannot make it true\./u,
+  );
+  assert.equal(
+    await browser.findElement(By.id("trust-empty")).isDisplayed(),
+    true,
+    "idle shows the honest empty agent-trust state",
+  );
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
   assert.equal((await browser.findElements(By.css("progress.capacity-baseline"))).length, 3);
   assert.equal((await browser.findElements(By.css("[style]"))).length, 0, "CSP-safe UI has no inline style attributes");
@@ -142,9 +197,16 @@ try {
     "the sticky topbar keeps scrolled content from reading through",
   );
   await screenshot(browser, join(screenshots, "01-initial.png"));
+  await browser.executeScript("document.getElementById('proof-capacity-details').open = true; document.getElementById('proof-center-title').scrollIntoView({block: 'start'});");
+  const capacityProof = await browser.findElement(By.id("proof-capacity-impact")).getText();
+  assert.match(capacityProof, /BEFORE RUSH[\s\S]*DIRECT PLAN[\s\S]*SAFE WINNER/u);
+  assert.match(capacityProof, /Agent work\s+4\s+-2\s+2\s+1/u);
+  assert.match(capacityProof, /criticality-weighted service degradation:[\s\S]*2\/5[\s\S]*versus[\s\S]*5/u);
+  await screenshot(browser, join(screenshots, "02-proof-center-capacity.png"));
+  await browser.executeScript("document.getElementById('proof-capacity-details').open = false; window.scrollTo(0, 0);");
   await browser.manage().window().setRect({ width: 1024, height: 768 });
   assert.equal(await hasHorizontalOverflow(browser), false);
-  await screenshot(browser, join(screenshots, "02-1024x768-idle.png"));
+  await screenshot(browser, join(screenshots, "03-1024x768-idle.png"));
   await browser.manage().window().setRect({ width: 1440, height: 900 });
 
   const start = await browser.findElement(By.id("start-button"));
@@ -187,6 +249,66 @@ try {
     );
     smokeStage = `owner_${ownerCall}_visible`;
     actionDigests.add(digest);
+    await waitText(browser, By.id("harness-state"), "Paused for human");
+    assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), true);
+    assert.equal(
+      await browser.findElement(By.id("harness-pause")).getText(),
+      "TrueForge paused this turn for your decision.",
+    );
+    assert.equal(
+      (await browser.findElement(By.id("harness-gate")).getAttribute("textContent")) ?? "",
+      "Holding this turn",
+    );
+    assert.equal(
+      await browser.findElement(By.id("guided-heading")).getText(),
+      ownerCall <= 2 ? "Your approval is required" : ownerCall === 3 ? "This time slot conflicts with protected work" : "A safe time slot is available",
+      `owner call ${String(ownerCall)} carries its plain-language story heading`,
+    );
+    if (ownerCall === 4) {
+      assert.equal(
+        await browser.findElement(By.id("guided-mechanical")).isDisplayed(),
+        true,
+        "the mechanical-block story persists into the next approval",
+      );
+      assert.match(
+        await browser.findElement(By.id("guided-mechanical")).getText(),
+        /The same unsafe request was blocked automatically/u,
+      );
+      const pendingTrustRows = await browser.findElement(By.id("trust-rows")).getText();
+      assert.match(
+        pendingTrustRows,
+        /the same denied action in another technical representation/u,
+        "the agents-checking-agents panel carries the mechanical-block handoff",
+      );
+      assert.match(pendingTrustRows, /BLOCKED/u, "the mechanical handoff renders its Blocked result");
+    }
+    const foldViewports = [
+      [1440, 900], [1280, 800], [1120, 800], [1024, 768],
+    ] as const;
+    for (const [foldWidth, foldHeight] of foldViewports) {
+      await browser.manage().window().setRect({ width: foldWidth, height: foldHeight });
+      await browser.executeScript("window.scrollTo(0, 0);");
+      const positions = await browser.executeScript<{
+        readonly headingBottom: number;
+        readonly actionsBottom: number;
+        readonly viewport: number;
+      }>(
+        "const heading = document.getElementById('guided-heading').getBoundingClientRect();" +
+          "const actions = document.querySelector('.approval-actions').getBoundingClientRect();" +
+          "return { headingBottom: heading.bottom, actionsBottom: actions.bottom, viewport: window.innerHeight };",
+      );
+      assert.equal(
+        positions.headingBottom > 0 && positions.headingBottom <= positions.viewport,
+        true,
+        `guided story heading is above the fold at ${String(foldWidth)}x${String(foldHeight)}`,
+      );
+      assert.equal(
+        positions.actionsBottom > 0 && positions.actionsBottom <= positions.viewport,
+        true,
+        `the operator decision actions are above the fold at ${String(foldWidth)}x${String(foldHeight)}`,
+      );
+    }
+    await browser.manage().window().setRect({ width: 1440, height: 900 });
 
     if (ownerCall === 2) {
       assert.equal(
@@ -201,7 +323,7 @@ try {
         5_000,
         "the session network observer did not record the pre-refresh controlled failure",
       );
-      await screenshot(browser, join(screenshots, "03-pending-approval.png"));
+      await screenshot(browser, join(screenshots, "04-pending-approval.png"));
       await browser.navigate().refresh();
       await browser.wait(until.elementLocated(By.id("approval-panel")), 60_000);
       await browser.wait(
@@ -245,7 +367,7 @@ try {
     );
     if (ownerCall === 3) {
       await browser.wait(until.elementLocated(By.css(".policy-decision:not([hidden])")), 60_000);
-      await waitText(browser, By.id("policy-decision"), "Auto-blocked · active policy", 60_000);
+      await waitText(browser, By.id("policy-decision"), "Blocked automatically — same denied action", 60_000);
       assert.equal(
         await browser.executeScript("return document.querySelector('#timeline .evidence-details').open;"),
         true,
@@ -256,46 +378,142 @@ try {
         "block",
         "policy decision titles render as stacked rows rather than run-on text",
       );
-      await screenshot(browser, join(screenshots, "04-owner-and-mechanical-denial.png"));
+      await screenshot(browser, join(screenshots, "05-owner-and-mechanical-denial.png"));
     }
   }
 
   await waitText(browser, By.id("outcome"), "Verified success", 60_000);
   await waitText(browser, By.id("verification-pill"), "Verified", 30_000);
   const documentText = await browser.findElement(By.css("body")).getText();
-  assert.match(documentText, /Auto-blocked · active policy/u);
+  assert.match(documentText, /Blocked automatically — same denied action/u);
   assert.match(documentText, /09:40–10:10/u);
-  assert.match(documentText, /ACTUAL CONSUMPTION FACTS/u);
+  assert.match(documentText, /MEASURED RESOURCE USE/u);
   assert.match(documentText, /Agent work[\s\S]*6/u);
   assert.match(documentText, /Production cell[\s\S]*30/u);
-  assert.match(documentText, /Resolved through bounded replan/u);
+  assert.match(documentText, /Resolved through the safest workable plan/u);
   assert.match(documentText, /Earlier attempt stopped safely · recovered/u);
   assert.doesNotMatch(documentText, /Mission stopped safely/u);
   assert.match(documentText, /Independent read-back observed/u);
   assert.doesNotMatch(documentText, /Independent read-back pending/u);
+  assert.match(documentText, /What FlakeBrake prevented/iu);
+  assert.match(documentText, /3 allowed · 1 denied/u);
+  assert.match(documentText, /1 receipt · 1 verified completion · 2 measured facts/u);
+  assert.match(documentText, /only mutation is the approved 09:40–10:10 interval/u);
   assert.equal(await browser.findElement(By.id("connection-label")).getText(), "Mission complete");
+  await waitText(browser, By.id("harness-state"), "Verified");
+  await waitText(browser, By.id("guided-heading"), "Done—and independently verified", 30_000);
+  assert.equal(
+    await browser.findElement(By.id("harness-plain")).getText(),
+    "TrueForge coordinated 3 specialist agents, connected 4 factory tools, ran a sandbox check, paused for your decisions, and resumed the same durable session.",
+    "the terminal ribbon states the exact plain-language TrueForge sentence",
+  );
+  assert.equal(await browser.findElement(By.id("chain-verified")).getText(), "VERIFIED");
+  assert.equal(await browser.findElement(By.id("chain-agents")).getText(), "OBSERVED");
+  assert.equal(await browser.findElement(By.id("chain-tools")).getText(), "OBSERVED");
+  assert.equal(await browser.findElement(By.id("chain-sandbox")).getText(), "OBSERVED");
+  assert.equal(await browser.findElement(By.id("chain-resume")).getText(), "OBSERVED");
+  assert.equal(await readTextContent("harness-mcp"), "4/4 services reached");
+  assert.equal(await readTextContent("harness-sandbox"), "1 executed");
+  assert.equal(await readTextContent("harness-subagents"), "3 threads evidenced");
+  assert.match(await readTextContent("harness-gate"), /Native · 4 owner calls/u);
+  const harnessSessionBeforeRefresh = await readTextContent("harness-session");
+  assert.match(harnessSessionBeforeRefresh, /^[0-9a-z]{20,}$/u, "the ribbon shows the genuine TrueForge session identifier");
+  assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), false);
+  const trustRowsText = await browser.findElement(By.id("trust-rows")).getText();
+  assert.match(trustRowsText, /Specialist subagents — Portfolio and order analyst, Capacity and schedule analyst, Assurance and simulation engineer/u);
+  assert.match(trustRowsText, /RECOMMENDATION RECORDED/u, "recorded specialist prose is labeled as recorded, never verified");
+  assert.match(trustRowsText, /recorded, not semantically verified/u);
+  assert.match(trustRowsText, /Authoritative effect check: factory-change-control\/select_portfolio_modification/u);
+  assert.match(trustRowsText, /no additional owner decision was used/u);
+  assert.match(trustRowsText, /Authoritative effect check: factory-change-control\/verify_schedule_execution/u);
+  assert.doesNotMatch(trustRowsText, /pending verification/iu, "the executor claim reads verified only at terminal");
+  assert.match(trustRowsText, /VERIFIED RESULT/u, "the executor claim renders its verified result after read-back");
+  assert.equal(
+    await browser.findElement(By.id("trust-recheck")).isDisplayed(),
+    true,
+    "the audited root-recheck sentence appears once specialist evidence exists",
+  );
+  assert.doesNotMatch(trustRowsText, /bridge |turn\/|call /u, "trust rows keep raw identities behind the disclosure");
   assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
   assert.equal((await browser.findElements(By.css("#timeline li.pending"))).length, 0);
   assert.equal((await browser.findElements(By.css(".agent-node.child"))).length, 3);
+  const evidenceDownload = await browser.findElement(By.id("evidence-download"));
+  assert.equal(await evidenceDownload.isDisplayed(), true);
+  assert.equal(await evidenceDownload.getAttribute("aria-disabled"), "false");
+  assert.equal(await evidenceDownload.getAttribute("download"), "flakebrake-mission-evidence.json");
+  assert.equal(
+    await browser.executeScript<boolean>(
+      "return fetch('/api/evidence').then(async (response) => response.status === 200 && response.headers.get('content-type')?.startsWith('application/json') === true && JSON.parse(await response.text()).schemaVersion === 'flakebrake-mission-evidence-bundle/v2');",
+    ),
+    true,
+    "the completed mission exposes inspectable canonical evidence",
+  );
   const metrics = await Promise.all(
     (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
   );
   assert.deepEqual(metrics, ["1", "1", "1", "1"]);
+  assert.deepEqual(
+    await browser.executeScript("return [...document.querySelectorAll('.proof-counts strong')].map((item) => item.textContent);"),
+    ["1", "1", "1", "2"],
+  );
   await browser.executeScript("window.scrollTo(0, 0);");
-  await screenshot(browser, join(screenshots, "05-terminal-overview.png"));
+  await screenshot(browser, join(screenshots, "06-terminal-overview.png"));
+  await browser.executeScript("document.getElementById('proof-control-details').open = true; document.getElementById('proof-durable-details').open = true; document.getElementById('proof-center-title').scrollIntoView({block: 'start'});");
+  assert.equal((await browser.findElements(By.css("#proof-decisions .proof-decision"))).length, 4);
+  assert.equal((await browser.findElements(By.css("#proof-decisions .mechanical-proof"))).length, 1);
+  await screenshot(browser, join(screenshots, "07-terminal-proof-center.png"));
   await browser.executeScript("document.getElementById('result-title').scrollIntoView({block: 'start'});");
-  await screenshot(browser, join(screenshots, "06-readback-proof.png"));
+  await screenshot(browser, join(screenshots, "08-readback-proof.png"));
 
   const sessionBeforeRefresh = await browser.findElement(By.id("session-id")).getText();
   await browser.navigate().refresh();
   await waitText(browser, By.id("outcome"), "Verified success", 60_000);
   await waitText(browser, By.id("connection-label"), "Durable replay restored", 60_000);
+  assert.match((await browser.findElement(By.id("proof-durable-proof")).getAttribute("textContent")) ?? "", /browser is attached to a durable replay/u);
   assert.equal(await browser.findElement(By.id("session-id")).getText(), sessionBeforeRefresh);
+  assert.equal(
+    (await browser.findElement(By.id("harness-session")).getAttribute("textContent")) ?? "",
+    harnessSessionBeforeRefresh,
+    "refresh preserves the harness session identity",
+  );
+  assert.equal(
+    await browser.executeScript("return document.getElementById('harness-replay-row').hidden;"),
+    false,
+  );
+  assert.equal(
+    (await browser.findElement(By.id("harness-replay")).getAttribute("textContent")) ?? "",
+    "Durable session replayed",
+    "the recovered mission carries genuine durable-replay evidence",
+  );
+  await waitText(browser, By.id("harness-state"), "Verified");
+  await waitText(browser, By.id("guided-heading"), "Done—and independently verified");
+  assert.match(
+    await browser.findElement(By.id("guided-why")).getText(),
+    /same completed TrueForge session/u,
+    "the replay story explains the unchanged completed session",
+  );
+  assert.match(
+    await browser.findElement(By.id("trust-rows")).getText(),
+    /Resumed process — continuity claim/u,
+    "the replayed session carries the continuity trust row",
+  );
+  assert.equal(
+    (await browser.findElements(By.css("#trust-rows li"))).length,
+    await browser.executeScript<number>(
+      "return new Set([...document.querySelectorAll('#trust-rows li')].map((item) => item.textContent)).size;",
+    ),
+    "refresh cannot duplicate agent-trust handoffs",
+  );
   assert.deepEqual(
     await Promise.all(
       (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
     ),
     ["1", "1", "1", "1"],
+  );
+  assert.equal(await browser.findElement(By.id("evidence-download")).isDisplayed(), true);
+  assert.equal(
+    await browser.findElement(By.id("evidence-download")).getAttribute("aria-disabled"),
+    "false",
   );
 
   const viewports = [
@@ -307,7 +525,7 @@ try {
     assert.equal(await hasHorizontalOverflow(browser), false, `${String(width)}x${String(height)} overflow`);
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
-  await screenshot(browser, join(screenshots, "07-tablet-820x1180.png"));
+  await screenshot(browser, join(screenshots, "09-tablet-820x1180.png"));
   assert.equal(
     capture.capturedErrorCount(),
     0,
@@ -334,8 +552,19 @@ try {
     "the session transport-failure channel lost coverage before the end of the smoke",
   );
   const sessionFailures = armedNetworkCapture.failedResponses();
+  // The smoke's own deliberate refreshes and away-navigations abort whichever
+  // application /api poll is mid-flight; Firefox reports that browser-initiated
+  // cancellation as NS_BINDING_ABORTED. Only that exact self-inflicted
+  // signature is exempt — every other failed request still fails the smoke.
+  const navigationAbortedPoll = (entry: string): boolean =>
+    entry.startsWith(`${running.url}/api/`) && entry.endsWith("transport=NS_BINDING_ABORTED");
   assert.deepEqual(
-    sessionFailures.filter((entry) => entry !== networkProbeEntry && !entry.startsWith(transportProbePrefix)),
+    sessionFailures.filter(
+      (entry) =>
+        entry !== networkProbeEntry &&
+        !entry.startsWith(transportProbePrefix) &&
+        !navigationAbortedPoll(entry),
+    ),
     [],
     "no unexpected request failed at any point in the browser session",
   );

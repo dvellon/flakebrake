@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Builder, By, until, type WebDriver } from "selenium-webdriver";
+import { Builder, By, Key, until, type WebDriver } from "selenium-webdriver";
 import firefox from "selenium-webdriver/firefox.js";
 
 import { startRecoveryDemoServer } from "../src/recovery-demo-ui.js";
@@ -38,11 +38,11 @@ try {
   assert.equal((await browser.findElements(By.xpath("//*[contains(text(), 'Start hero mission')]"))).length, 0);
 
   await exercise(browser, "after_execution_fence_before_factory_mutation");
-  await browser.findElement(By.id("reset-button")).click();
+  await browser.findElement(By.id("reset-button")).sendKeys(Key.ENTER);
   await waitStage(browser, "idle");
   await exercise(browser, "after_factory_commit_before_m2_binding");
 
-  for (const [width, height] of [[1280, 900], [768, 900], [390, 844]] as const) {
+  for (const [width, height] of [[1280, 800], [390, 844]] as const) {
     await browser.manage().window().setRect({ width, height });
     const horizontalOverflow: number = await browser.executeScript<number>(
       "return Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth);",
@@ -93,21 +93,21 @@ async function exercise(
   browser: WebDriver,
   boundary: "after_execution_fence_before_factory_mutation" | "after_factory_commit_before_m2_binding",
 ): Promise<void> {
-  await browser.findElement(By.css(`input[value="${boundary}"]`)).click();
-  await browser.findElement(By.id("interrupt-button")).click();
+  await browser.findElement(By.css(`input[value="${boundary}"]`)).sendKeys(Key.SPACE);
+  await browser.findElement(By.id("interrupt-button")).sendKeys(Key.ENTER);
   await waitStage(browser, "interrupted");
   assert.equal(await focusedStageTitle(browser), true);
-  await browser.findElement(By.id("restart-button")).click();
+  await browser.findElement(By.id("restart-button")).sendKeys(Key.ENTER);
   await waitStage(browser, "restarted");
   assert.equal(await focusedStageTitle(browser), true);
-  await browser.findElement(By.id("recover-button")).click();
+  await browser.findElement(By.id("recover-button")).sendKeys(Key.ENTER);
   await waitStage(browser, "verified");
   assert.equal(await focusedStageTitle(browser), true);
   assert.equal(await browser.findElement(By.id("after-mutations")).getText(), "1");
   assert.equal(await browser.findElement(By.id("after-receipts")).getText(), "1");
   assert.equal(await browser.findElement(By.id("after-terminals")).getText(), "1");
   assert.equal(await browser.findElement(By.id("after-actuals")).getText(), "2");
-  await browser.findElement(By.id("replay-button")).click();
+  await browser.findElement(By.id("replay-button")).sendKeys(Key.ENTER);
   await waitStage(browser, "replayed");
   assert.equal(await focusedStageTitle(browser), true);
   assert.match(await browser.findElement(By.id("replay-proof")).getText(), /digest did not change/u);

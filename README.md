@@ -197,6 +197,27 @@ bindings fail closed.
 The M5 client also uses monotonic request generations and durable revisions so
 an older poll cannot overwrite a newer approval or regress terminal success.
 
+## Canonical mission evidence
+
+After terminal verification, the execution ledger exposes **Download evidence
+JSON**. The read-only `/api/evidence` endpoint returns a versioned canonical
+Mission Evidence Bundle and a SHA-256 digest of its exact payload. The digest is
+a commitment to those bytes; it does not authenticate the producer.
+
+Verify a downloaded bundle by itself, or require an exact match to the three
+durable source databases:
+
+```bash
+npm run evidence:verify -- --bundle /absolute/path/mission-evidence.json
+npm run evidence:verify -- \
+  --bundle /absolute/path/mission-evidence.json \
+  --data-dir /absolute/path/to/m5-data
+```
+
+The verifier opens source databases read-only and validates canonical encoding,
+schema, digest, linkage, exact counts, independent read-back, and terminal
+consistency. See [the evidence format and trust boundary](docs/mission-evidence.md).
+
 ## Deterministic judge mode
 
 ### Prerequisites

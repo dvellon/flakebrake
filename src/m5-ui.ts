@@ -1,13 +1,18 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   createReadStream,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import {
   createServer,
@@ -16,7 +21,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { Socket } from "node:net";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { canonicalSerialize } from "./canonical.js";
@@ -33,6 +38,11 @@ import {
 } from "./hero-fixture.js";
 import { evaluateAdmission } from "./kernel.js";
 import {
+  createMissionEvidenceDatabaseLifecycle,
+  exportMissionEvidenceBundleWithLifecycle,
+  isMissionEvidenceReadyWithLifecycle,
+} from "./mission-evidence.js";
+import {
   m4OwnerDecisionResponse,
   type M4ApprovalRecord,
   type M4MissionCheckpoint,
@@ -47,6 +57,15 @@ import {
   type DeterministicM4MissionResult,
 } from "./m4-runner.js";
 import { createStore } from "./store.js";
+import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
+import {
+  DETERMINISTIC_MODEL_NAME,
+  DETERMINISTIC_MODEL_PROVIDER_NAME,
+  FLAKEBRAKE_ROOT_AGENT_NAME,
+  flakeBrakeRootAgentSpec,
+  TRUEFORGE_SDK_VERSION,
+  TRUEFORGE_SERVER_VERSION,
+} from "./trueforge-runtime.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const OWNER_SOURCE_IDENTITY = "owner/judge-ui";
@@ -56,6 +75,15 @@ const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_RECORDS = 256;
 const HERO_ATTEMPT_ID = "attempt/m4-approved-alternative";
 const DEFAULT_REQUEST_DRAIN_TIMEOUT_MS = 500;
+const INTERNAL_EVIDENCE_LIFECYCLE = Symbol("M5 evidence database lifecycle");
+
+type MissionEvidenceDatabaseLifecycle = ReturnType<
+  typeof createMissionEvidenceDatabaseLifecycle
+>;
+
+type InternalEvidenceLifecycleOptions = {
+  readonly [INTERNAL_EVIDENCE_LIFECYCLE]?: MissionEvidenceDatabaseLifecycle;
+};
 
 export type M5RunStatus =
   | "idle"
@@ -96,6 +124,18 @@ export interface M5JudgeState {
     readonly terminalProjectionDigest: string | null;
     readonly disconnectedAndResumed: boolean;
   };
+  readonly harness: {
+    readonly framework: "TrueForge";
+    readonly serverVersion: string;
+    readonly sdkVersion: string;
+    readonly providerProfile: "Deterministic judge profile";
+    readonly modelName: string;
+    readonly rootAgentName: string;
+    readonly mcpConfigured: readonly string[];
+    readonly sandboxConfigured: boolean;
+    readonly dynamicSubagentsConfigured: boolean;
+    readonly approvalGatedToolCount: number;
+  };
   readonly hero: {
     readonly directDecision: "REPLAN";
     readonly portfolioVersion: string;
@@ -126,7 +166,25 @@ export interface M5JudgeState {
       readonly candidatePlanId: string;
       readonly strategy: string;
       readonly changedObligations: readonly string[];
+      readonly changes: readonly {
+        readonly obligationId: string;
+        readonly optionId: string;
+        readonly criticality: string;
+        readonly fromQuantity: number;
+        readonly toQuantity: number;
+        readonly serviceLoss: { readonly numerator: number; readonly denominator: number };
+      }[];
       readonly remainingCapacity: readonly { readonly resourceKey: string; readonly value: number }[];
+      readonly requiredOwnerApprovalCount: number;
+      readonly rank: {
+        readonly protectedObligationViolations: number;
+        readonly criticalityWeightedServiceDegradation: {
+          readonly numerator: number;
+          readonly denominator: number;
+        };
+        readonly previouslyAcceptedObligationsChanged: number;
+        readonly bottleneckSlack: { readonly numerator: number; readonly denominator: number };
+      };
       readonly recommended: boolean;
     }[];
     readonly winningModification: {
@@ -171,6 +229,7 @@ export interface M5JudgeState {
     readonly attemptCount: number;
     readonly mutationCount: number;
     readonly receiptCount: number;
+    readonly terminalEventCount: number;
     readonly actualFactCount: number;
     readonly actualFacts: readonly {
       readonly resourceKey: string;
@@ -191,7 +250,41 @@ export interface M5JudgeState {
     readonly duplicateEffectCount: number;
     readonly unauthorizedMutationCount: number;
   };
+  readonly agentTrust: {
+    readonly recommendationsRecorded: boolean;
+    readonly checks: readonly {
+      readonly key: string;
+      readonly kind: "recommendation" | "owner_gate" | "mechanical_block" | "execution" | "replay";
+      readonly source: string;
+      readonly claim: string;
+      readonly check: string;
+      readonly result: "recorded" | "allowed" | "blocked" | "pending_verification" | "verified";
+      readonly why: string;
+      readonly technicalEvidence: string | null;
+    }[];
+  };
 }
+
+const HARNESS_PROJECTION: M5JudgeState["harness"] = (() => {
+  const qualifiedModelName = `${DETERMINISTIC_MODEL_PROVIDER_NAME}/${DETERMINISTIC_MODEL_NAME}`;
+  const spec = flakeBrakeRootAgentSpec(qualifiedModelName);
+  const mcpServers = spec.mcpServers ?? [];
+  return {
+    framework: "TrueForge",
+    serverVersion: TRUEFORGE_SERVER_VERSION,
+    sdkVersion: TRUEFORGE_SDK_VERSION,
+    providerProfile: "Deterministic judge profile",
+    modelName: qualifiedModelName,
+    rootAgentName: FLAKEBRAKE_ROOT_AGENT_NAME,
+    mcpConfigured: mcpServers.map((server) => server.name),
+    sandboxConfigured: spec.config?.sandbox?.enabled === true,
+    dynamicSubagentsConfigured: spec.config?.dynamicSubAgents?.enabled === true,
+    approvalGatedToolCount: mcpServers.reduce(
+      (total, server) => total + (server.requireApprovalForTools?.length ?? 0),
+      0,
+    ),
+  };
+})();
 
 export interface M5DemoCoordinatorOptions {
   readonly dataRoot: string;
@@ -215,6 +308,7 @@ interface DemoPaths {
   readonly mission: string;
   readonly trueforge: string;
   readonly sandboxes: string;
+  readonly sandboxEvidence: string;
 }
 
 export class M5RequestError extends Error {
@@ -232,6 +326,7 @@ export class M5DemoCoordinator {
   readonly #dataRoot: string;
   readonly #cleanupDataOnClose: boolean;
   readonly #paths: DemoPaths;
+  readonly #evidenceLifecycle: MissionEvidenceDatabaseLifecycle;
   readonly #decisionHistory = new Map<string, RecordedDecision>();
   readonly #observedApprovals: M4ApprovalRecord[] = [];
   readonly #runtimeEvidence: {
@@ -253,6 +348,7 @@ export class M5DemoCoordinator {
   #revision = 0;
   #ownerCallsThisProcess = 0;
   #replayedTerminal = false;
+  #markerDurability: MarkerPublicationDurability | null = null;
 
   public constructor(options: M5DemoCoordinatorOptions) {
     if (!isAbsolute(options.dataRoot)) {
@@ -260,14 +356,104 @@ export class M5DemoCoordinator {
     }
     this.#dataRoot = resolve(options.dataRoot);
     this.#cleanupDataOnClose = options.cleanupDataOnClose ?? true;
+    this.#evidenceLifecycle = (
+      options as M5DemoCoordinatorOptions & InternalEvidenceLifecycleOptions
+    )[INTERNAL_EVIDENCE_LIFECYCLE] ?? createMissionEvidenceDatabaseLifecycle();
     this.#paths = {
       m2: join(this.#dataRoot, "m2.sqlite"),
       factory: join(this.#dataRoot, "factory.sqlite"),
       mission: join(this.#dataRoot, "mission.sqlite"),
       trueforge: join(this.#dataRoot, "trueforge.sqlite"),
       sandboxes: join(this.#dataRoot, "trueforge-data"),
+      sandboxEvidence: join(this.#dataRoot, "m5-sandbox-evidence.json"),
     };
     establishOwnedDataRoot(this.#dataRoot);
+    this.#restoreDurableSandboxEvidence();
+  }
+
+  /**
+   * The sandbox.created checkpoint is relayed once per mission by the live
+   * TrueForge stream and is never re-emitted after the persisted resume
+   * cursor passes it. The coordinator therefore persists that authoritative
+   * observation, bound to the exact mission and session, and every
+   * projection — live or after a full process restart — flows through the
+   * same #recordSandboxEvidence path. A marker from another mission or
+   * session, or a malformed marker, fails closed and promotes nothing.
+   */
+  #restoreDurableSandboxEvidence(): void {
+    if (!existsSync(this.#paths.sandboxEvidence)) return;
+    try {
+      const marker = objectValue(
+        parseJsonRejectingDuplicateKeys(readFileSync(this.#paths.sandboxEvidence, "utf8")),
+      );
+      const snapshot = this.#readMissionSnapshot();
+      if (
+        marker === null ||
+        snapshot === null ||
+        stringValue(marker["missionId"]) !== snapshot.mission.missionId ||
+        stringValue(marker["trueforgeSessionId"]) !== snapshot.mission.trueforgeSessionId ||
+        snapshot.mission.missionId !== M4_HERO_MISSION_ID
+      ) {
+        return;
+      }
+      this.#recordSandboxEvidence();
+    } catch {
+      // A malformed marker is ignored; the station honestly stays Configured.
+    }
+  }
+
+  #recordSandboxEvidence(): void {
+    this.#upsertEvidence(
+      "sandbox",
+      "Assurance sandbox created",
+      "TrueForge Code Mode opened an isolated deterministic assurance run.",
+      "informational",
+    );
+  }
+
+  #persistSandboxEvidence(): void {
+    const snapshot = this.#readMissionSnapshot();
+    if (snapshot === null) return;
+    try {
+      const serialized = `${JSON.stringify({
+        missionId: snapshot.mission.missionId,
+        trueforgeSessionId: snapshot.mission.trueforgeSessionId,
+        trueforgeTurnId: snapshot.mission.currentTurnId,
+      })}\n`;
+      const roundTrip = objectValue(parseJsonRejectingDuplicateKeys(serialized));
+      if (
+        roundTrip === null ||
+        stringValue(roundTrip["missionId"]) !== snapshot.mission.missionId ||
+        stringValue(roundTrip["trueforgeSessionId"]) !== snapshot.mission.trueforgeSessionId
+      ) {
+        return;
+      }
+      // The durability level actually established is kept as an internal
+      // diagnostic; no user-facing copy claims more than the marker's
+      // file-level durability, so a Windows file-durable outcome needs no
+      // presentation change.
+      this.#markerDurability = publishJsonFileAtomically(this.#paths.sandboxEvidence, serialized);
+    } catch {
+      this.#markerDurability = null;
+      // Persistence is best effort; the live in-memory evidence still renders
+      // and any previously committed marker remains untouched on disk.
+    }
+  }
+
+  // Marker temporaries are never swept: a matching name may be another
+  // process's in-flight publication, and deleting it would break that
+  // writer's atomic rename. Restoration reads only the committed marker
+  // path, so crash-orphaned temporaries are inert.
+
+  /**
+   * Internal diagnostic only: the durability level the last sandbox-marker
+   * publication actually established ("directory-durable", the narrower
+   * "file-durable-atomic-replacement" on platforms that cannot fsync a
+   * directory, or null when no publication succeeded). Never projected into
+   * judge-facing state, which claims no more than the marker's existence.
+   */
+  public markerDurabilityDiagnostic(): MarkerPublicationDurability | null {
+    return this.#markerDurability;
   }
 
   public start(): M5JudgeState {
@@ -324,8 +510,8 @@ export class M5DemoCoordinator {
         );
         this.#upsertEvidence(
           "terminal",
-          "Terminal verified success",
-          "Independent read-back matched the authorized mutation before root completion.",
+          "Verified complete",
+          "Terminal verified success: independent read-back matched the authorized mutation before root completion.",
           "verified",
         );
       })
@@ -500,6 +686,7 @@ export class M5DemoCoordinator {
         disconnectedAndResumed:
           (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
       },
+      harness: HARNESS_PROJECTION,
       hero: {
         directDecision: direct.decision,
         portfolioVersion: portfolio.versions.portfolioVersion,
@@ -539,7 +726,35 @@ export class M5DemoCoordinator {
           candidatePlanId: candidate.candidatePlanId,
           strategy: candidate.strategy,
           changedObligations: candidate.affectedObligations.map((item) => item.obligationId),
+          changes: candidate.affectedObligations.map((item) => {
+            const obligation = [
+              ...evaluationInput.acceptedObligations,
+              evaluationInput.proposal,
+            ].find((candidateObligation) => candidateObligation.obligationId === item.obligationId);
+            const before = item.previousServiceLevel.find((value) => value.field === "quantity");
+            const after = item.proposedServiceLevel.find((value) => value.field === "quantity");
+            if (obligation === undefined || before === undefined || after === undefined) {
+              throw new Error("The canonical hero candidate has an incomplete quantity change");
+            }
+            return {
+              obligationId: item.obligationId,
+              optionId: item.optionId,
+              criticality: obligation.criticality,
+              fromQuantity: before.value,
+              toQuantity: after.value,
+              serviceLoss: item.obligationServiceLoss,
+            };
+          }),
           remainingCapacity: candidate.capacity.capacityAfter,
+          requiredOwnerApprovalCount: candidate.requiredOwnerApprovals.length,
+          rank: {
+            protectedObligationViolations: candidate.score.protectedObligationViolations,
+            criticalityWeightedServiceDegradation:
+              candidate.score.criticalityWeightedServiceDegradation,
+            previouslyAcceptedObligationsChanged:
+              candidate.score.previouslyAcceptedObligationsChanged,
+            bottleneckSlack: candidate.score.bottleneckSlack,
+          },
           recommended: candidate.candidatePlanId === direct.recommendedCandidate?.candidatePlanId,
         })),
         winningModification: winningModification(direct.recommendedCandidate),
@@ -578,7 +793,69 @@ export class M5DemoCoordinator {
             ? execution.mutationCount
             : 0,
       },
+      agentTrust: agentTrustProjection({
+        approvals,
+        approvalEffectText: (approval) => approvalEffect(approval, missionSnapshot),
+        execution,
+        subagentTitles: activity.subagents.map((item) => item.title),
+        subagentThreadIds: activity.subagents.map((item) => item.threadId),
+        admission: this.#readReplanAdmission(),
+        sessionId:
+          missionSnapshot?.mission.trueforgeSessionId ?? result?.mission.trueforgeSessionId ?? null,
+        disconnectedAndResumed:
+          (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
+        runStatus: this.#status,
+      }),
     };
+  }
+
+  #readReplanAdmission(): { readonly admissionRecordId: string; readonly decision: string } | null {
+    if (!existsSync(this.#paths.m2) || !existsSync(this.#paths.factory)) return null;
+    try {
+      const store = createStore({
+        path: this.#paths.m2,
+        authoritativeFactoryDatabasePath: this.#paths.factory,
+        now: () => HERO_HORIZON_END,
+      });
+      try {
+        const admission = store
+          .getAdmissionHistory()
+          .find((item) => item.record.decision === "REPLAN");
+        return admission === undefined
+          ? null
+          : {
+              admissionRecordId: admission.record.admissionRecordId,
+              decision: admission.record.decision,
+            };
+      } finally {
+        store.close();
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /** Canonical completed-mission evidence projected through read-only handles. */
+  public evidenceBundle(): string {
+    this.#assertOpen();
+    const options = {
+      missionId: M4_HERO_MISSION_ID,
+      m2DatabasePath: this.#paths.m2,
+      factoryDatabasePath: this.#paths.factory,
+      missionDatabasePath: this.#paths.mission,
+      trueforgeDatabasePath: this.#paths.trueforge,
+    } as const;
+    if (!isMissionEvidenceReadyWithLifecycle(options, this.#evidenceLifecycle)) {
+      throw new M5RequestError(
+        409,
+        "evidence_not_ready",
+        "Canonical mission evidence is available only after durable verification completes",
+      );
+    }
+    return exportMissionEvidenceBundleWithLifecycle(
+      options,
+      this.#evidenceLifecycle,
+    );
   }
 
   public async close(): Promise<void> {
@@ -595,6 +872,7 @@ export class M5DemoCoordinator {
       );
     }
     await this.#runPromise;
+    this.#evidenceLifecycle.close();
     this.#status = "closed";
     this.#closed = true;
     if (this.#cleanupDataOnClose) cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths);
@@ -637,12 +915,8 @@ export class M5DemoCoordinator {
 
   #observeCheckpoint(checkpoint: M4MissionCheckpoint): void {
     if (checkpoint.phase === "running_turn") {
-      this.#upsertEvidence(
-        "sandbox",
-        "Assurance sandbox created",
-        "TrueForge Code Mode opened an isolated deterministic assurance run.",
-        "informational",
-      );
+      this.#persistSandboxEvidence();
+      this.#recordSandboxEvidence();
     } else if (checkpoint.phase === "approval_bridge_bound") {
       if (!this.#observedApprovals.some((item) => item.bridgeKey === checkpoint.approval.bridgeKey)) {
         this.#observedApprovals.push(checkpoint.approval);
@@ -650,7 +924,7 @@ export class M5DemoCoordinator {
       this.#upsertEvidence(
         `approval:${checkpoint.approval.bridgeKey}`,
         checkpoint.approval.source === "active_m2_denial"
-          ? "Auto-blocked · active policy"
+          ? "Blocked automatically — same denied action"
           : checkpoint.approval.decision === "allow"
             ? "Owner approved the bound action"
             : "Owner denied the bound action",
@@ -710,6 +984,7 @@ export class M5DemoCoordinator {
       attemptCount: 0,
       mutationCount: 0,
       receiptCount: 0,
+      terminalEventCount: 0,
       actualFactCount: 0,
       actualFacts: [],
       attemptId: null,
@@ -766,6 +1041,11 @@ export class M5DemoCoordinator {
           attemptCount: attemptIds.size,
           mutationCount: factory.getMutationCount(),
           receiptCount: addenda.filter((item) => item.kind === "receipt_reference").length,
+          terminalEventCount: addenda.filter((item) => {
+            if (item.kind !== "reservation_transition") return false;
+            const claimState = stringValue(objectValue(item.body)?.["claimState"]);
+            return claimState?.startsWith("terminal_") === true;
+          }).length,
           actualFactCount: actualFacts.length,
           actualFacts,
           attemptId: attempt?.executionAttemptId ?? null,
@@ -840,7 +1120,7 @@ export class M5DemoCoordinator {
         kind: `approval:${approval.bridgeKey}`,
         title:
           approval.source === "active_m2_denial"
-            ? "Auto-blocked · active policy"
+            ? "Blocked automatically — same denied action"
             : approval.decision === "allow"
               ? "Action approved"
               : "Action denied",
@@ -1027,6 +1307,11 @@ export async function startM5JudgeServer(
       sendJson(response, 200, coordinator.state());
       return;
     }
+    if (url.pathname === "/api/evidence") {
+      requireMethod(request, "GET");
+      sendMissionEvidence(response, coordinator.evidenceBundle());
+      return;
+    }
     if (url.pathname === "/api/mission") {
       requireMethod(request, "POST");
       const body = await readJsonObject(request);
@@ -1182,6 +1467,18 @@ export async function startM5JudgeServer(
   };
 }
 
+/** @internal Deterministic lifecycle injection for cleanup-boundary tests. */
+export function startM5JudgeServerWithEvidenceLifecycle(
+  options: StartM5JudgeServerOptions,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
+): Promise<RunningM5JudgeServer> {
+  const internalOptions = {
+    ...options,
+    [INTERNAL_EVIDENCE_LIFECYCLE]: lifecycle,
+  } as StartM5JudgeServerOptions & InternalEvidenceLifecycleOptions;
+  return startM5JudgeServer(internalOptions);
+}
+
 async function closeServer(
   server: Server,
   serverClose: Promise<void>,
@@ -1276,6 +1573,7 @@ function cleanupOwnedDemoArtifacts(dataRoot: string, paths: DemoPaths): void {
       rmSync(artifact, { force: true });
     }
   }
+  rmSync(paths.sandboxEvidence, { force: true });
   rmSync(paths.sandboxes, { recursive: true, force: true });
 }
 
@@ -1372,6 +1670,279 @@ function winningModification(candidate: {
     optionId: change.optionId,
     fromQuantity: before.value,
     toQuantity: after.value,
+  };
+}
+
+export interface MarkerFilesystem {
+  readonly openSync: (path: string, flags: string, mode?: number) => number;
+  readonly writeSync: (descriptor: number, payload: Uint8Array, offset?: number) => number;
+  readonly fsyncSync: (descriptor: number) => void;
+  readonly closeSync: (descriptor: number) => void;
+  readonly renameSync: (from: string, to: string) => void;
+  readonly rmSync: (path: string, options?: { readonly force?: boolean }) => void;
+  readonly randomSuffix?: () => string;
+  readonly platform?: NodeJS.Platform;
+}
+
+const REAL_MARKER_FILESYSTEM: MarkerFilesystem = {
+  openSync,
+  writeSync,
+  fsyncSync,
+  closeSync,
+  renameSync,
+  rmSync,
+};
+
+export type MarkerPublicationDurability = "directory-durable" | "file-durable-atomic-replacement";
+
+const MARKER_COLLISION_ATTEMPTS = 5;
+
+// Windows cannot fsync a directory handle: Node reports EPERM (and directory
+// opens can report EISDIR/ENOTSUP). Only these signatures, and only on
+// win32, downgrade to the narrower file-durability result; the same codes on
+// a supported platform — and genuine I/O errors everywhere — stay failures.
+const WINDOWS_DIRECTORY_SYNC_UNSUPPORTED_CODES = new Set(["EPERM", "EISDIR", "ENOTSUP"]);
+
+function errnoCode(error: unknown): string | null {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof code === "string" ? code : null;
+}
+
+/**
+ * Crash-durable marker publication. The complete payload is written to an
+ * invocation-owned temporary file in the destination directory whose identity
+ * comes from a high-entropy random suffix (exclusive creation, 0o600, no
+ * mission or session content in the name); an EEXIST collision retries a
+ * fresh identity under a small explicit bound and never touches the
+ * pre-existing file, and exhausting the bound fails closed without deleting
+ * anything foreign. The payload is fully written, fsynced, and closed before
+ * an atomic same-directory rename publishes it — the committed path is never
+ * opened or truncated in place. After the rename the containing directory is
+ * opened, fsynced, and closed; on platforms that support it this is required
+ * before the full "directory-durable" result is reported, while Windows's
+ * authoritative unsupported signature yields the explicit narrower
+ * "file-durable-atomic-replacement" result instead of a false durability
+ * claim. Pre-rename failures clean only the temporary this invocation
+ * actually created, preserving the primary error and attaching cleanup
+ * diagnostics secondarily.
+ */
+export function publishJsonFileAtomically(
+  destination: string,
+  serialized: string,
+  filesystem: MarkerFilesystem = REAL_MARKER_FILESYSTEM,
+): MarkerPublicationDurability {
+  const nextSuffix = filesystem.randomSuffix ?? ((): string => randomUUID());
+  const platform = filesystem.platform ?? process.platform;
+  let descriptor: number | null = null;
+  let temporary: string | null = null;
+  let collision: unknown = null;
+  for (let attempt = 0; attempt < MARKER_COLLISION_ATTEMPTS && descriptor === null; attempt += 1) {
+    const candidate = `${destination}.${nextSuffix()}.tmp`;
+    try {
+      descriptor = filesystem.openSync(candidate, "wx", 0o600);
+      temporary = candidate;
+    } catch (error: unknown) {
+      if (errnoCode(error) !== "EEXIST") throw error;
+      collision = error;
+    }
+  }
+  if (descriptor === null || temporary === null) {
+    throw new Error(
+      `Marker publication exhausted ${String(MARKER_COLLISION_ATTEMPTS)} unique temporary identities`,
+      { cause: collision },
+    );
+  }
+  const owned = temporary;
+  let renamed = false;
+  try {
+    const payload = Buffer.from(serialized, "utf8");
+    let written = 0;
+    while (written < payload.length) {
+      written += filesystem.writeSync(descriptor, payload, written);
+    }
+    filesystem.fsyncSync(descriptor);
+    filesystem.closeSync(descriptor);
+    descriptor = null;
+    filesystem.renameSync(owned, destination);
+    renamed = true;
+    let directoryDescriptor: number | null = null;
+    let durabilityFailure: unknown = null;
+    let directoryDurable = true;
+    try {
+      directoryDescriptor = filesystem.openSync(dirname(destination), "r");
+      filesystem.fsyncSync(directoryDescriptor);
+    } catch (error: unknown) {
+      const code = errnoCode(error);
+      if (platform === "win32" && code !== null && WINDOWS_DIRECTORY_SYNC_UNSUPPORTED_CODES.has(code)) {
+        directoryDurable = false;
+      } else {
+        durabilityFailure = error;
+      }
+    }
+    if (directoryDescriptor !== null) {
+      try {
+        filesystem.closeSync(directoryDescriptor);
+      } catch (closeError: unknown) {
+        if (durabilityFailure === null) throw closeError;
+        throw new AggregateError(
+          [durabilityFailure, closeError],
+          "Marker directory durability failed and its descriptor could not be closed",
+          { cause: durabilityFailure },
+        );
+      }
+    }
+    if (durabilityFailure !== null) throw durabilityFailure;
+    return directoryDurable ? "directory-durable" : "file-durable-atomic-replacement";
+  } catch (error: unknown) {
+    if (renamed) throw error;
+    const cleanupFailures: unknown[] = [];
+    if (descriptor !== null) {
+      try {
+        filesystem.closeSync(descriptor);
+      } catch (closeError: unknown) {
+        cleanupFailures.push(closeError);
+      }
+      descriptor = null;
+    }
+    try {
+      filesystem.rmSync(owned, { force: true });
+    } catch (removeError: unknown) {
+      cleanupFailures.push(removeError);
+    }
+    if (cleanupFailures.length === 0) throw error;
+    throw new AggregateError(
+      [error, ...cleanupFailures],
+      "Marker publication failed and its temporary file could not be cleaned",
+      { cause: error },
+    );
+  }
+}
+
+export interface AgentTrustEvidence {
+  readonly approvals: readonly M4ApprovalRecord[];
+  readonly approvalEffectText: (approval: M4ApprovalRecord) => string;
+  readonly execution: M5JudgeState["execution"];
+  readonly subagentTitles: readonly string[];
+  readonly subagentThreadIds: readonly string[];
+  readonly admission: { readonly admissionRecordId: string; readonly decision: string } | null;
+  readonly sessionId: string | null;
+  readonly disconnectedAndResumed: boolean;
+  readonly runStatus: M5RunStatus;
+}
+
+/**
+ * Derives the "agents checking agents" rows exclusively from durable evidence:
+ * the recorded admission basis, persisted approval-bridge records, M2/factory
+ * execution reads, subagent-thread evidence, and the durable session identity.
+ * No row is produced without its own authoritative source, so recommendation
+ * prose can never populate, upgrade, or duplicate a check.
+ */
+export function agentTrustProjection(input: AgentTrustEvidence): M5JudgeState["agentTrust"] {
+  const checks: Array<M5JudgeState["agentTrust"]["checks"][number]> = [];
+  if (input.subagentTitles.length > 0) {
+    checks.push({
+      key: "specialist-recommendations",
+      kind: "recommendation",
+      source: `Specialist subagents — ${input.subagentTitles.join(", ")}`,
+      claim: "Provided read-only analyses and recommendations to the root agent.",
+      check:
+        "TrueForge thread record — provenance linkage only; the prose is recorded, not semantically verified",
+      result: "recorded",
+      why: "Agents can propose anything; they cannot make it true. A recommendation authorizes nothing until the root proposes the exact action and it passes the authoritative checks below.",
+      technicalEvidence:
+        input.subagentThreadIds.length === 0
+          ? null
+          : input.subagentThreadIds.map((threadId) => `thread ${threadId}`).join(" · "),
+    });
+  }
+  const subagentThreads = new Set(input.subagentThreadIds);
+  const seenBridges = new Set<string>();
+  for (const approval of input.approvals) {
+    if (
+      approval.bridgeKey === "" ||
+      approval.turnId === "" ||
+      approval.threadId === "" ||
+      approval.toolCallId === "" ||
+      subagentThreads.has(approval.threadId) ||
+      seenBridges.has(approval.bridgeKey)
+    ) {
+      continue;
+    }
+    seenBridges.add(approval.bridgeKey);
+    const identity = [
+      `bridge ${approval.bridgeKey}`,
+      `turn ${approval.turnId}`,
+      `call ${approval.toolCallId}`,
+      ...(approval.denialId === null ? [] : [`denial ${approval.denialId}`]),
+      ...(approval.executionAttemptId === null ? [] : [`attempt ${approval.executionAttemptId}`]),
+      ...(input.admission === null ? [] : [`admission ${input.admission.admissionRecordId}`]),
+    ].join(" · ");
+    if (approval.source === "active_m2_denial") {
+      if (approval.decision !== "deny") continue;
+      checks.push({
+        key: `m2:${approval.bridgeKey}`,
+        kind: "mechanical_block",
+        source: "Root agent — the same denied action in another technical representation",
+        claim: input.approvalEffectText(approval),
+        check: `factory-change-control/${approval.toolName} — M2 canonical-equivalence check against the active denial`,
+        result: "blocked",
+        why: "FlakeBrake recognized the same effect behind a different tool shape and blocked it mechanically — no additional owner decision was used.",
+        technicalEvidence: identity,
+      });
+      continue;
+    }
+    checks.push({
+      key: `owner:${approval.bridgeKey}`,
+      kind: "owner_gate",
+      source: `Root agent — proposed ${humanToolName(approval.toolName)}`,
+      claim: input.approvalEffectText(approval),
+      check: `factory-change-control/${approval.toolName} — exact action reevaluated against current authoritative state at the TrueForge approval gate`,
+      result: approval.decision === "allow" ? "allowed" : "blocked",
+      why:
+        approval.decision === "allow"
+          ? "Nothing ran on a recommendation alone: the exact action digest was bound to current M1–M4 state and to your recorded decision before the tool executed."
+          : "Your denial is durably recorded and becomes an active denial covering this exact effect.",
+      technicalEvidence: identity,
+    });
+  }
+  if (input.execution.mutationCount > 0) {
+    // Only the exact terminal_verified claim state is verified success;
+    // terminal_reconciled and terminal failures stay unverified claims.
+    const verified =
+      input.execution.independentReadBackObserved &&
+      input.execution.terminalStatus === "terminal_verified";
+    const executionIdentity = [
+      ...(input.execution.attemptId === null ? [] : [`attempt ${input.execution.attemptId}`]),
+      ...(input.execution.receiptId === null ? [] : [`receipt ${input.execution.receiptId}`]),
+    ].join(" · ");
+    checks.push({
+      key: "execution-claim",
+      kind: "execution",
+      source: "Root agent — executor success claim",
+      claim: "The approved change was written to the factory.",
+      check: "factory-change-control/verify_schedule_execution — independent authoritative read-back",
+      result: verified ? "verified" : "pending_verification",
+      why: verified
+        ? "Success is presented only because FlakeBrake independently read the factory back and the terminal state matched the exact approved effect."
+        : "A recorded change is not success yet — FlakeBrake reads the factory back independently before anything is presented as verified.",
+      technicalEvidence: executionIdentity === "" ? null : executionIdentity,
+    });
+  }
+  if (input.disconnectedAndResumed && input.runStatus === "verified" && input.sessionId !== null) {
+    checks.push({
+      key: "replay-claim",
+      kind: "replay",
+      source: "Resumed process — continuity claim",
+      claim: "This is the same completed session; nothing was re-run.",
+      check: "Durable TrueForge session read + authoritative factory effect counts",
+      result: "verified",
+      why: `The session id is unchanged and the factory still shows ${String(input.execution.mutationCount)} mutation — a reconnect cannot invent or repeat decisions or effects.`,
+      technicalEvidence: `session ${input.sessionId}`,
+    });
+  }
+  return {
+    recommendationsRecorded: input.subagentTitles.length > 0,
+    checks,
   };
 }
 
@@ -1620,11 +2191,21 @@ function sendJson(response: ServerResponse, statusCode: number, value: unknown):
   response.end(body);
 }
 
+function sendMissionEvidence(response: ServerResponse, body: string): void {
+  if (response.headersSent) return;
+  response.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Disposition": 'attachment; filename="flakebrake-mission-evidence.json"',
+    "Content-Length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
 function resourceLabel(key: string): string {
   return key === HERO_RESOURCE_KEYS.agent
     ? "Agent work"
     : key === HERO_RESOURCE_KEYS.human
-      ? "Owner decisions"
+      ? "Human decisions"
       : key === HERO_RESOURCE_KEYS.production
         ? "Production cell"
         : key;

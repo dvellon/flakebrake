@@ -126,3 +126,20 @@ export {
   startRecoveryDemoServer,
 } from "./recovery-demo-ui.js";
 export type * from "./recovery-demo-ui.js";
+export {
+  MISSION_EVIDENCE_CANONICALIZATION,
+  MISSION_EVIDENCE_PAYLOAD_SCHEMA_VERSION,
+  MISSION_EVIDENCE_SCHEMA_VERSION,
+  MissionEvidenceError,
+  buildMissionEvidenceBundle,
+  exportMissionEvidenceBundle,
+  isMissionEvidenceReady,
+  missionEvidenceBundleSchema,
+  missionEvidencePayloadSchema,
+  sanitizeEvidenceValue,
+  serializeMissionEvidenceBundle,
+  verifyMissionEvidenceBundle,
+  verifyMissionEvidenceBytes,
+  verifyMissionEvidencePayload,
+} from "./mission-evidence.js";
+export type * from "./mission-evidence.js";
