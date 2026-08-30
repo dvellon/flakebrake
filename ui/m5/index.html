@@ -25,12 +25,20 @@
     <main id="main">
       <section class="hero" aria-labelledby="hero-title">
         <div>
-          <p class="eyebrow">Deterministic TrueForge mission</p>
-          <h1 id="hero-title"><span>A rush order.</span> <span class="hero-line">One safe promise.</span></h1>
-          <p class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
+          <p id="hero-eyebrow" class="eyebrow">Deterministic TrueForge mission</p>
+          <h1 id="hero-title"><span id="hero-lead">A rush order.</span> <span id="hero-result" class="hero-line">One safe promise.</span></h1>
+          <p id="hero-copy" class="hero-copy">See FlakeBrake reject overcommitment, negotiate one bounded change, and prove the factory result before it declares success.</p>
           <p id="basis-note" class="basis-note"><strong>Before you start:</strong> this is the precomputed canonical basis. Start runs the real deterministic mission against invocation-owned stores.</p>
+          <p id="scenario-transition" class="scenario-transition" hidden></p>
         </div>
         <div class="hero-actions">
+          <label class="scenario-selector" for="scenario-select">
+            <span>Scenario</span>
+            <select id="scenario-select" name="scenario">
+              <option value="rush-order" selected>Rush order · hero</option>
+              <option value="capacity-shock">Capacity shock · second scenario</option>
+            </select>
+          </label>
           <button id="start-button" class="button button-primary" type="button">Start hero mission</button>
           <button id="reset-button" class="button button-quiet" type="button">Reset demo</button>
         </div>
@@ -77,12 +85,12 @@
             <div><p class="eyebrow">01 · Original promise basis</p><h2 id="promise-title">Capacity before commitment</h2></div>
             <span class="pill pill-denied">REPLAN · original basis</span>
           </div>
-          <p class="context-note">The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.</p>
+          <p id="basis-context" class="context-note">The conflict is interval-specific: aggregate production headroom can remain positive while the requested 09:10–09:40 slot overlaps protected work.</p>
           <p id="basis-resolution" class="basis-resolution">Original rush basis requires a bounded replan.</p>
           <div id="capacity-grid" class="capacity-grid" role="group" aria-label="Capacity evaluation"></div>
           <div class="split-list">
             <div><h3>Accepted workload after bounded replan</h3><div id="obligations"></div></div>
-            <div><h3>Original rush request</h3><div id="proposal"></div></div>
+            <div><h3 id="proposal-heading">Original rush request</h3><div id="proposal"></div></div>
           </div>
         </section>
 
@@ -101,7 +109,7 @@
           </div>
           <div class="activity-layout">
             <div id="agent-tree" class="agent-tree"></div>
-            <div><h3>Sandbox & MCP evidence</h3><div id="runtime-chips" class="chip-list"></div></div>
+            <div><h3 id="runtime-heading">Sandbox & MCP evidence</h3><div id="runtime-chips" class="chip-list"></div></div>
           </div>
         </section>
 

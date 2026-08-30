@@ -33,7 +33,7 @@ const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
 const running = await startM5JudgeServer({
   dataRoot: root,
-  port: 0,
+  port: 4176,
   cleanupDataOnClose: true,
 });
 const transportKillServer = createServer((socket) => socket.destroy());
@@ -308,6 +308,92 @@ try {
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
   await screenshot(browser, join(screenshots, "07-tablet-820x1180.png"));
+
+  await browser.manage().window().setRect({ width: 1440, height: 900 });
+  await browser.executeScript("document.getElementById('scenario-select').focus();");
+  assert.equal(
+    await browser.executeScript(
+      "return document.activeElement === document.getElementById('scenario-select');",
+    ),
+    true,
+    "the scenario selector is keyboard focusable",
+  );
+  await browser.findElement(By.id("scenario-select")).sendKeys(Key.END);
+  smokeStage = "capacity_scenario_selected";
+  await waitText(browser, By.id("hero-title"), "A capacity shock.", 30_000);
+  await waitText(browser, By.id("start-button"), "Start capacity shock", 30_000);
+  await waitText(browser, By.id("scenario-transition"), "100 to 90 minutes", 30_000);
+  assert.equal(
+    await browser.findElement(By.id("scenario-select")).getAttribute("value"),
+    "capacity-shock",
+  );
+  assert.match(await browser.findElement(By.id("basis-resolution")).getText(), /Capacity-plan\/v1/u);
+  assert.equal(await hasHorizontalOverflow(browser), false);
+  await screenshot(browser, join(screenshots, "08-capacity-shock-idle.png"));
+
+  await browser.findElement(By.id("start-button")).click();
+  const capacityDigests = new Set<string>();
+  for (let ownerCall = 1; ownerCall <= 4; ownerCall += 1) {
+    const panel = await browser.findElement(By.id("approval-panel"));
+    await browser.wait(
+      async () => {
+        const className = await panel.getAttribute("class");
+        const digest =
+          (await browser.findElement(By.id("approval-digest")).getAttribute("textContent")) ?? "";
+        return (
+          !className?.includes("is-continuing") &&
+          /^(?:m4-bridge\/)?sha256:[a-f0-9]{64}$/u.test(digest)
+        );
+      },
+      60_000,
+    );
+    const digest =
+      (await browser.findElement(By.id("approval-digest")).getAttribute("textContent")) ?? "";
+    assert.equal(capacityDigests.has(digest), false);
+    capacityDigests.add(digest);
+    const guidance = await browser.findElement(By.id("approval-guidance")).getText();
+    const button = await browser.findElement(
+      By.id(guidance.toLowerCase().includes("deny") ? "deny-button" : "allow-button"),
+    );
+    assert.equal(await button.isEnabled(), true);
+    await button.click();
+    smokeStage = `capacity_owner_${ownerCall}_clicked`;
+    await browser.wait(
+      async () => {
+        const outcome = await browser.findElement(By.id("outcome")).getText();
+        if (outcome === "Verified success" || outcome === "Stopped safely") return true;
+        const nextDigest =
+          (await browser.findElement(By.id("approval-digest")).getAttribute("textContent")) ?? "";
+        return nextDigest !== digest;
+      },
+      60_000,
+    );
+  }
+  await waitText(browser, By.id("outcome"), "Verified success", 60_000);
+  const capacityDocument = await browser.findElement(By.css("body")).getText();
+  assert.match(capacityDocument, /Initial plan: ADMITTABLE/u);
+  assert.match(capacityDocument, /Capacity shock: 100 → 90 minutes/u);
+  assert.match(capacityDocument, /Stale v1 action rejected/u);
+  assert.match(capacityDocument, /09:36–10:00/u);
+  assert.match(capacityDocument, /Agent work[\s\S]*3/u);
+  assert.match(capacityDocument, /Production cell[\s\S]*24/u);
+  assert.match(capacityDocument, /order\/best-effort-training-trays/u);
+  assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
+  assert.deepEqual(
+    await Promise.all(
+      (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
+    ),
+    ["1", "1", "1", "1"],
+  );
+  const capacitySession = await browser.findElement(By.id("session-id")).getText();
+  await screenshot(browser, join(screenshots, "09-capacity-shock-verified.png"));
+  await browser.navigate().refresh();
+  await waitText(browser, By.id("outcome"), "Verified success", 60_000);
+  assert.equal(await browser.findElement(By.id("session-id")).getText(), capacitySession);
+  assert.equal(
+    await browser.findElement(By.id("scenario-select")).getAttribute("value"),
+    "capacity-shock",
+  );
   assert.equal(
     capture.capturedErrorCount(),
     0,

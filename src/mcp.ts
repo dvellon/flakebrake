@@ -1417,7 +1417,7 @@ function registerM4ChangeControlTools(
   );
 }
 
-function applyM4PortfolioModification(
+export function applyM4PortfolioModification(
   store: FlakeBrakeStore,
   input: z.infer<typeof selectPortfolioModificationSchema>,
   assertDatabaseBinding: () => void,
