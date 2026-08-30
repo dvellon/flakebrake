@@ -6,9 +6,11 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 import {
+  EvidenceHandleLifecycleManager,
   EvidenceHandleOwnership,
   evidenceCleanupErrors,
   withEvidenceHandleOwnership,
+  withEvidenceLifecycleShutdown,
   type EvidenceHandleRequest,
   type EvidenceHandleScope,
   type EvidenceOwnedHandle,
@@ -98,10 +100,16 @@ function assertBalanced(factory: CountingFactory): void {
   }
 }
 
+function lifecycle(
+  factory: CountingFactory,
+): EvidenceHandleLifecycleManager<CountingHandle> {
+  return new EvidenceHandleLifecycleManager(factory.open);
+}
+
 describe("mission evidence database-handle lifecycle", () => {
   test("procfs-independent success owns and closes all four handles exactly once", () => {
     const factory = new CountingFactory();
-    const result = withEvidenceHandleOwnership(factory.open, (scope) => {
+    const result = withEvidenceHandleOwnership(lifecycle(factory), (scope) => {
       const handles = acquireFirst(scope, FOUR_DATABASES.length);
       assert.equal(scope.acquiredCount, 4);
       assert.equal(scope.ownedCount, 4);
@@ -121,7 +129,7 @@ describe("mission evidence database-handle lifecycle", () => {
       );
       assert.throws(
         () =>
-          withEvidenceHandleOwnership(factory.open, (scope) => {
+          withEvidenceHandleOwnership(lifecycle(factory), (scope) => {
             acquireFirst(scope, FOUR_DATABASES.length);
           }),
         new RegExp(`injected open failure for ${FOUR_DATABASES[failureBoundary - 1]?.key}`),
@@ -143,7 +151,7 @@ describe("mission evidence database-handle lifecycle", () => {
       const primary = new Error(`failure after acquisition ${failureBoundary}`);
       assert.throws(
         () =>
-          withEvidenceHandleOwnership(factory.open, (scope) => {
+          withEvidenceHandleOwnership(lifecycle(factory), (scope) => {
             acquireFirst(scope, failureBoundary);
             throw primary;
           }),
@@ -161,10 +169,11 @@ describe("mission evidence database-handle lifecycle", () => {
 
   test("a verification throw after acquisition closes all four handles", () => {
     const factory = new CountingFactory();
+    const manager = lifecycle(factory);
     const verificationError = new Error("injected verification failure");
     assert.throws(
       () =>
-        withEvidenceHandleOwnership(factory.open, (scope) => {
+        withEvidenceHandleOwnership(manager, (scope) => {
           acquireFirst(scope, FOUR_DATABASES.length);
           throw verificationError;
         }),
@@ -174,12 +183,13 @@ describe("mission evidence database-handle lifecycle", () => {
     assertBalanced(factory);
   });
 
-  test("one close failure does not prevent exhaustive cleanup and stays secondary", () => {
+  test("wrapper retains a failed close, retries only that handle, and preserves the primary", () => {
     const factory = new CountingFactory(() => false, { mission: 1 });
+    const manager = lifecycle(factory);
     const verificationError = Object.freeze(new Error("primary verification failure"));
     assert.throws(
       () =>
-        withEvidenceHandleOwnership(factory.open, (scope) => {
+        withEvidenceHandleOwnership(manager, (scope) => {
           acquireFirst(scope, FOUR_DATABASES.length);
           throw verificationError;
         }),
@@ -197,6 +207,79 @@ describe("mission evidence database-handle lifecycle", () => {
     for (const key of ["m2", "factory", "trueforge"]) {
       assert.equal(factory.handles.find((handle) => handle.key === key)?.successfulCloses, 1);
     }
+    assert.deepEqual(manager.snapshot(), {
+      activeOperationCount: 0,
+      retainedOperationCount: 1,
+      ownedHandleCount: 1,
+      closed: false,
+    });
+
+    manager.drain();
+    assert.equal(manager.snapshot().ownedHandleCount, 0);
+    const mission = factory.handles.find((handle) => handle.key === "mission");
+    assert.equal(mission?.closeAttempts, 2);
+    assert.equal(mission?.successfulCloses, 1);
+    for (const handle of factory.handles.filter((item) => item.key !== "mission")) {
+      assert.equal(handle.closeAttempts, 1, `${handle.key} must not be retried`);
+    }
+    assertBalanced(factory);
+  });
+
+  test("persistent close failure remains owned, observable, and bounded", () => {
+    const factory = new CountingFactory(() => false, { trueforge: 10 });
+    const manager = lifecycle(factory);
+    assert.throws(
+      () => withEvidenceHandleOwnership(manager, (scope) => acquireFirst(scope, 4)),
+      /handle cleanup failed/u,
+    );
+    assert.equal(manager.snapshot().ownedHandleCount, 1);
+    assert.throws(() => manager.drain(), /handle cleanup failed/u);
+    assert.equal(manager.snapshot().ownedHandleCount, 1);
+    assert.equal(factory.handles.find((handle) => handle.key === "trueforge")?.closeAttempts, 2);
+  });
+
+  test("subsequent operation drains retained cleanup before acquiring a new handle", () => {
+    const factory = new CountingFactory(() => false, { mission: 1 });
+    const manager = lifecycle(factory);
+    assert.throws(
+      () => withEvidenceHandleOwnership(manager, (scope) => scope.acquire(FOUR_DATABASES[1])),
+      /handle cleanup failed/u,
+    );
+    assert.equal(factory.openAttempts, 1);
+
+    const result = withEvidenceHandleOwnership(manager, (scope) =>
+      scope.acquire(FOUR_DATABASES[2]).key,
+    );
+    assert.equal(result, "factory");
+    assert.equal(factory.openAttempts, 2);
+    assert.deepEqual(factory.closeOrder, ["mission", "mission", "factory"]);
+    manager.close();
+    assert.equal(manager.snapshot().closed, true);
+    assertBalanced(factory);
+  });
+
+  test("CLI shutdown retry preserves a primary operation error and drains fail-once cleanup", () => {
+    const factory = new CountingFactory(() => false, { m2: 1 });
+    const manager = lifecycle(factory);
+    const primary = new Error("database-backed CLI verification failed");
+    assert.throws(
+      () =>
+        withEvidenceLifecycleShutdown(manager, () =>
+          withEvidenceHandleOwnership(manager, (scope) => {
+            scope.acquire(FOUR_DATABASES[0]);
+            throw primary;
+          }),
+        ),
+      (error: unknown) => error === primary,
+    );
+    assert.equal(evidenceCleanupErrors(primary).length, 1);
+    assert.deepEqual(manager.snapshot(), {
+      activeOperationCount: 0,
+      retainedOperationCount: 0,
+      ownedHandleCount: 0,
+      closed: true,
+    });
+    assertBalanced(factory);
   });
 
   test("cleanup can retry a failed close without reclosing successful handles", () => {
@@ -278,7 +361,7 @@ describe("mission evidence database-handle lifecycle", () => {
     for (let attempt = 0; attempt < 16; attempt += 1) {
       assert.throws(
         () =>
-          withEvidenceHandleOwnership(factory.open, (scope) => {
+          withEvidenceHandleOwnership(lifecycle(factory), (scope) => {
             scope.acquire(FOUR_DATABASES[0]);
             scope.acquire(FOUR_DATABASES[1]);
           }),
@@ -292,20 +375,21 @@ describe("mission evidence database-handle lifecycle", () => {
   });
 
   test("concurrent export and verification scopes retain independent ownership", async () => {
+    const factory = new CountingFactory();
+    const manager = lifecycle(factory);
     const operations = Array.from({ length: 8 }, (_unused, index) => {
-      const factory = new CountingFactory();
       return Promise.resolve().then(() => {
-        const result = withEvidenceHandleOwnership(factory.open, (scope) => {
+        const result = withEvidenceHandleOwnership(manager, (scope) => {
           acquireFirst(scope, FOUR_DATABASES.length);
           return index % 2 === 0 ? "export" : "verification";
         });
-        return { factory, result };
+        return result;
       });
     });
 
     const results = await Promise.all(operations);
     assert.deepEqual(
-      results.map(({ result }) => result),
+      results,
       [
         "export",
         "verification",
@@ -317,11 +401,42 @@ describe("mission evidence database-handle lifecycle", () => {
         "verification",
       ],
     );
-    for (const { factory } of results) {
-      assert.equal(factory.handles.length, 4);
-      assertBalanced(factory);
-    }
-    const allHandles = results.flatMap(({ factory }) => factory.handles);
-    assert.equal(new Set(allHandles).size, 32);
+    assert.equal(factory.handles.length, 32);
+    assert.equal(new Set(factory.handles).size, 32);
+    assert.equal(manager.snapshot().ownedHandleCount, 0);
+    assertBalanced(factory);
+  });
+
+  test("overlapping callers retain isolated active owners", () => {
+    const factory = new CountingFactory();
+    const manager = lifecycle(factory);
+    const result = withEvidenceHandleOwnership(manager, (outer) => {
+      outer.acquire(FOUR_DATABASES[0]);
+      assert.deepEqual(manager.snapshot(), {
+        activeOperationCount: 1,
+        retainedOperationCount: 0,
+        ownedHandleCount: 1,
+        closed: false,
+      });
+      const inner = withEvidenceHandleOwnership(manager, (innerScope) => {
+        innerScope.acquire(FOUR_DATABASES[2]);
+        assert.deepEqual(manager.snapshot(), {
+          activeOperationCount: 2,
+          retainedOperationCount: 0,
+          ownedHandleCount: 2,
+          closed: false,
+        });
+        return "inner";
+      });
+      assert.equal(inner, "inner");
+      assert.equal(outer.ownedCount, 1);
+      assert.equal(manager.snapshot().ownedHandleCount, 1);
+      return "outer";
+    });
+
+    assert.equal(result, "outer");
+    assert.deepEqual(factory.closeOrder, ["factory", "m2"]);
+    assert.equal(manager.snapshot().ownedHandleCount, 0);
+    assertBalanced(factory);
   });
 });

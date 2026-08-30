@@ -29,6 +29,8 @@ import {
   verifyMissionEvidenceBytes,
   type MissionEvidenceBuildOptions,
 } from "../src/index.js";
+import { runMissionEvidenceCli } from "../src/mission-evidence-cli.js";
+import { createMissionEvidenceDatabaseLifecycle } from "../src/mission-evidence.js";
 
 describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-evidence-test-"));
@@ -229,6 +231,63 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Verified canonical mission evidence bundle/u);
     assert.match(result.stdout, /Durable database match: exact/u);
+    assert.deepEqual(durableSnapshot(options), beforeVerification);
+  });
+
+  test("database-backed CLI drains retained fail-once cleanup before its failure exit", () => {
+    const bundlePath = join(directory, "mission-evidence-cli-cleanup.json");
+    writeFileSync(bundlePath, canonicalBytes, "utf8");
+    const beforeVerification = durableSnapshot(options);
+    const owned = new Set<DatabaseSync>();
+    let trueforgeCloseAttempts = 0;
+    let failTrueforgeCloseOnce = true;
+    const lifecycle = createMissionEvidenceDatabaseLifecycle((request, openDefault) => {
+      const database = openDefault();
+      let wrapper!: DatabaseSync;
+      wrapper = new Proxy(database, {
+        get(target, property) {
+          if (property === "close") {
+            return (): void => {
+              if (request.key === "trueforge") {
+                trueforgeCloseAttempts += 1;
+                if (failTrueforgeCloseOnce) {
+                  failTrueforgeCloseOnce = false;
+                  throw new Error("injected CLI TrueForge close failure");
+                }
+              }
+              target.close();
+              owned.delete(wrapper);
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as DatabaseSync;
+      owned.add(wrapper);
+      return wrapper;
+    });
+    let output = "";
+
+    assert.throws(
+      () =>
+        runMissionEvidenceCli(
+          ["--bundle", bundlePath, "--data-dir", directory],
+          lifecycle,
+          (text) => {
+            output += text;
+          },
+        ),
+      /handle cleanup failed/u,
+    );
+    assert.equal(output, "", "cleanup failure must not report successful verification");
+    assert.equal(trueforgeCloseAttempts, 2);
+    assert.equal(owned.size, 0);
+    assert.deepEqual(lifecycle.snapshot(), {
+      activeOperationCount: 0,
+      retainedOperationCount: 0,
+      ownedHandleCount: 0,
+      closed: true,
+    });
     assert.deepEqual(durableSnapshot(options), beforeVerification);
   });
 

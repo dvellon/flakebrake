@@ -1,11 +1,17 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 import {
-  verifyMissionEvidenceBytes,
+  createMissionEvidenceDatabaseLifecycle,
+  verifyMissionEvidenceBytesWithLifecycle,
   type MissionEvidenceBuildOptions,
 } from "./mission-evidence.js";
+import {
+  withEvidenceLifecycleShutdown,
+  type EvidenceHandleLifecycleManager,
+} from "./mission-evidence-lifecycle.js";
 
 const VALUE_FLAGS = [
   "--bundle",
@@ -99,21 +105,35 @@ export function parseMissionEvidenceCliArguments(
   return { help: false, bundlePath, databases };
 }
 
-function main(arguments_: readonly string[]): void {
-  const parsed = parseMissionEvidenceCliArguments(arguments_);
-  if (parsed.help) {
-    process.stdout.write(usage());
-    return;
-  }
-  const bytes = readFileSync(parsed.bundlePath as string, "utf8");
-  const result = verifyMissionEvidenceBytes(bytes, parsed.databases);
-  process.stdout.write(
-    `Verified canonical mission evidence bundle\n` +
-      `Mission: ${result.missionId}\n` +
-      `Payload digest: ${result.payloadDigest}\n` +
-      `Canonical bytes: ${String(result.canonicalByteLength)}\n` +
-      `Durable database match: ${result.databaseMatch ? "exact" : "not requested"}\n`,
-  );
+/** @internal Real CLI boundary with explicit, bounded lifecycle shutdown. */
+export function runMissionEvidenceCli(
+  arguments_: readonly string[],
+  lifecycle: EvidenceHandleLifecycleManager<DatabaseSync> =
+    createMissionEvidenceDatabaseLifecycle(),
+  writeOutput: (text: string) => void = (text) => {
+    process.stdout.write(text);
+  },
+): void {
+  withEvidenceLifecycleShutdown(lifecycle, () => {
+    const parsed = parseMissionEvidenceCliArguments(arguments_);
+    if (parsed.help) {
+      writeOutput(usage());
+      return;
+    }
+    const bytes = readFileSync(parsed.bundlePath as string, "utf8");
+    const result = verifyMissionEvidenceBytesWithLifecycle(
+      bytes,
+      parsed.databases,
+      lifecycle,
+    );
+    writeOutput(
+      `Verified canonical mission evidence bundle\n` +
+        `Mission: ${result.missionId}\n` +
+        `Payload digest: ${result.payloadDigest}\n` +
+        `Canonical bytes: ${String(result.canonicalByteLength)}\n` +
+        `Durable database match: ${result.databaseMatch ? "exact" : "not requested"}\n`,
+    );
+  });
 }
 
 function databaseOptionsFromDirectory(
@@ -154,7 +174,7 @@ if (
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
   try {
-    main(process.argv.slice(2));
+    runMissionEvidenceCli(process.argv.slice(2));
   } catch (error: unknown) {
     process.stderr.write(
       `Mission evidence verification failed: ${

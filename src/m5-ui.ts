@@ -33,8 +33,9 @@ import {
 } from "./hero-fixture.js";
 import { evaluateAdmission } from "./kernel.js";
 import {
-  exportMissionEvidenceBundle,
-  isMissionEvidenceReady,
+  createMissionEvidenceDatabaseLifecycle,
+  exportMissionEvidenceBundleWithLifecycle,
+  isMissionEvidenceReadyWithLifecycle,
 } from "./mission-evidence.js";
 import {
   m4OwnerDecisionResponse,
@@ -68,6 +69,15 @@ const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_RECORDS = 256;
 const HERO_ATTEMPT_ID = "attempt/m4-approved-alternative";
 const DEFAULT_REQUEST_DRAIN_TIMEOUT_MS = 500;
+const INTERNAL_EVIDENCE_LIFECYCLE = Symbol("M5 evidence database lifecycle");
+
+type MissionEvidenceDatabaseLifecycle = ReturnType<
+  typeof createMissionEvidenceDatabaseLifecycle
+>;
+
+type InternalEvidenceLifecycleOptions = {
+  readonly [INTERNAL_EVIDENCE_LIFECYCLE]?: MissionEvidenceDatabaseLifecycle;
+};
 
 export type M5RunStatus =
   | "idle"
@@ -296,6 +306,7 @@ export class M5DemoCoordinator {
   readonly #dataRoot: string;
   readonly #cleanupDataOnClose: boolean;
   readonly #paths: DemoPaths;
+  readonly #evidenceLifecycle: MissionEvidenceDatabaseLifecycle;
   readonly #decisionHistory = new Map<string, RecordedDecision>();
   readonly #observedApprovals: M4ApprovalRecord[] = [];
   readonly #runtimeEvidence: {
@@ -324,6 +335,9 @@ export class M5DemoCoordinator {
     }
     this.#dataRoot = resolve(options.dataRoot);
     this.#cleanupDataOnClose = options.cleanupDataOnClose ?? true;
+    this.#evidenceLifecycle = (
+      options as M5DemoCoordinatorOptions & InternalEvidenceLifecycleOptions
+    )[INTERNAL_EVIDENCE_LIFECYCLE] ?? createMissionEvidenceDatabaseLifecycle();
     this.#paths = {
       m2: join(this.#dataRoot, "m2.sqlite"),
       factory: join(this.#dataRoot, "factory.sqlite"),
@@ -684,14 +698,17 @@ export class M5DemoCoordinator {
       missionDatabasePath: this.#paths.mission,
       trueforgeDatabasePath: this.#paths.trueforge,
     } as const;
-    if (!isMissionEvidenceReady(options)) {
+    if (!isMissionEvidenceReadyWithLifecycle(options, this.#evidenceLifecycle)) {
       throw new M5RequestError(
         409,
         "evidence_not_ready",
         "Canonical mission evidence is available only after durable verification completes",
       );
     }
-    return exportMissionEvidenceBundle(options);
+    return exportMissionEvidenceBundleWithLifecycle(
+      options,
+      this.#evidenceLifecycle,
+    );
   }
 
   public async close(): Promise<void> {
@@ -708,6 +725,7 @@ export class M5DemoCoordinator {
       );
     }
     await this.#runPromise;
+    this.#evidenceLifecycle.close();
     this.#status = "closed";
     this.#closed = true;
     if (this.#cleanupDataOnClose) cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths);
@@ -1304,6 +1322,18 @@ export async function startM5JudgeServer(
       return closing;
     },
   };
+}
+
+/** @internal Deterministic lifecycle injection for cleanup-boundary tests. */
+export function startM5JudgeServerWithEvidenceLifecycle(
+  options: StartM5JudgeServerOptions,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
+): Promise<RunningM5JudgeServer> {
+  const internalOptions = {
+    ...options,
+    [INTERNAL_EVIDENCE_LIFECYCLE]: lifecycle,
+  } as StartM5JudgeServerOptions & InternalEvidenceLifecycleOptions;
+  return startM5JudgeServer(internalOptions);
 }
 
 async function closeServer(

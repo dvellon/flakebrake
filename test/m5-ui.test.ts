@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 import { createContext, runInContext } from "node:vm";
 
@@ -16,6 +17,8 @@ import {
   type RunningM5JudgeServer,
 } from "../src/index.js";
 import { parseM5CliArguments } from "../src/m5-cli.js";
+import { createMissionEvidenceDatabaseLifecycle } from "../src/mission-evidence.js";
+import { startM5JudgeServerWithEvidenceLifecycle } from "../src/m5-ui.js";
 import {
   armSessionErrorCapture,
   armSessionNetworkCapture,
@@ -1508,10 +1511,119 @@ describe("M5 judge UI", { concurrency: false }, () => {
   });
 });
 
+test("M5 evidence readiness/export failures retain cleanup until service shutdown", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-evidence-lifecycle-"));
+  const owned = new Set<DatabaseSync>();
+  const closeAttempts = new Map<string, number>();
+  let failOnceKey: string | null = null;
+  const lifecycle = createMissionEvidenceDatabaseLifecycle((request, openDefault) => {
+    const database = openDefault();
+    let wrapper!: DatabaseSync;
+    wrapper = new Proxy(database, {
+      get(target, property) {
+        if (property === "close") {
+          return (): void => {
+            closeAttempts.set(request.key, (closeAttempts.get(request.key) ?? 0) + 1);
+            if (failOnceKey === request.key) {
+              failOnceKey = null;
+              throw new Error(`injected ${request.key} close failure`);
+            }
+            target.close();
+            owned.delete(wrapper);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as DatabaseSync;
+    owned.add(wrapper);
+    return wrapper;
+  });
+  const running = await startM5JudgeServerWithEvidenceLifecycle(
+    { dataRoot: directory, port: 0, cleanupDataOnClose: false },
+    lifecycle,
+  );
+  try {
+    await completeHeroMission(running, "lifecycle");
+
+    // The readiness projection owns mission+M2. Its failed mission close must
+    // make the HTTP request fail safely and stay reachable by the service owner.
+    failOnceKey = "mission";
+    const readinessFailure = await fetch(`${running.url}/api/evidence`);
+    assert.equal(readinessFailure.status, 500);
+    assert.deepEqual(await readinessFailure.json(), {
+      error: "internal_error",
+      message: "The request failed safely",
+    });
+    assert.equal(lifecycle.snapshot().ownedHandleCount, 1);
+    assert.equal(owned.size, 1);
+
+    // A later safe request drains only the failed callback before opening a new
+    // readiness/export scope, then returns the canonical evidence successfully.
+    const retry = await fetch(`${running.url}/api/evidence`);
+    assert.equal(retry.status, 200);
+    assert.match(retry.headers.get("content-type") ?? "", /application\/json/u);
+    assert.equal(lifecycle.snapshot().ownedHandleCount, 0);
+    assert.equal(owned.size, 0);
+
+    // Fail the final TrueForge close in the real four-database export. The
+    // request cannot report success; service close owns and drains the retry.
+    failOnceKey = "trueforge";
+    const exportFailure = await fetch(`${running.url}/api/evidence`);
+    assert.equal(exportFailure.status, 500);
+    assert.equal(lifecycle.snapshot().ownedHandleCount, 1);
+    assert.equal(owned.size, 1);
+    await running.close();
+    assert.deepEqual(lifecycle.snapshot(), {
+      activeOperationCount: 0,
+      retainedOperationCount: 0,
+      ownedHandleCount: 0,
+      closed: true,
+    });
+    assert.equal(owned.size, 0);
+    assert.ok((closeAttempts.get("mission") ?? 0) >= 2);
+    assert.ok((closeAttempts.get("trueforge") ?? 0) >= 2);
+  } finally {
+    failOnceKey = null;
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function getState(running: RunningM5JudgeServer): Promise<M5JudgeState> {
   const response = await fetch(`${running.url}/api/state`);
   assert.equal(response.status, 200);
   return (await response.json()) as M5JudgeState;
+}
+
+async function completeHeroMission(
+  running: RunningM5JudgeServer,
+  requestPrefix: string,
+): Promise<M5JudgeState> {
+  await postJson(running, "/api/mission", {
+    operation: "start",
+    requestId: `${requestPrefix}-start-0001`,
+  });
+  for (let decision = 1; decision <= 4; decision += 1) {
+    const current = await waitForState(
+      running,
+      (state) => state.pendingApproval !== null || isTerminal(state),
+    );
+    if (isTerminal(current)) return current;
+    const pending = current.pendingApproval;
+    assert.ok(pending);
+    await postJson(running, "/api/approval", {
+      missionId: pending.missionId,
+      actionIdentity: pending.actionIdentity,
+      decision: pending.recommendedDecision,
+      reason:
+        pending.recommendedDecision === "deny"
+          ? "The primary interval conflicts with protected production commitments"
+          : null,
+      requestId: `${requestPrefix}-approval-${String(decision).padStart(4, "0")}`,
+    });
+  }
+  return waitForState(running, isTerminal);
 }
 
 async function postJson(

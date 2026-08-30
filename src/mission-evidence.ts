@@ -13,7 +13,11 @@ import {
   readAuthoritativeFactoryExecution,
 } from "./factory-environment.js";
 import { stableTupleId } from "./identity.js";
-import { withEvidenceHandleOwnership } from "./mission-evidence-lifecycle.js";
+import {
+  EvidenceHandleLifecycleManager,
+  withEvidenceHandleOwnership,
+  type EvidenceHandleRequest,
+} from "./mission-evidence-lifecycle.js";
 import {
   canonicalDatabasePath,
   databaseInstanceIdentityFromHandle,
@@ -513,6 +517,33 @@ export class MissionEvidenceError extends Error {
   }
 }
 
+type MissionEvidenceDatabaseLifecycle =
+  EvidenceHandleLifecycleManager<DatabaseSync>;
+
+/** @internal Caller-owned lifecycle for CLI and loopback-service boundaries. */
+export function createMissionEvidenceDatabaseLifecycle(
+  overrideOpen?: (
+    request: EvidenceHandleRequest,
+    openDefault: () => DatabaseSync,
+  ) => DatabaseSync,
+): MissionEvidenceDatabaseLifecycle {
+  return new EvidenceHandleLifecycleManager((request) => {
+    const openDefault = (): DatabaseSync =>
+      openReadOnlyDatabase(request.path, request.label);
+    return overrideOpen === undefined
+      ? openDefault()
+      : overrideOpen(request, openDefault);
+  });
+}
+
+const defaultMissionEvidenceDatabaseLifecycle =
+  createMissionEvidenceDatabaseLifecycle();
+
+/** @internal Bounded drain for direct database-backed callers at shutdown. */
+export function drainDefaultMissionEvidenceDatabaseLifecycle(): void {
+  defaultMissionEvidenceDatabaseLifecycle.drain();
+}
+
 /**
  * Distinguishes an unfinished mission from an evidence-export defect without
  * opening either durable store for mutation.
@@ -520,11 +551,22 @@ export class MissionEvidenceError extends Error {
 export function isMissionEvidenceReady(
   options: MissionEvidenceBuildOptions,
 ): boolean {
+  return isMissionEvidenceReadyWithLifecycle(
+    options,
+    defaultMissionEvidenceDatabaseLifecycle,
+  );
+}
+
+/** @internal Readiness projection using a caller-owned lifecycle. */
+export function isMissionEvidenceReadyWithLifecycle(
+  options: MissionEvidenceBuildOptions,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
+): boolean {
   requireText(options.missionId, "missionId");
   if (!existsSync(options.missionDatabasePath)) return false;
   try {
     return withEvidenceHandleOwnership(
-      (request) => openReadOnlyDatabase(request.path, request.label),
+      lifecycle,
       ({ acquire }) => {
         const mission = acquire({
           key: "mission",
@@ -575,6 +617,17 @@ export function isMissionEvidenceReady(
 
 export function buildMissionEvidenceBundle(
   options: MissionEvidenceBuildOptions,
+): MissionEvidenceBundle {
+  return buildMissionEvidenceBundleWithLifecycle(
+    options,
+    defaultMissionEvidenceDatabaseLifecycle,
+  );
+}
+
+/** @internal Canonical projection using a caller-owned lifecycle. */
+export function buildMissionEvidenceBundleWithLifecycle(
+  options: MissionEvidenceBuildOptions,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
 ): MissionEvidenceBundle {
   validateBuildOptions(options);
   function projectEvidenceFromHandles(
@@ -1147,7 +1200,7 @@ export function buildMissionEvidenceBundle(
 
   try {
     return withEvidenceHandleOwnership(
-      (request) => openReadOnlyDatabase(request.path, request.label),
+      lifecycle,
       ({ acquire }) =>
         projectEvidenceFromHandles(
           acquire({
@@ -1192,12 +1245,38 @@ export function serializeMissionEvidenceBundle(
 export function exportMissionEvidenceBundle(
   options: MissionEvidenceBuildOptions,
 ): string {
-  return serializeMissionEvidenceBundle(buildMissionEvidenceBundle(options));
+  return exportMissionEvidenceBundleWithLifecycle(
+    options,
+    defaultMissionEvidenceDatabaseLifecycle,
+  );
+}
+
+/** @internal Canonical export using a caller-owned lifecycle. */
+export function exportMissionEvidenceBundleWithLifecycle(
+  options: MissionEvidenceBuildOptions,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
+): string {
+  return serializeMissionEvidenceBundle(
+    buildMissionEvidenceBundleWithLifecycle(options, lifecycle),
+  );
 }
 
 export function verifyMissionEvidenceBytes(
   bytes: string,
   databases?: MissionEvidenceBuildOptions,
+): MissionEvidenceVerificationResult {
+  return verifyMissionEvidenceBytesWithLifecycle(
+    bytes,
+    databases,
+    defaultMissionEvidenceDatabaseLifecycle,
+  );
+}
+
+/** @internal Standalone/database-backed verification with outer cleanup ownership. */
+export function verifyMissionEvidenceBytesWithLifecycle(
+  bytes: string,
+  databases: MissionEvidenceBuildOptions | undefined,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
 ): MissionEvidenceVerificationResult {
   let parsedJson: unknown;
   try {
@@ -1221,7 +1300,7 @@ export function verifyMissionEvidenceBytes(
   verifyMissionEvidenceBundle(parsed.data);
   let databaseMatch = false;
   if (databases !== undefined) {
-    const expected = exportMissionEvidenceBundle(databases);
+    const expected = exportMissionEvidenceBundleWithLifecycle(databases, lifecycle);
     if (expected !== bytes) {
       throw new MissionEvidenceError(
         "evidence bundle does not exactly match the read-only durable database projection",
