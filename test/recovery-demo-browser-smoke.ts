@@ -42,7 +42,7 @@ try {
   await waitStage(browser, "idle");
   await exercise(browser, "after_factory_commit_before_m2_binding");
 
-  for (const [width, height] of [[1280, 800], [390, 844]] as const) {
+  for (const [width, height] of [[1280, 800], [768, 1024], [390, 844]] as const) {
     await browser.manage().window().setRect({ width, height });
     const horizontalOverflow: number = await browser.executeScript<number>(
       "return Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth);",
