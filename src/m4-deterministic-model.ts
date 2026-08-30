@@ -28,6 +28,7 @@ import type {
   ClaimExecutionInput,
   EffectFingerprint,
 } from "./stateful-domain.js";
+import { retainM4RunnerCleanupDiagnostics } from "./m4-runner-lifecycle.js";
 
 const PRIMARY_START = "2026-08-26T09:10:00.000Z";
 const PRIMARY_END = "2026-08-26T09:40:00.000Z";
@@ -48,6 +49,7 @@ export interface DeterministicM4ModelOptions {
   readonly factoryDatabasePath: string;
   readonly host?: "127.0.0.1";
   readonly port?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface RunningDeterministicM4Model {
@@ -127,21 +129,33 @@ export async function startDeterministicM4Model(
       );
     });
   });
-  await listen(server, host, port);
+  try {
+    await listen(server, host, port, options.signal);
+  } catch (error: unknown) {
+    const cleanupFailures: unknown[] = [];
+    try {
+      await closeServer(server);
+    } catch (cleanupError: unknown) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (error instanceof Error) {
+      retainM4RunnerCleanupDiagnostics(error, cleanupFailures);
+    }
+    throw error;
+  }
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("Deterministic model did not bind a TCP address");
   }
-  let closed = false;
+  let closePromise: Promise<void> | undefined;
   return {
     host,
     port: address.port,
     baseUrl: `http://${host}:${String(address.port)}/v1`,
     requestCount: () => requests,
     close: async () => {
-      if (closed) return;
-      closed = true;
-      await closeServer(server);
+      closePromise ??= closeServer(server);
+      await closePromise;
     },
   };
 }
@@ -1065,10 +1079,38 @@ async function readBody(request: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function listen(server: Server, host: string, port: number): Promise<void> {
+function listen(
+  server: Server,
+  host: string,
+  port: number,
+  signal?: AbortSignal,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, host, resolve);
+    let settled = false;
+    const settle = (outcome: "resolve" | "reject", error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      server.off("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+      if (outcome === "resolve") resolve();
+      else reject(error);
+    };
+    const onError = (error: Error): void => settle("reject", error);
+    const onAbort = (): void =>
+      settle(
+        "reject",
+        signal?.reason ?? new DOMException("The operation was aborted", "AbortError"),
+      );
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted === true) {
+      onAbort();
+      return;
+    }
+    server.once("error", onError);
+    server.listen(
+      { host, port, ...(signal === undefined ? {} : { signal }) },
+      () => settle("resolve"),
+    );
   });
 }
 

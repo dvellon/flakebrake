@@ -13,6 +13,7 @@ import {
 import { HERO_ENVIRONMENT_ID } from "./hero-fixture.js";
 import { readDatabaseInstanceIdentity } from "./sqlite.js";
 import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
+import { retainM4RunnerCleanupDiagnostics } from "./m4-runner-lifecycle.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const MAX_MCP_FRAME_BYTES = 1_048_576;
@@ -20,6 +21,7 @@ const MAX_MCP_FRAME_BYTES = 1_048_576;
 export interface FactoryMcpHttpServiceOptions extends FactoryMcpServiceOptions {
   readonly host?: "127.0.0.1";
   readonly port?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface RunningFactoryMcpHttpService {
@@ -108,7 +110,20 @@ export async function startFactoryMcpHttpService(
   httpServer.on("clientError", (_error, socket) => {
     socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
   });
-  await listen(httpServer, host, port);
+  try {
+    await listen(httpServer, host, port, options.signal);
+  } catch (error: unknown) {
+    const cleanupFailures: unknown[] = [];
+    try {
+      await closeHttpServer(httpServer);
+    } catch (cleanupError: unknown) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (error instanceof Error) {
+      retainM4RunnerCleanupDiagnostics(error, cleanupFailures);
+    }
+    throw error;
+  }
   const address = httpServer.address();
   if (address === null || typeof address === "string") {
     await closeHttpServer(httpServer);
@@ -213,20 +228,25 @@ export async function startFactoryMcpHttpCluster(
     const services = new Map(
       opened.map((service) => [service.serviceName, service] as const),
     );
-    let closed = false;
+    let closePromise: Promise<void> | undefined;
     return {
       transport: "streamable-http",
       services,
       close: async () => {
-        if (closed) return;
-        closed = true;
-        await Promise.allSettled(
-          [...services.values()].map((service) => service.close()),
-        );
+        closePromise ??= closeServicesInReverse([...services.values()]);
+        await closePromise;
       },
     };
   } catch (error: unknown) {
-    await Promise.allSettled(opened.map((service) => service.close()));
+    const cleanupFailures: unknown[] = [];
+    try {
+      await closeServicesInReverse(opened);
+    } catch (cleanupError: unknown) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (error instanceof Error) {
+      retainM4RunnerCleanupDiagnostics(error, cleanupFailures);
+    }
     throw error;
   }
 }
@@ -246,20 +266,60 @@ async function readBoundedUtf8Body(request: IncomingMessage): Promise<string> {
   return decoded;
 }
 
-function listen(server: Server, host: string, port: number): Promise<void> {
+function listen(
+  server: Server,
+  host: string,
+  port: number,
+  signal?: AbortSignal,
+): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => {
+    let settled = false;
+    const settle = (outcome: "resolve" | "reject", error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      server.off("error", onError);
       server.off("listening", onListening);
-      reject(error);
+      signal?.removeEventListener("abort", onAbort);
+      if (outcome === "resolve") resolve();
+      else reject(error);
+    };
+    const onError = (error: Error): void => {
+      settle("reject", error);
     };
     const onListening = (): void => {
-      server.off("error", onError);
-      resolve();
+      settle("resolve");
     };
+    const onAbort = (): void => settle("reject", abortReason(signal));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted === true) {
+      onAbort();
+      return;
+    }
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(port, host);
+    server.listen({ host, port, ...(signal === undefined ? {} : { signal }) });
   });
+}
+
+async function closeServicesInReverse(
+  services: readonly RunningFactoryMcpHttpService[],
+): Promise<void> {
+  const reverseOwned = [...services].reverse();
+  const settled = await Promise.allSettled(
+    reverseOwned.map((service) => service.close()),
+  );
+  const failures = settled
+    .filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    )
+    .map((result) => result.reason as unknown);
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Factory MCP HTTP cluster teardown failed");
+  }
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
 function closeHttpServer(server: Server): Promise<void> {
