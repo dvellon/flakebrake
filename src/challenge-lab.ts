@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import {
+  type BigIntStats,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -131,6 +136,18 @@ interface ClaimedFixture extends PreparedFixture {
 
 interface CompleteEvidence extends ChallengeEvidence {
   readonly snapshot: string;
+}
+
+interface SQLiteParticipant {
+  readonly path: string;
+  readonly required: boolean;
+}
+
+interface SQLiteParticipantIdentity {
+  readonly path: string;
+  readonly descriptor: number;
+  readonly device: bigint;
+  readonly inode: bigint;
 }
 
 /**
@@ -883,89 +900,340 @@ function alternateMutationArguments(
 }
 
 function completeEvidence(paths: FixturePaths): CompleteEvidence {
-  const snapshot = canonicalSerialize({
-    m2: databaseSnapshot(paths.m2),
-    factory: databaseSnapshot(paths.factory),
-  });
-  return {
-    counts: {
-      admissions: tableCount(paths.m2, "admission_records"),
-      grants: tableCount(paths.m2, "grants"),
-      attempts: tableCount(paths.m2, "execution_attempts"),
-      fences: tableCount(paths.m2, "execution_fences"),
-      mutations: tableCount(paths.factory, "mutation_events"),
-      receipts: tableCount(paths.factory, "execution_results"),
-      terminalEvents: tableCount(paths.m2, "reservation_events"),
-      actualFacts: filteredCount(
-        paths.m2,
-        "admission_addenda",
-        "kind = 'actual_consumption'",
-      ),
-    },
-    snapshot,
-    snapshotDigest: sha256(snapshot),
-  };
+  const scenario = challengeScenarioRoot(paths);
+  const definitions = sqliteParticipants(paths);
+  const tracked = new Map<string, SQLiteParticipantIdentity | null>();
+  const identities: SQLiteParticipantIdentity[] = [];
+  const databases: DatabaseSync[] = [];
+  let primaryFailed = false;
+  let primaryError: unknown;
+  let evidence: CompleteEvidence | undefined;
+  try {
+    for (const participant of definitions) {
+      const identity = acquireSQLiteParticipant(participant, scenario);
+      tracked.set(participant.path, identity);
+      if (identity !== null) identities.push(identity);
+    }
+
+    const m2 = new DatabaseSync(paths.m2, { readOnly: true });
+    databases.push(m2);
+    const factory = new DatabaseSync(paths.factory, { readOnly: true });
+    databases.push(factory);
+
+    // Opening and priming the handles is the acquisition phase. Any WAL or SHM
+    // that SQLite creates here is provenance-checked before evidence is read.
+    m2.prepare("PRAGMA schema_version").get();
+    factory.prepare("PRAGMA schema_version").get();
+    acquireNewSQLiteParticipants(definitions, tracked, identities, scenario);
+
+    const snapshot = canonicalSerialize({
+      m2: databaseSnapshot(m2),
+      factory: databaseSnapshot(factory),
+    });
+    evidence = {
+      counts: {
+        admissions: tableCount(m2, "admission_records"),
+        grants: tableCount(m2, "grants"),
+        attempts: tableCount(m2, "execution_attempts"),
+        fences: tableCount(m2, "execution_fences"),
+        mutations: tableCount(factory, "mutation_events"),
+        receipts: tableCount(factory, "execution_results"),
+        terminalEvents: tableCount(m2, "reservation_events"),
+        actualFacts: filteredCount(m2, "admission_addenda", "kind = 'actual_consumption'"),
+      },
+      snapshot,
+      snapshotDigest: sha256(snapshot),
+    };
+    verifySQLiteParticipants(definitions, tracked, scenario);
+  } catch (error: unknown) {
+    primaryFailed = true;
+    primaryError = error;
+  }
+
+  const cleanupErrors: unknown[] = [];
+  for (const database of databases.reverse()) {
+    try {
+      database.close();
+    } catch (error: unknown) {
+      cleanupErrors.push(error);
+    }
+  }
+  for (const identity of identities.reverse()) {
+    try {
+      closeSync(identity.descriptor);
+    } catch (error: unknown) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (primaryFailed) {
+    attachChallengeCleanupDiagnostics(primaryError, cleanupErrors);
+    throw primaryError;
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Challenge evidence cleanup failed");
+  }
+  if (evidence === undefined) throw new Error("Challenge evidence acquisition was incomplete");
+  return evidence;
 }
 
-function databaseSnapshot(path: string): Readonly<Record<string, readonly unknown[]>> {
-  const database = new DatabaseSync(path, { readOnly: true });
+function challengeScenarioRoot(paths: FixturePaths): string {
+  const scenario = dirname(paths.m2);
+  if (
+    dirname(paths.factory) !== scenario ||
+    paths.m2 !== join(scenario, "m2.sqlite") ||
+    paths.factory !== join(scenario, "factory.sqlite")
+  ) {
+    throw sqliteParticipantError();
+  }
+  const challengeRoot = dirname(scenario);
+  requireChallengeRoot(challengeRoot);
+  const scenarioStat = lstatSync(scenario);
+  if (!scenarioStat.isDirectory() || scenarioStat.isSymbolicLink()) {
+    throw sqliteParticipantError();
+  }
+  const canonicalRoot = realpathSync(challengeRoot);
+  const canonicalScenario = realpathSync(scenario);
+  if (
+    canonicalRoot !== challengeRoot ||
+    canonicalScenario !== scenario ||
+    canonicalScenario !== join(canonicalRoot, basename(scenario))
+  ) {
+    throw sqliteParticipantError();
+  }
+  return canonicalScenario;
+}
+
+function sqliteParticipants(paths: FixturePaths): readonly SQLiteParticipant[] {
+  return [
+    { path: paths.m2, required: true },
+    { path: `${paths.m2}-wal`, required: false },
+    { path: `${paths.m2}-shm`, required: false },
+    { path: paths.factory, required: true },
+    { path: `${paths.factory}-wal`, required: false },
+    { path: `${paths.factory}-shm`, required: false },
+  ];
+}
+
+function acquireSQLiteParticipant(
+  participant: SQLiteParticipant,
+  scenario: string,
+): SQLiteParticipantIdentity | null {
+  const before = sqliteParticipantStat(participant.path);
+  if (before === null) {
+    if (participant.required) throw sqliteParticipantError();
+    return null;
+  }
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1n ||
+    before.ino === 0n ||
+    dirname(participant.path) !== scenario ||
+    !hasAuthorizedSQLiteParticipantPath(participant.path)
+  ) {
+    throw sqliteParticipantError();
+  }
+
+  let descriptor: number | undefined;
   try {
-    const tables = (
-      database
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
-        .all() as Record<string, unknown>[]
-    ).map((row) => String(row["name"]));
-    return Object.fromEntries(
-      tables.map((table) => [
-        table,
-        (database.prepare(`SELECT * FROM "${table}"`).all() as Record<string, unknown>[])
-          .map((row) =>
-            Object.fromEntries(
-              Object.entries(row).sort(([left], [right]) =>
-                compareStableStrings(left, right),
-              ),
-            ),
-          )
-          .sort((left, right) =>
-            compareStableStrings(canonicalSerialize(left), canonicalSerialize(right)),
-          ),
-      ]),
+    descriptor = openSync(
+      participant.path,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
     );
-  } finally {
-    database.close();
+    const opened = fstatSync(descriptor, { bigint: true });
+    const after = sqliteParticipantStat(participant.path);
+    if (
+      after === null ||
+      after.isSymbolicLink() ||
+      !after.isFile() ||
+      after.nlink !== 1n ||
+      opened.nlink !== 1n ||
+      !opened.isFile() ||
+      opened.ino === 0n ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino
+    ) {
+      throw sqliteParticipantError();
+    }
+    return {
+      path: participant.path,
+      descriptor,
+      device: opened.dev,
+      inode: opened.ino,
+    };
+  } catch (error: unknown) {
+    const primaryError =
+      error instanceof Error && error.message === sqliteParticipantError().message
+        ? error
+        : sqliteParticipantError();
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch (cleanupError: unknown) {
+        attachChallengeCleanupDiagnostics(primaryError, [cleanupError]);
+      }
+    }
+    throw primaryError;
   }
 }
 
-function tableCount(path: string, table: string): number {
-  const database = new DatabaseSync(path, { readOnly: true });
-  try {
-    const row = database.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as
-      | Record<string, unknown>
-      | undefined;
-    const count = row?.["count"];
-    if (!Number.isSafeInteger(count) || (count as number) < 0) {
-      throw new Error(`Invalid challenge evidence count for ${table}`);
+function acquireNewSQLiteParticipants(
+  definitions: readonly SQLiteParticipant[],
+  tracked: Map<string, SQLiteParticipantIdentity | null>,
+  identities: SQLiteParticipantIdentity[],
+  scenario: string,
+): void {
+  for (const participant of definitions) {
+    const identity = tracked.get(participant.path);
+    if (identity === undefined) throw sqliteParticipantError();
+    if (identity === null) {
+      const acquired = acquireSQLiteParticipant(participant, scenario);
+      tracked.set(participant.path, acquired);
+      if (acquired !== null) identities.push(acquired);
+    } else {
+      verifySQLiteParticipant(identity, scenario);
     }
-    return count as number;
-  } finally {
-    database.close();
   }
 }
 
-function filteredCount(path: string, table: string, predicate: string): number {
-  const database = new DatabaseSync(path, { readOnly: true });
-  try {
-    const row = database
-      .prepare(`SELECT COUNT(*) AS count FROM "${table}" WHERE ${predicate}`)
-      .get() as Record<string, unknown> | undefined;
-    const count = row?.["count"];
-    if (!Number.isSafeInteger(count) || (count as number) < 0) {
-      throw new Error(`Invalid challenge evidence count for ${table}`);
+function verifySQLiteParticipants(
+  definitions: readonly SQLiteParticipant[],
+  tracked: ReadonlyMap<string, SQLiteParticipantIdentity | null>,
+  scenario: string,
+): void {
+  for (const participant of definitions) {
+    const identity = tracked.get(participant.path);
+    if (identity === undefined) throw sqliteParticipantError();
+    if (identity === null) {
+      if (sqliteParticipantStat(participant.path) !== null) throw sqliteParticipantError();
+    } else {
+      verifySQLiteParticipant(identity, scenario);
     }
-    return count as number;
-  } finally {
-    database.close();
   }
+}
+
+function verifySQLiteParticipant(
+  identity: SQLiteParticipantIdentity,
+  scenario: string,
+): void {
+  try {
+    const pathStat = sqliteParticipantStat(identity.path);
+    const descriptorStat = fstatSync(identity.descriptor, { bigint: true });
+    if (
+      pathStat === null ||
+      pathStat.isSymbolicLink() ||
+      !pathStat.isFile() ||
+      pathStat.nlink !== 1n ||
+      !descriptorStat.isFile() ||
+      descriptorStat.nlink !== 1n ||
+      dirname(identity.path) !== scenario ||
+      !hasAuthorizedSQLiteParticipantPath(identity.path) ||
+      pathStat.dev !== identity.device ||
+      pathStat.ino !== identity.inode ||
+      descriptorStat.dev !== identity.device ||
+      descriptorStat.ino !== identity.inode
+    ) {
+      throw sqliteParticipantError();
+    }
+  } catch {
+    throw sqliteParticipantError();
+  }
+}
+
+function sqliteParticipantStat(path: string): BigIntStats | null {
+  try {
+    return lstatSync(path, { bigint: true });
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw sqliteParticipantError();
+  }
+}
+
+function hasAuthorizedSQLiteParticipantPath(path: string): boolean {
+  try {
+    return realpathSync(path) === path;
+  } catch {
+    return false;
+  }
+}
+
+function sqliteParticipantError(): Error {
+  return new Error(
+    "Challenge evidence requires every file to be an owned regular non-symbolic-link single-link SQLite participant with stable identity",
+  );
+}
+
+function attachChallengeCleanupDiagnostics(
+  primaryError: unknown,
+  cleanupErrors: readonly unknown[],
+): void {
+  if (
+    cleanupErrors.length === 0 ||
+    ((typeof primaryError !== "object" || primaryError === null) &&
+      typeof primaryError !== "function")
+  ) {
+    return;
+  }
+  try {
+    const existing = Reflect.get(primaryError, "cleanupErrors");
+    Object.defineProperty(primaryError, "cleanupErrors", {
+      configurable: true,
+      enumerable: false,
+      value: Object.freeze([
+        ...(Array.isArray(existing) ? existing : []),
+        ...cleanupErrors,
+      ]),
+      writable: false,
+    });
+  } catch {
+    // The authoritative provenance failure remains primary.
+  }
+}
+
+function databaseSnapshot(database: DatabaseSync): Readonly<Record<string, readonly unknown[]>> {
+  const tables = (
+    database
+      .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+      .all() as Record<string, unknown>[]
+  ).map((row) => String(row["name"]));
+  return Object.fromEntries(
+    tables.map((table) => [
+      table,
+      (database.prepare(`SELECT * FROM "${table}"`).all() as Record<string, unknown>[])
+        .map((row) =>
+          Object.fromEntries(
+            Object.entries(row).sort(([left], [right]) => compareStableStrings(left, right)),
+          ),
+        )
+        .sort((left, right) =>
+          compareStableStrings(canonicalSerialize(left), canonicalSerialize(right)),
+        ),
+    ]),
+  );
+}
+
+function tableCount(database: DatabaseSync, table: string): number {
+  const row = database.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as
+    | Record<string, unknown>
+    | undefined;
+  const count = row?.["count"];
+  if (!Number.isSafeInteger(count) || (count as number) < 0) {
+    throw new Error(`Invalid challenge evidence count for ${table}`);
+  }
+  return count as number;
+}
+
+function filteredCount(database: DatabaseSync, table: string, predicate: string): number {
+  const row = database
+    .prepare(`SELECT COUNT(*) AS count FROM "${table}" WHERE ${predicate}`)
+    .get() as Record<string, unknown> | undefined;
+  const count = row?.["count"];
+  if (!Number.isSafeInteger(count) || (count as number) < 0) {
+    throw new Error(`Invalid challenge evidence count for ${table}`);
+  }
+  return count as number;
 }
 
 function publicEvidence(evidence: CompleteEvidence): ChallengeEvidence {

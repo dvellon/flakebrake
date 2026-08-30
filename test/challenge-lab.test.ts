@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -10,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 import {
@@ -164,4 +169,141 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  test("durable replay rejects foreign SQLite participants before evidence use", async (context) => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-challenge-provenance-"));
+    const coordinator = new M5DemoCoordinator({
+      dataRoot: directory,
+      cleanupDataOnClose: false,
+    });
+    try {
+      const result = await runAdversarialChallengeLab(directory);
+      const scenario = join(directory, "challenge-lab-v1", "01-identity");
+      const m2 = join(scenario, "m2.sqlite");
+      const factory = join(scenario, "factory.sqlite");
+
+      for (const [label, primary] of [
+        ["M2", m2],
+        ["factory", factory],
+      ] as const) {
+        await context.test(`hardlinked ${label} primary is rejected without effects`, () => {
+          const foreign = join(directory, `foreign-${label.toLowerCase()}.sqlite`);
+          renameSync(primary, foreign);
+          linkSync(foreign, primary);
+          try {
+            assertProvenanceRejectionLeavesSourcesUnchanged(
+              directory,
+              primary,
+              foreign,
+              () => readAdversarialChallengeLab(directory),
+            );
+          } finally {
+            rmSync(primary, { force: true });
+            renameSync(foreign, primary);
+          }
+        });
+      }
+
+      for (const suffix of ["-wal", "-shm"] as const) {
+        for (const linkKind of ["symbolic", "hard"] as const) {
+          await context.test(`${linkKind} ${suffix.slice(1)} sidecar is rejected without effects`, () => {
+            const participant = `${m2}${suffix}`;
+            const ownedParticipant = `${participant}.owned`;
+            const foreign = join(directory, `foreign-m2.sqlite${suffix}-${linkKind}`);
+            const hadOwnedParticipant = existsSync(participant);
+            if (hadOwnedParticipant) renameSync(participant, ownedParticipant);
+            writeFileSync(foreign, `foreign ${suffix} participant\n`, { mode: 0o600 });
+            if (linkKind === "symbolic") symlinkSync(foreign, participant);
+            else linkSync(foreign, participant);
+            try {
+              assertProvenanceRejectionLeavesSourcesUnchanged(
+                directory,
+                participant,
+                foreign,
+                () => readAdversarialChallengeLab(directory),
+              );
+            } finally {
+              rmSync(participant, { force: true });
+              rmSync(foreign, { force: true });
+              if (hadOwnedParticipant) renameSync(ownedParticipant, participant);
+            }
+          });
+        }
+      }
+
+      await context.test("legitimate owned primary, WAL, and SHM participants remain accepted", () => {
+        const databases = [new DatabaseSync(m2), new DatabaseSync(factory)];
+        try {
+          for (const database of databases) {
+            database.prepare("SELECT name FROM sqlite_schema ORDER BY name LIMIT 1").get();
+          }
+          for (const primary of [m2, factory]) {
+            assert.equal(existsSync(`${primary}-wal`), true);
+            assert.equal(existsSync(`${primary}-shm`), true);
+          }
+          assert.equal(
+            canonicalSerialize(readAdversarialChallengeLab(directory)),
+            canonicalSerialize(result),
+          );
+        } finally {
+          for (const database of databases.reverse()) database.close();
+        }
+      });
+    } finally {
+      await coordinator.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
+
+function assertProvenanceRejectionLeavesSourcesUnchanged(
+  directory: string,
+  participant: string,
+  foreign: string,
+  action: () => unknown,
+): void {
+  const challengeBefore = challengeDurableSourceSnapshot(directory);
+  const participantBefore = participantSnapshot(participant);
+  const foreignBefore = participantSnapshot(foreign);
+  assert.throws(action, /single-link SQLite participant/u);
+  assert.equal(challengeDurableSourceSnapshot(directory), challengeBefore);
+  assert.equal(participantSnapshot(participant), participantBefore);
+  assert.equal(participantSnapshot(foreign), foreignBefore);
+}
+
+function participantSnapshot(path: string): string {
+  const stat = lstatSync(path, { bigint: true });
+  return canonicalSerialize({
+    bytes: stat.isSymbolicLink() ? null : readFileSync(path).toString("base64"),
+    device: stat.dev.toString(),
+    inode: stat.ino.toString(),
+    kind: stat.isSymbolicLink() ? "symbolic-link" : stat.isFile() ? "regular-file" : "other",
+    links: stat.nlink.toString(),
+    mode: stat.mode.toString(),
+    size: stat.size.toString(),
+    target: stat.isSymbolicLink() ? readlinkSync(path) : null,
+  });
+}
+
+function challengeDurableSourceSnapshot(directory: string): string {
+  const root = join(directory, "challenge-lab-v1");
+  const paths = [
+    ["result", join(root, "challenge-result.json")],
+    ...[
+      "01-identity",
+      "02-stale-basis",
+      "03-attempt-conflict",
+      "04-forged-receipt",
+      "05-alternate-denial",
+      "06-valid-replay",
+    ].flatMap((scenario) => [
+      [`${scenario}/m2`, join(root, scenario, "m2.sqlite")],
+      [`${scenario}/factory`, join(root, scenario, "factory.sqlite")],
+    ]),
+  ] as const;
+  return canonicalSerialize(
+    Object.fromEntries(
+      paths.map(([label, path]) => [label, readFileSync(path).toString("base64")]),
+    ),
+  );
+}
