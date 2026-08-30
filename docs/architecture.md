@@ -109,11 +109,14 @@ re-executes the mission or reopens an approval.
 The optional Challenge FlakeBrake route is isolated from the hero databases.
 It allocates six fixed child stores under the already marked M5 data root and
 accepts no caller paths. Consequential cases enter the existing M2 claim,
-terminal-verification, or in-memory MCP change-control boundaries. A result is
-projected only after a complete canonical snapshot of every table in both
-stores is captured before and after. Durable lab replay revalidates those
-snapshots before displaying the prior result; missing, changed, symlinked, or
-unmarked evidence fails closed.
+terminal-verification, or in-memory MCP change-control boundaries. Evidence is
+read only from connections opened when each scenario's stores are created and
+held for the scenario's lifetime; every snapshot pins one read transaction per
+database before any row is read, and all counts derive from that same row set.
+The completed run persists a canonical, scenario-bound evidence representation
+beside the result. Durable lab replay consumes that representation alone and
+never reopens the scenario databases; tampering, missing bindings, mixed
+snapshots, or malformed records fail closed.
 
 ## Hero authorization sequence
 

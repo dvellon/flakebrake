@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
+  copyFileSync,
   existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readlinkSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -18,11 +19,51 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
 
 import {
+  ChallengeEvidenceSession,
   readAdversarialChallengeLab,
   runAdversarialChallengeLab,
 } from "../src/challenge-lab.js";
 import { canonicalSerialize } from "../src/canonical.js";
+import { SyntheticFactoryEnvironment } from "../src/factory-environment.js";
+import {
+  HERO_HORIZON_END,
+  HERO_HORIZON_START,
+  createHeroInitialState,
+} from "../src/hero-fixture.js";
 import { M5DemoCoordinator } from "../src/m5-ui.js";
+import { createStore } from "../src/store.js";
+
+interface MutableChallengeEvidenceBundle {
+  schemaVersion: string;
+  missionId: string;
+  labSessionId: string;
+  resultDigest: string;
+  scenarios: {
+    scenarioId: string;
+    directory: string;
+    databases: {
+      m2: { storeKind: string; incarnationId: string };
+      factory: { storeKind: string; incarnationId: string };
+    };
+    counts: Record<string, number>;
+    terminal: { reservationEventKinds: string[]; verifiedTerminalEvents: number };
+    snapshot: { m2: Record<string, unknown[]>; factory: Record<string, unknown[]> };
+    snapshotDigest: string;
+  }[];
+}
+
+interface MutableChallengeResult {
+  omitted: string[];
+  challenges: {
+    title: string;
+    before: { counts: Record<string, number>; snapshotDigest: string };
+    after: { counts: Record<string, number>; snapshotDigest: string };
+  }[];
+}
+
+function sha256OfBytes(bytes: string): string {
+  return `sha256:${createHash("sha256").update(bytes, "utf8").digest("hex")}`;
+}
 
 describe("deterministic adversarial challenge lab", { concurrency: false }, () => {
   test("all required challenges use real controls and prove exact zero-effect boundaries", async () => {
@@ -95,37 +136,45 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
       assert.equal(replay?.before.counts.terminalEvents, 1);
       assert.equal(replay?.before.counts.actualFacts, 2);
 
+      const expected = canonicalSerialize(result);
       const durableReplay = readAdversarialChallengeLab(directory);
-      assert.equal(canonicalSerialize(durableReplay), canonicalSerialize(result));
+      assert.equal(canonicalSerialize(durableReplay), expected);
       assert.equal(
         canonicalSerialize(await runAdversarialChallengeLab(directory)),
-        canonicalSerialize(result),
+        expected,
       );
 
+      // Restart replay consumes the persisted canonical representation, so
+      // rename-and-restore substitution of the source databases can no longer
+      // affect the evidence: replay returns the original result unchanged.
       const challengeRoot = join(directory, "challenge-lab-v1");
       const identityRoot = join(challengeRoot, "01-identity");
       const m2Path = join(identityRoot, "m2.sqlite");
-      const copiedM2Path = join(identityRoot, "m2-copy.sqlite");
-      renameSync(m2Path, copiedM2Path);
+      const asidePath = join(identityRoot, "m2-aside.sqlite");
+
+      renameSync(m2Path, asidePath);
       try {
-        symlinkSync(copiedM2Path, m2Path);
-        assert.throws(
-          () => readAdversarialChallengeLab(directory),
-          /regular non-symbolic-link file/u,
-        );
+        symlinkSync(asidePath, m2Path);
+        assertReplayReturnsOriginal(directory, expected);
       } finally {
         rmSync(m2Path, { force: true });
-        renameSync(copiedM2Path, m2Path);
+        renameSync(asidePath, m2Path);
+      }
+
+      renameSync(m2Path, asidePath);
+      try {
+        copyFileSync(join(identityRoot, "factory.sqlite"), m2Path);
+        assertReplayReturnsOriginal(directory, expected);
+      } finally {
+        rmSync(m2Path, { force: true });
+        renameSync(asidePath, m2Path);
       }
 
       const copiedIdentityRoot = join(challengeRoot, "01-identity-copy");
       renameSync(identityRoot, copiedIdentityRoot);
       try {
         symlinkSync(copiedIdentityRoot, identityRoot, "dir");
-        assert.throws(
-          () => readAdversarialChallengeLab(directory),
-          /scenario directory must not be a symbolic link/u,
-        );
+        assertReplayReturnsOriginal(directory, expected);
       } finally {
         rmSync(identityRoot, { force: true });
         renameSync(copiedIdentityRoot, identityRoot);
@@ -170,7 +219,7 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
     }
   });
 
-  test("durable replay rejects foreign SQLite participants before evidence use", async (context) => {
+  test("restart replay consumes the canonical representation and never rereads source databases", async (context) => {
     const directory = mkdtempSync(join(tmpdir(), "flakebrake-challenge-provenance-"));
     const coordinator = new M5DemoCoordinator({
       dataRoot: directory,
@@ -178,25 +227,26 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
     });
     try {
       const result = await runAdversarialChallengeLab(directory);
-      const scenario = join(directory, "challenge-lab-v1", "01-identity");
+      const expected = canonicalSerialize(result);
+      const challengeRoot = join(directory, "challenge-lab-v1");
+      const scenario = join(challengeRoot, "01-identity");
       const m2 = join(scenario, "m2.sqlite");
       const factory = join(scenario, "factory.sqlite");
+      const evidencePath = join(challengeRoot, "challenge-evidence.json");
+      const resultPath = join(challengeRoot, "challenge-result.json");
+      const originalEvidenceBytes = readFileSync(evidencePath, "utf8");
+      const originalResultBytes = readFileSync(resultPath, "utf8");
 
       for (const [label, primary] of [
         ["M2", m2],
         ["factory", factory],
       ] as const) {
-        await context.test(`hardlinked ${label} primary is rejected without effects`, () => {
+        await context.test(`hardlinked ${label} primary cannot affect replay`, () => {
           const foreign = join(directory, `foreign-${label.toLowerCase()}.sqlite`);
           renameSync(primary, foreign);
           linkSync(foreign, primary);
           try {
-            assertProvenanceRejectionLeavesSourcesUnchanged(
-              directory,
-              primary,
-              foreign,
-              () => readAdversarialChallengeLab(directory),
-            );
+            assertReplayReturnsOriginal(directory, expected);
           } finally {
             rmSync(primary, { force: true });
             renameSync(foreign, primary);
@@ -206,7 +256,7 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
 
       for (const suffix of ["-wal", "-shm"] as const) {
         for (const linkKind of ["symbolic", "hard"] as const) {
-          await context.test(`${linkKind} ${suffix.slice(1)} sidecar is rejected without effects`, () => {
+          await context.test(`${linkKind} ${suffix.slice(1)} sidecar cannot affect replay`, () => {
             const participant = `${m2}${suffix}`;
             const ownedParticipant = `${participant}.owned`;
             const foreign = join(directory, `foreign-m2.sqlite${suffix}-${linkKind}`);
@@ -216,12 +266,7 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
             if (linkKind === "symbolic") symlinkSync(foreign, participant);
             else linkSync(foreign, participant);
             try {
-              assertProvenanceRejectionLeavesSourcesUnchanged(
-                directory,
-                participant,
-                foreign,
-                () => readAdversarialChallengeLab(directory),
-              );
+              assertReplayReturnsOriginal(directory, expected);
             } finally {
               rmSync(participant, { force: true });
               rmSync(foreign, { force: true });
@@ -231,7 +276,17 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
         }
       }
 
-      await context.test("legitimate owned primary, WAL, and SHM participants remain accepted", () => {
+      await context.test("a fully removed scenario directory cannot affect replay", () => {
+        const aside = join(challengeRoot, "01-identity-removed");
+        renameSync(scenario, aside);
+        try {
+          assertReplayReturnsOriginal(directory, expected);
+        } finally {
+          renameSync(aside, scenario);
+        }
+      });
+
+      await context.test("live owned WAL and SHM sidecars cannot affect replay", () => {
         const databases = [new DatabaseSync(m2), new DatabaseSync(factory)];
         try {
           for (const database of databases) {
@@ -241,54 +296,569 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
             assert.equal(existsSync(`${primary}-wal`), true);
             assert.equal(existsSync(`${primary}-shm`), true);
           }
-          assert.equal(
-            canonicalSerialize(readAdversarialChallengeLab(directory)),
-            canonicalSerialize(result),
-          );
+          assertReplayReturnsOriginal(directory, expected);
         } finally {
           for (const database of databases.reverse()) database.close();
         }
+      });
+
+      await context.test("tampering with the representation or its bindings fails closed", () => {
+        const readBundle = (): MutableChallengeEvidenceBundle =>
+          JSON.parse(readFileSync(evidencePath, "utf8")) as MutableChallengeEvidenceBundle;
+        const restore = (): void => {
+          rmSync(evidencePath, { force: true });
+          writeFileSync(evidencePath, originalEvidenceBytes, "utf8");
+          rmSync(resultPath, { force: true });
+          writeFileSync(resultPath, originalResultBytes, "utf8");
+        };
+
+        // Missing representation.
+        renameSync(evidencePath, `${evidencePath}.aside`);
+        try {
+          assert.throws(
+            () => readAdversarialChallengeLab(directory),
+            /challenge lab evidence representation is missing/u,
+          );
+        } finally {
+          renameSync(`${evidencePath}.aside`, evidencePath);
+        }
+
+        // Symbolic-link representation.
+        renameSync(evidencePath, `${evidencePath}.aside`);
+        try {
+          symlinkSync(`${evidencePath}.aside`, evidencePath);
+          assert.throws(
+            () => readAdversarialChallengeLab(directory),
+            /evidence representation must not be a symbolic link/u,
+          );
+        } finally {
+          rmSync(evidencePath, { force: true });
+          renameSync(`${evidencePath}.aside`, evidencePath);
+        }
+
+        // Non-canonical bytes.
+        writeFileSync(evidencePath, `${originalEvidenceBytes} `, "utf8");
+        try {
+          assert.throws(
+            () => readAdversarialChallengeLab(directory),
+            /durable challenge evidence representation is invalid/u,
+          );
+        } finally {
+          restore();
+        }
+
+        // Reordered scenario records are malformed.
+        {
+          const bundle = readBundle();
+          const [first, second] = [bundle.scenarios[0], bundle.scenarios[1]];
+          assert.ok(first !== undefined && second !== undefined);
+          bundle.scenarios[0] = second;
+          bundle.scenarios[1] = first;
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /durable challenge evidence representation is invalid/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // Mixed snapshots: one scenario's snapshot paired with another's record.
+        {
+          const bundle = readBundle();
+          const [first, second] = [bundle.scenarios[0], bundle.scenarios[1]];
+          assert.ok(first !== undefined && second !== undefined);
+          const swapped = first.snapshot;
+          first.snapshot = second.snapshot;
+          second.snapshot = swapped;
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /internally inconsistent/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // Tampered durable counts.
+        {
+          const bundle = readBundle();
+          const first = bundle.scenarios[0];
+          assert.ok(first !== undefined);
+          first.counts["admissions"] = (first.counts["admissions"] ?? 0) + 1;
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /internally inconsistent/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // Tampered database-identity binding.
+        {
+          const bundle = readBundle();
+          const first = bundle.scenarios[0];
+          assert.ok(first !== undefined);
+          first.databases.m2.incarnationId =
+            "database-incarnation/00000000-0000-0000-0000-000000000000";
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /internally inconsistent/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // A canonically rewritten result no longer binds to the representation.
+        {
+          const tamperedResult = JSON.parse(originalResultBytes) as MutableChallengeResult;
+          const first = tamperedResult.challenges[0];
+          assert.ok(first !== undefined);
+          first.title = `${first.title} (tampered)`;
+          writeFileSync(resultPath, canonicalSerialize(tamperedResult), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /does not bind to the durable challenge result/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // Mixed before/after evidence fails even when both files are
+        // regenerated consistently around it.
+        {
+          const tamperedResult = JSON.parse(originalResultBytes) as MutableChallengeResult;
+          const first = tamperedResult.challenges[0];
+          assert.ok(first !== undefined);
+          first.before = {
+            ...first.before,
+            snapshotDigest: `sha256:${"0".repeat(64)}`,
+          };
+          const tamperedResultBytes = canonicalSerialize(tamperedResult);
+          const bundle = readBundle();
+          bundle.resultDigest = sha256OfBytes(tamperedResultBytes);
+          writeFileSync(resultPath, tamperedResultBytes, "utf8");
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /does not bind to the durable challenge result/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // A result whose recorded evidence digest no longer matches the
+        // bundle scenario fails the after-to-scenario binding even when
+        // before and after are kept equal and both files are regenerated.
+        {
+          const tamperedResult = JSON.parse(originalResultBytes) as MutableChallengeResult;
+          const first = tamperedResult.challenges[0];
+          assert.ok(first !== undefined);
+          const forged = `sha256:${"1".repeat(64)}`;
+          first.before = { ...first.before, snapshotDigest: forged };
+          first.after = { ...first.after, snapshotDigest: forged };
+          const tamperedResultBytes = canonicalSerialize(tamperedResult);
+          const bundle = readBundle();
+          bundle.resultDigest = sha256OfBytes(tamperedResultBytes);
+          writeFileSync(resultPath, tamperedResultBytes, "utf8");
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /does not bind to the durable challenge result/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // The same holds for the counts binding when before and after agree.
+        {
+          const tamperedResult = JSON.parse(originalResultBytes) as MutableChallengeResult;
+          const first = tamperedResult.challenges[0];
+          assert.ok(first !== undefined);
+          const forgedCounts = {
+            ...first.after.counts,
+            admissions: (first.after.counts["admissions"] ?? 0) + 1,
+          };
+          first.before = { ...first.before, counts: { ...forgedCounts } };
+          first.after = { ...first.after, counts: { ...forgedCounts } };
+          const tamperedResultBytes = canonicalSerialize(tamperedResult);
+          const bundle = readBundle();
+          bundle.resultDigest = sha256OfBytes(tamperedResultBytes);
+          writeFileSync(resultPath, tamperedResultBytes, "utf8");
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /does not bind to the durable challenge result/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // A tampered snapshot row value with a stale digest fails the
+        // content-digest recomputation even though every count still matches.
+        {
+          const bundle = readBundle();
+          const first = bundle.scenarios[0];
+          assert.ok(first !== undefined);
+          const grants = first.snapshot.m2["grants"];
+          assert.ok(Array.isArray(grants) && grants.length === 1);
+          const row = grants[0] as Record<string, unknown>;
+          row["body_json"] = JSON.stringify({ forged: true });
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /internally inconsistent/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // A tampered terminal-state binding fails its recomputation.
+        {
+          const bundle = readBundle();
+          const first = bundle.scenarios[0];
+          assert.ok(first !== undefined);
+          first.terminal.verifiedTerminalEvents += 1;
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /internally inconsistent/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // Forged omissions and injected extra keys are rejected by the strict
+        // result schema even when the bundle digest is regenerated to match.
+        {
+          const tamperedResult = JSON.parse(originalResultBytes) as MutableChallengeResult;
+          tamperedResult.omitted = ["scenario-07 was omitted for capacity reasons"];
+          const tamperedResultBytes = canonicalSerialize(tamperedResult);
+          const bundle = readBundle();
+          bundle.resultDigest = sha256OfBytes(tamperedResultBytes);
+          writeFileSync(resultPath, tamperedResultBytes, "utf8");
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /durable challenge result is invalid/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+        {
+          const tamperedResult = JSON.parse(originalResultBytes) as Record<string, unknown>;
+          tamperedResult["zzInjectedNarrative"] = { forged: true };
+          const tamperedResultBytes = canonicalSerialize(tamperedResult);
+          const bundle = readBundle();
+          bundle.resultDigest = sha256OfBytes(tamperedResultBytes);
+          writeFileSync(resultPath, tamperedResultBytes, "utf8");
+          writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /durable challenge result is invalid/u,
+            );
+          } finally {
+            restore();
+          }
+        }
+
+        // The read path's own entry guards fail closed: a corrupted ownership
+        // marker, a missing result, and a symlinked result are each rejected.
+        {
+          const marker = join(challengeRoot, ".flakebrake-challenge-owned-v1");
+          writeFileSync(marker, "invalid\n");
+          try {
+            assert.throws(
+              () => readAdversarialChallengeLab(directory),
+              /challenge-lab ownership marker is invalid/u,
+            );
+          } finally {
+            writeFileSync(marker, "flakebrake-adversarial-challenge/v1\n");
+          }
+        }
+        renameSync(resultPath, `${resultPath}.aside`);
+        try {
+          assert.throws(
+            () => readAdversarialChallengeLab(directory),
+            /challenge lab has incomplete durable state/u,
+          );
+        } finally {
+          renameSync(`${resultPath}.aside`, resultPath);
+        }
+        renameSync(resultPath, `${resultPath}.aside`);
+        try {
+          symlinkSync(`${resultPath}.aside`, resultPath);
+          assert.throws(
+            () => readAdversarialChallengeLab(directory),
+            /challenge result must not be a symbolic link/u,
+          );
+        } finally {
+          rmSync(resultPath, { force: true });
+          renameSync(`${resultPath}.aside`, resultPath);
+        }
+
+        // The intact representation still replays after every restoration.
+        assertReplayReturnsOriginal(directory, expected);
       });
     } finally {
       await coordinator.close();
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  test("in-run evidence reads only the connections established at scenario creation", () => {
+    const fixture = fabricateOwnedChallengeScenario("flakebrake-challenge-session-");
+    try {
+      const substitute = join(fixture.directory, "substitute.sqlite");
+      createStore({
+        path: substitute,
+        initialState: createHeroInitialState(),
+        now: () => HERO_HORIZON_START,
+      }).close();
+      const substituteReader = new DatabaseSync(substitute, { readOnly: true });
+      let substituteIncarnation: unknown;
+      try {
+        substituteIncarnation = (
+          substituteReader
+            .prepare("SELECT incarnation_id FROM database_incarnation WHERE singleton = 1")
+            .get() as Record<string, unknown>
+        )["incarnation_id"];
+      } finally {
+        substituteReader.close();
+      }
+
+      const session = ChallengeEvidenceSession.open({ m2: fixture.m2, factory: fixture.factory });
+      try {
+        const baseline = session.snapshot();
+
+        // Rename-and-restore substitution at the primary pathname. A pathname
+        // reopen would consume the substituted database; the held session
+        // keeps reading the connections established at creation.
+        assert.notEqual(substituteIncarnation, session.bindings.m2.incarnationId);
+        const aside = `${fixture.m2}.aside`;
+        renameSync(fixture.m2, aside);
+        copyFileSync(substitute, fixture.m2);
+        try {
+          const during = session.snapshot();
+          assert.equal(during.snapshotDigest, baseline.snapshotDigest);
+        } finally {
+          rmSync(fixture.m2, { force: true });
+          renameSync(aside, fixture.m2);
+        }
+        const restored = session.snapshot();
+        assert.equal(restored.snapshotDigest, baseline.snapshotDigest);
+
+        // A commit that lands in either database after the snapshot
+        // transactions are pinned is invisible to that snapshot and visible
+        // to the next one, so rows and counts can never mix database states.
+        const pinnedView = session.snapshot({
+          onSnapshotsPinned: () => {
+            const m2Writer = new DatabaseSync(fixture.m2);
+            try {
+              m2Writer.exec(
+                "INSERT INTO denials (denial_id, created_at, body_json) VALUES ('denial/challenge-pinned-proof', '2026-08-26T09:10:00.000Z', '{}')",
+              );
+            } finally {
+              m2Writer.close();
+            }
+            const factoryWriter = new DatabaseSync(fixture.factory);
+            try {
+              factoryWriter.exec(
+                "INSERT INTO incoming_proposals (proposal_id, body_json) VALUES ('proposal/challenge-pinned-proof', '{}')",
+              );
+            } finally {
+              factoryWriter.close();
+            }
+          },
+        });
+        assert.equal(pinnedView.snapshotDigest, baseline.snapshotDigest);
+        assert.equal(
+          canonicalSerialize(pinnedView.content.factory),
+          canonicalSerialize(baseline.content.factory),
+        );
+        const fresh = session.snapshot();
+        assert.notEqual(fresh.snapshotDigest, baseline.snapshotDigest);
+        assert.notEqual(
+          canonicalSerialize(fresh.content.factory),
+          canonicalSerialize(baseline.content.factory),
+        );
+      } finally {
+        session.close();
+      }
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("evidence admission rejects symlinked and multi-link files at scenario creation", () => {
+    const fixture = fabricateOwnedChallengeScenario("flakebrake-challenge-admission-");
+    const paths = { m2: fixture.m2, factory: fixture.factory };
+    try {
+      const aside = `${fixture.m2}.aside`;
+      renameSync(fixture.m2, aside);
+      try {
+        symlinkSync(aside, fixture.m2);
+        assert.throws(
+          () => ChallengeEvidenceSession.open(paths),
+          /single-link SQLite participant/u,
+        );
+      } finally {
+        rmSync(fixture.m2, { force: true });
+        renameSync(aside, fixture.m2);
+      }
+
+      const hardlink = join(fixture.directory, "hardlinked-m2.sqlite");
+      linkSync(fixture.m2, hardlink);
+      try {
+        assert.throws(
+          () => ChallengeEvidenceSession.open(paths),
+          /single-link SQLite participant/u,
+        );
+      } finally {
+        rmSync(hardlink, { force: true });
+      }
+
+      const foreignWal = join(fixture.directory, "foreign-wal");
+      writeFileSync(foreignWal, "foreign wal\n", { mode: 0o600 });
+      symlinkSync(foreignWal, `${fixture.m2}-wal`);
+      try {
+        assert.throws(
+          () => ChallengeEvidenceSession.open(paths),
+          /single-link SQLite participant/u,
+        );
+      } finally {
+        rmSync(`${fixture.m2}-wal`, { force: true });
+        rmSync(foreignWal, { force: true });
+      }
+
+      const foreignShm = join(fixture.directory, "foreign-shm");
+      writeFileSync(foreignShm, "foreign shm\n", { mode: 0o600 });
+      linkSync(foreignShm, `${fixture.factory}-shm`);
+      try {
+        assert.throws(
+          () => ChallengeEvidenceSession.open(paths),
+          /single-link SQLite participant/u,
+        );
+      } finally {
+        rmSync(`${fixture.factory}-shm`, { force: true });
+        rmSync(foreignShm, { force: true });
+      }
+
+      const scenarioAside = `${fixture.scenario}-aside`;
+      renameSync(fixture.scenario, scenarioAside);
+      try {
+        symlinkSync(scenarioAside, fixture.scenario, "dir");
+        assert.throws(
+          () => ChallengeEvidenceSession.open(paths),
+          /single-link SQLite participant/u,
+        );
+      } finally {
+        rmSync(fixture.scenario, { force: true });
+        renameSync(scenarioAside, fixture.scenario);
+      }
+
+      // Positive control: legitimately owned primaries with live WAL and SHM
+      // sidecars, exactly as during real scenario creation, are admitted.
+      const databases = [new DatabaseSync(fixture.m2), new DatabaseSync(fixture.factory)];
+      try {
+        for (const database of databases) {
+          database.prepare("SELECT name FROM sqlite_schema ORDER BY name LIMIT 1").get();
+        }
+        for (const primary of [fixture.m2, fixture.factory]) {
+          assert.equal(existsSync(`${primary}-wal`), true);
+          assert.equal(existsSync(`${primary}-shm`), true);
+        }
+        const session = ChallengeEvidenceSession.open(paths);
+        try {
+          assert.match(session.snapshot().snapshotDigest, /^sha256:[0-9a-f]{64}$/u);
+        } finally {
+          session.close();
+        }
+      } finally {
+        for (const database of databases.reverse()) database.close();
+      }
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test("valid roots reached through symlinked ancestors produce and replay evidence", async () => {
+    const realParent = mkdtempSync(join(tmpdir(), "flakebrake-challenge-realroot-"));
+    const linkParent = mkdtempSync(join(tmpdir(), "flakebrake-challenge-linkroot-"));
+    try {
+      const realRoot = join(realParent, "data");
+      mkdirSync(realRoot, { mode: 0o700 });
+      writeFileSync(
+        join(realRoot, ".flakebrake-m5-owned-v1"),
+        "flakebrake-m5-judge-state/v1\n",
+        { mode: 0o600 },
+      );
+      const alias = join(linkParent, "alias");
+      symlinkSync(realParent, alias, "dir");
+      const aliasedRoot = join(alias, "data");
+
+      const result = await runAdversarialChallengeLab(aliasedRoot);
+      assert.equal(result.complete, true);
+      assert.equal(result.allPassed, true);
+      const expected = canonicalSerialize(result);
+      assert.equal(canonicalSerialize(readAdversarialChallengeLab(aliasedRoot)), expected);
+      assert.equal(canonicalSerialize(readAdversarialChallengeLab(realRoot)), expected);
+      assert.equal(
+        canonicalSerialize(await runAdversarialChallengeLab(realRoot)),
+        expected,
+      );
+
+      // A symbolic link at the data root's own final entry stays rejected;
+      // only aliased ancestors are canonicalized.
+      const rootAlias = join(linkParent, "root-alias");
+      symlinkSync(realRoot, rootAlias, "dir");
+      assert.throws(
+        () => readAdversarialChallengeLab(rootAlias),
+        /Challenge data root must be a real directory/u,
+      );
+    } finally {
+      rmSync(linkParent, { recursive: true, force: true });
+      rmSync(realParent, { recursive: true, force: true });
+    }
+  });
 });
 
-function assertProvenanceRejectionLeavesSourcesUnchanged(
-  directory: string,
-  participant: string,
-  foreign: string,
-  action: () => unknown,
-): void {
-  const challengeBefore = challengeDurableSourceSnapshot(directory);
-  const participantBefore = participantSnapshot(participant);
-  const foreignBefore = participantSnapshot(foreign);
-  assert.throws(action, /single-link SQLite participant/u);
-  assert.equal(challengeDurableSourceSnapshot(directory), challengeBefore);
-  assert.equal(participantSnapshot(participant), participantBefore);
-  assert.equal(participantSnapshot(foreign), foreignBefore);
-}
-
-function participantSnapshot(path: string): string {
-  const stat = lstatSync(path, { bigint: true });
-  return canonicalSerialize({
-    bytes: stat.isSymbolicLink() ? null : readFileSync(path).toString("base64"),
-    device: stat.dev.toString(),
-    inode: stat.ino.toString(),
-    kind: stat.isSymbolicLink() ? "symbolic-link" : stat.isFile() ? "regular-file" : "other",
-    links: stat.nlink.toString(),
-    mode: stat.mode.toString(),
-    size: stat.size.toString(),
-    target: stat.isSymbolicLink() ? readlinkSync(path) : null,
-  });
+function assertReplayReturnsOriginal(directory: string, expected: string): void {
+  const sourcesBefore = challengeDurableSourceSnapshot(directory);
+  assert.equal(canonicalSerialize(readAdversarialChallengeLab(directory)), expected);
+  assert.equal(challengeDurableSourceSnapshot(directory), sourcesBefore);
 }
 
 function challengeDurableSourceSnapshot(directory: string): string {
   const root = join(directory, "challenge-lab-v1");
   const paths = [
     ["result", join(root, "challenge-result.json")],
+    ["evidence", join(root, "challenge-evidence.json")],
     ...[
       "01-identity",
       "02-stale-basis",
@@ -303,7 +873,44 @@ function challengeDurableSourceSnapshot(directory: string): string {
   ] as const;
   return canonicalSerialize(
     Object.fromEntries(
-      paths.map(([label, path]) => [label, readFileSync(path).toString("base64")]),
+      paths.map(([label, path]) => [
+        label,
+        existsSync(path) && !lstatSync(path).isSymbolicLink()
+          ? readFileSync(path).toString("base64")
+          : null,
+      ]),
     ),
   );
+}
+
+function fabricateOwnedChallengeScenario(prefix: string): {
+  readonly directory: string;
+  readonly scenario: string;
+  readonly m2: string;
+  readonly factory: string;
+} {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  writeFileSync(
+    join(directory, ".flakebrake-m5-owned-v1"),
+    "flakebrake-m5-judge-state/v1\n",
+    { mode: 0o600 },
+  );
+  const challengeRoot = join(directory, "challenge-lab-v1");
+  mkdirSync(challengeRoot, { mode: 0o700 });
+  writeFileSync(
+    join(challengeRoot, ".flakebrake-challenge-owned-v1"),
+    "flakebrake-adversarial-challenge/v1\n",
+    { mode: 0o600 },
+  );
+  const scenario = join(challengeRoot, "01-identity");
+  mkdirSync(scenario, { mode: 0o700 });
+  const m2 = join(scenario, "m2.sqlite");
+  const factory = join(scenario, "factory.sqlite");
+  createStore({
+    path: m2,
+    initialState: createHeroInitialState(),
+    now: () => HERO_HORIZON_START,
+  }).close();
+  new SyntheticFactoryEnvironment({ path: factory, now: () => HERO_HORIZON_END }).close();
+  return { directory, scenario, m2, factory };
 }
