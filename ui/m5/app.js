@@ -19,7 +19,8 @@ const nodes = Object.fromEntries(
     "chain-sandbox", "chain-pause", "chain-resume", "chain-verified", "guided-heading",
     "guided-what", "guided-why", "guided-mechanical", "guided-next", "guided-number-display",
     "guided-number-protected", "guided-number-mutations", "guided-number-mutations-note",
-    "trust-recheck", "trust-empty", "trust-rows", "trust-technical-list", "toast",
+    "trust-recheck", "trust-empty", "trust-rows", "trust-technical-list",
+    "evidence-bundle", "evidence-download", "toast",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -767,6 +768,11 @@ function renderExecution() {
   nodes["readback-note"].textContent = result.independentReadBackObserved
     ? `Independent read-back verified ${formatFriendlyInterval(result.approvedInterval)} before terminal completion.`
     : "Independent read-back has not yet occurred.";
+  const evidenceReady = state.run.status === "verified" && verified && result.receiptCount === 1;
+  if (nodes["evidence-bundle"] && nodes["evidence-download"]) {
+    nodes["evidence-bundle"].hidden = !evidenceReady;
+    nodes["evidence-download"].setAttribute?.("aria-disabled", String(!evidenceReady));
+  }
 }
 
 function showError(message) {
@@ -797,6 +803,11 @@ nodes["deny-button"].addEventListener("click", () => {
   if (!state?.pendingApproval) return;
   nodes["approval-title"].focus?.({ preventScroll: true });
   void mutate("/api/approval", { missionId: state.pendingApproval.missionId, actionIdentity: state.pendingApproval.actionIdentity, decision: "deny", reason: "The primary interval conflicts with protected production commitments", requestId: requestId("deny") });
+});
+nodes["evidence-download"]?.addEventListener("click", (event) => {
+  if (nodes["evidence-download"].getAttribute("aria-disabled") === "true") {
+    event.preventDefault();
+  }
 });
 
 void refresh();

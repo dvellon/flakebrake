@@ -38,6 +38,11 @@ import {
 } from "./hero-fixture.js";
 import { evaluateAdmission } from "./kernel.js";
 import {
+  createMissionEvidenceDatabaseLifecycle,
+  exportMissionEvidenceBundleWithLifecycle,
+  isMissionEvidenceReadyWithLifecycle,
+} from "./mission-evidence.js";
+import {
   m4OwnerDecisionResponse,
   type M4ApprovalRecord,
   type M4MissionCheckpoint,
@@ -70,6 +75,15 @@ const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_RECORDS = 256;
 const HERO_ATTEMPT_ID = "attempt/m4-approved-alternative";
 const DEFAULT_REQUEST_DRAIN_TIMEOUT_MS = 500;
+const INTERNAL_EVIDENCE_LIFECYCLE = Symbol("M5 evidence database lifecycle");
+
+type MissionEvidenceDatabaseLifecycle = ReturnType<
+  typeof createMissionEvidenceDatabaseLifecycle
+>;
+
+type InternalEvidenceLifecycleOptions = {
+  readonly [INTERNAL_EVIDENCE_LIFECYCLE]?: MissionEvidenceDatabaseLifecycle;
+};
 
 export type M5RunStatus =
   | "idle"
@@ -312,6 +326,7 @@ export class M5DemoCoordinator {
   readonly #dataRoot: string;
   readonly #cleanupDataOnClose: boolean;
   readonly #paths: DemoPaths;
+  readonly #evidenceLifecycle: MissionEvidenceDatabaseLifecycle;
   readonly #decisionHistory = new Map<string, RecordedDecision>();
   readonly #observedApprovals: M4ApprovalRecord[] = [];
   readonly #runtimeEvidence: {
@@ -341,6 +356,9 @@ export class M5DemoCoordinator {
     }
     this.#dataRoot = resolve(options.dataRoot);
     this.#cleanupDataOnClose = options.cleanupDataOnClose ?? true;
+    this.#evidenceLifecycle = (
+      options as M5DemoCoordinatorOptions & InternalEvidenceLifecycleOptions
+    )[INTERNAL_EVIDENCE_LIFECYCLE] ?? createMissionEvidenceDatabaseLifecycle();
     this.#paths = {
       m2: join(this.#dataRoot, "m2.sqlite"),
       factory: join(this.#dataRoot, "factory.sqlite"),
@@ -817,6 +835,29 @@ export class M5DemoCoordinator {
     }
   }
 
+  /** Canonical completed-mission evidence projected through read-only handles. */
+  public evidenceBundle(): string {
+    this.#assertOpen();
+    const options = {
+      missionId: M4_HERO_MISSION_ID,
+      m2DatabasePath: this.#paths.m2,
+      factoryDatabasePath: this.#paths.factory,
+      missionDatabasePath: this.#paths.mission,
+      trueforgeDatabasePath: this.#paths.trueforge,
+    } as const;
+    if (!isMissionEvidenceReadyWithLifecycle(options, this.#evidenceLifecycle)) {
+      throw new M5RequestError(
+        409,
+        "evidence_not_ready",
+        "Canonical mission evidence is available only after durable verification completes",
+      );
+    }
+    return exportMissionEvidenceBundleWithLifecycle(
+      options,
+      this.#evidenceLifecycle,
+    );
+  }
+
   public async close(): Promise<void> {
     if (this.#closed) return;
     this.#closing = true;
@@ -831,6 +872,7 @@ export class M5DemoCoordinator {
       );
     }
     await this.#runPromise;
+    this.#evidenceLifecycle.close();
     this.#status = "closed";
     this.#closed = true;
     if (this.#cleanupDataOnClose) cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths);
@@ -1265,6 +1307,11 @@ export async function startM5JudgeServer(
       sendJson(response, 200, coordinator.state());
       return;
     }
+    if (url.pathname === "/api/evidence") {
+      requireMethod(request, "GET");
+      sendMissionEvidence(response, coordinator.evidenceBundle());
+      return;
+    }
     if (url.pathname === "/api/mission") {
       requireMethod(request, "POST");
       const body = await readJsonObject(request);
@@ -1418,6 +1465,18 @@ export async function startM5JudgeServer(
       return closing;
     },
   };
+}
+
+/** @internal Deterministic lifecycle injection for cleanup-boundary tests. */
+export function startM5JudgeServerWithEvidenceLifecycle(
+  options: StartM5JudgeServerOptions,
+  lifecycle: MissionEvidenceDatabaseLifecycle,
+): Promise<RunningM5JudgeServer> {
+  const internalOptions = {
+    ...options,
+    [INTERNAL_EVIDENCE_LIFECYCLE]: lifecycle,
+  } as StartM5JudgeServerOptions & InternalEvidenceLifecycleOptions;
+  return startM5JudgeServer(internalOptions);
 }
 
 async function closeServer(
@@ -2127,6 +2186,16 @@ function sendJson(response: ServerResponse, statusCode: number, value: unknown):
   const body = canonicalSerialize(value);
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+function sendMissionEvidence(response: ServerResponse, body: string): void {
+  if (response.headersSent) return;
+  response.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Disposition": 'attachment; filename="flakebrake-mission-evidence.json"',
     "Content-Length": Buffer.byteLength(body),
   });
   response.end(body);

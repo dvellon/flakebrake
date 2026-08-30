@@ -18,6 +18,7 @@ import {
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 import { createContext, runInContext } from "node:vm";
 
@@ -29,6 +30,8 @@ import {
   type RunningM5JudgeServer,
 } from "../src/index.js";
 import { parseM5CliArguments } from "../src/m5-cli.js";
+import { createMissionEvidenceDatabaseLifecycle } from "../src/mission-evidence.js";
+import { startM5JudgeServerWithEvidenceLifecycle } from "../src/m5-ui.js";
 import {
   armSessionErrorCapture,
   armSessionNetworkCapture,
@@ -817,6 +820,90 @@ interface MarkerSeamLike {
   readonly renameSync: (from: string, to: string) => void;
   readonly rmSync: (path: string, options?: { readonly force?: boolean }) => void;
 }
+
+describe("PR16 integration: evidence availability follows the guided truth", () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-integration-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const evidenceHidden = (harness: Awaited<ReturnType<typeof createPollingHarness>>): boolean =>
+    harness.evaluate<boolean>("document.getElementById('evidence-bundle').hidden === true");
+
+  test("a failed run after a committed mutation stays truthful and never exposes a verified bundle", async () => {
+    const failedAfterMutation: M5JudgeState = {
+      ...idle,
+      revision: 3,
+      run: { ...idle.run, status: "failed", canStart: true },
+      execution: {
+        ...idle.execution,
+        mutationCount: 1,
+        receiptCount: 1,
+        mutationStatus: "committed",
+      },
+    };
+    const harness = await createPollingHarness(failedAfterMutation, []);
+    assert.equal(harness.text("guided-heading"), "The change is recorded—but it is not verified yet");
+    assert.equal(evidenceHidden(harness), true, "no evidence download is offered without verified completion");
+  });
+
+  test("the verified terminal shows the plain story and the evidence download together", async () => {
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const verified: M5JudgeState = {
+      ...verifiedBase,
+      execution: {
+        ...verifiedBase.execution,
+        independentReadBackObserved: true,
+        receiptCount: 1,
+      },
+    };
+    const harness = await createPollingHarness(verified, []);
+    assert.equal(harness.text("guided-heading"), "Done—and independently verified");
+    assert.equal(evidenceHidden(harness), false, "the canonical bundle download accompanies the verified story");
+    // The aria-disabled="false" state of the download control is asserted in
+    // the real-browser smoke; the vm harness observes the hidden gate.
+    const stale = deferred<unknown>();
+    harness.enqueue(stale.promise);
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    stale.resolve(uiProjection(idle, 2, "awaiting_approval"));
+    await oldPoll;
+    assert.equal(harness.text("guided-heading"), "Done—and independently verified");
+    assert.equal(
+      evidenceHidden(harness),
+      false,
+      "a stale cross-generation poll cannot revoke the verified story or its evidence download",
+    );
+  });
+
+  test("a non-verified terminal claim state cannot enable the evidence download", async () => {
+    const reconciled: M5JudgeState = {
+      ...uiProjection(idle, 7, "verified"),
+      execution: {
+        ...idle.execution,
+        mutationCount: 1,
+        receiptCount: 1,
+        independentReadBackObserved: true,
+        terminalStatus: "terminal_reconciled",
+        terminalEventCount: 1,
+      },
+    };
+    const harness = await createPollingHarness(reconciled, []);
+    assert.equal(
+      evidenceHidden(harness),
+      true,
+      "only the exact terminal_verified discriminant offers the canonical bundle",
+    );
+  });
+});
 
 describe("Qodo PR16 Round 5: collision-safe temporaries and the platform durability contract", () => {
   const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
@@ -3319,6 +3406,38 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(refreshed.run.ownerCallsThisProcess, 4);
   });
 
+  test("integration: the guided verified terminal and the evidence bundle describe the same mission", async () => {
+    const response = await fetch(`${running.url}/api/evidence`);
+    assert.equal(response.status, 200, "the canonical evidence bundle downloads only at the verified terminal");
+    assert.match(response.headers.get("content-disposition") ?? "", /flakebrake-mission-evidence\.json/u);
+    const bundle = (await response.json()) as {
+      readonly payloadDigest: string;
+      readonly payload: {
+        readonly mission: { readonly missionId: string; readonly trueforgeSessionId: string };
+        readonly ownerApprovalBindings: readonly unknown[];
+        readonly counts: Record<string, number>;
+      };
+    };
+    assert.equal(bundle.payload.mission.missionId, terminal.mission.missionId);
+    assert.equal(bundle.payload.mission.trueforgeSessionId, terminal.mission.sessionId);
+    assert.equal(bundle.payload.counts["factoryMutations"], terminal.execution.mutationCount);
+    assert.equal(bundle.payload.counts["mutationReceipts"], terminal.execution.receiptCount);
+    assert.equal(bundle.payload.counts["terminalEvents"], terminal.execution.terminalEventCount);
+    assert.equal(
+      bundle.payload.ownerApprovalBindings.length,
+      terminal.approvals.length,
+      "every gated bridge decision in the guided projection appears in the bundle",
+    );
+    assert.equal(bundle.payload.counts["mechanicalDenials"], terminal.safety.mechanicalDenialCount);
+    assert.equal(bundle.payload.counts["trueforgeSubagentThreads"], terminal.activity.subagents.length);
+    assert.match(bundle.payloadDigest, /^sha256:[0-9a-f]{64}$/u);
+    assert.equal(
+      terminal.agentTrust.checks.some((row) => row.kind === "execution" && row.result === "verified"),
+      true,
+      "the guided trust projection and the downloadable evidence agree on verified completion",
+    );
+  });
+
   test("HTTP control boundary rejects origin, method, content type, and malformed JSON", async () => {
     const wrongOrigin = await fetch(`${running.url}/api/mission`, {
       method: "POST",
@@ -3408,10 +3527,123 @@ describe("M5 judge UI", { concurrency: false }, () => {
   });
 });
 
+test("M5 evidence readiness/export failures retain cleanup until service shutdown", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-evidence-lifecycle-"));
+  const owned = new Set<DatabaseSync>();
+  const closeAttempts = new Map<string, number>();
+  let failOnceKey: string | null = null;
+  const lifecycle = createMissionEvidenceDatabaseLifecycle((request, openDefault) => {
+    const database = openDefault();
+    let wrapper!: DatabaseSync;
+    wrapper = new Proxy(database, {
+      get(target, property) {
+        if (property === "close") {
+          return (): void => {
+            closeAttempts.set(request.key, (closeAttempts.get(request.key) ?? 0) + 1);
+            if (failOnceKey === request.key) {
+              failOnceKey = null;
+              throw new Error(`injected ${request.key} close failure`);
+            }
+            target.close();
+            owned.delete(wrapper);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as DatabaseSync;
+    owned.add(wrapper);
+    return wrapper;
+  });
+  const running = await startM5JudgeServerWithEvidenceLifecycle(
+    { dataRoot: directory, port: 0, cleanupDataOnClose: false },
+    lifecycle,
+  );
+  try {
+    await completeHeroMission(running, "lifecycle");
+
+    // The readiness projection owns mission+M2. Its failed mission close must
+    // make the HTTP request fail safely and stay reachable by the service owner.
+    failOnceKey = "mission";
+    const readinessFailure = await fetch(`${running.url}/api/evidence`);
+    assert.equal(readinessFailure.status, 500);
+    assert.deepEqual(await readinessFailure.json(), {
+      error: "internal_error",
+      message: "The request failed safely",
+    });
+    assert.equal(lifecycle.snapshot().ownedHandleCount, 1);
+    assert.equal(lifecycle.verifyCleanup(null).status, "cleanup_incomplete");
+    assert.equal(owned.size, 1);
+
+    // A later safe request drains only the failed callback before opening a new
+    // readiness/export scope, then returns the canonical evidence successfully.
+    const retry = await fetch(`${running.url}/api/evidence`);
+    assert.equal(retry.status, 200);
+    assert.match(retry.headers.get("content-type") ?? "", /application\/json/u);
+    assert.equal(lifecycle.snapshot().ownedHandleCount, 0);
+    assert.equal(lifecycle.verifyCleanup(null).status, "verified_clean");
+    assert.equal(owned.size, 0);
+
+    // Fail the final TrueForge close in the real four-database export. The
+    // request cannot report success; service close owns and drains the retry.
+    failOnceKey = "trueforge";
+    const exportFailure = await fetch(`${running.url}/api/evidence`);
+    assert.equal(exportFailure.status, 500);
+    assert.equal(lifecycle.snapshot().ownedHandleCount, 1);
+    assert.equal(lifecycle.verifyCleanup(null).status, "cleanup_incomplete");
+    assert.equal(owned.size, 1);
+    await running.close();
+    assert.deepEqual(lifecycle.snapshot(), {
+      activeOperationCount: 0,
+      retainedOperationCount: 0,
+      ownedHandleCount: 0,
+      closed: true,
+    });
+    assert.equal(lifecycle.verifyCleanup(null).status, "verified_clean");
+    assert.equal(owned.size, 0);
+    assert.ok((closeAttempts.get("mission") ?? 0) >= 2);
+    assert.ok((closeAttempts.get("trueforge") ?? 0) >= 2);
+  } finally {
+    failOnceKey = null;
+    await running.close().catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 async function getState(running: RunningM5JudgeServer): Promise<M5JudgeState> {
   const response = await fetch(`${running.url}/api/state`);
   assert.equal(response.status, 200);
   return (await response.json()) as M5JudgeState;
+}
+
+async function completeHeroMission(
+  running: RunningM5JudgeServer,
+  requestPrefix: string,
+): Promise<M5JudgeState> {
+  await postJson(running, "/api/mission", {
+    operation: "start",
+    requestId: `${requestPrefix}-start-0001`,
+  });
+  for (let decision = 1; decision <= 4; decision += 1) {
+    const current = await waitForState(
+      running,
+      (state) => state.pendingApproval !== null || isTerminal(state),
+    );
+    if (isTerminal(current)) return current;
+    const pending = current.pendingApproval;
+    assert.ok(pending);
+    await postJson(running, "/api/approval", {
+      missionId: pending.missionId,
+      actionIdentity: pending.actionIdentity,
+      decision: pending.recommendedDecision,
+      reason:
+        pending.recommendedDecision === "deny"
+          ? "The primary interval conflicts with protected production commitments"
+          : null,
+      requestId: `${requestPrefix}-approval-${String(decision).padStart(4, "0")}`,
+    });
+  }
+  return waitForState(running, isTerminal);
 }
 
 async function postJson(
