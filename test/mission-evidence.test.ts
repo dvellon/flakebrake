@@ -3,10 +3,13 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -535,33 +538,38 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
   });
 
   test("failed read-only database opens release every acquired handle", () => {
-    const corruptRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-corrupt-"));
-    const corruptOptions: MissionEvidenceBuildOptions = {
-      ...options,
-      m2DatabasePath: join(corruptRoot, "m2.sqlite"),
-      factoryDatabasePath: join(corruptRoot, "factory.sqlite"),
-      missionDatabasePath: join(corruptRoot, "mission.sqlite"),
-      trueforgeDatabasePath: join(corruptRoot, "trueforge.sqlite"),
+    exerciseRejectedOpenCleanup(options, canonicalBytes, tryOpenDescriptorCount);
+  });
+
+  test("descriptor probe preserves exact evidence when procfs is available", () => {
+    const target = "/portable/example.sqlite";
+    const count = tryOpenDescriptorCount(target, {
+      readdir: () => ["10", "11", "12"],
+      readlink: (path) =>
+        path.endsWith("/10") || path.endsWith("/12")
+          ? target
+          : "/portable/different.sqlite",
+    });
+    assert.equal(count, 2);
+  });
+
+  test("failed-open cleanup remains meaningful without procfs", () => {
+    let unavailableProbeCalls = 0;
+    const unavailableCount = (path: string): number | null => {
+      unavailableProbeCalls += 1;
+      return tryOpenDescriptorCount(path, {
+        readdir: () => {
+          const error = new Error("simulated unavailable procfs");
+          Object.assign(error, { code: "ENOENT" });
+          throw error;
+        },
+        readlink: () => {
+          throw new Error("readlink must not run without procfs enumeration");
+        },
+      });
     };
-    try {
-      copyFileSync(options.m2DatabasePath, corruptOptions.m2DatabasePath);
-      copyFileSync(options.factoryDatabasePath, corruptOptions.factoryDatabasePath);
-      copyFileSync(
-        options.trueforgeDatabasePath,
-        corruptOptions.trueforgeDatabasePath,
-      );
-      writeFileSync(corruptOptions.missionDatabasePath, "not a SQLite database", "utf8");
-      for (let attempt = 0; attempt < 16; attempt += 1) {
-        assert.throws(
-          () => exportMissionEvidenceBundle(corruptOptions),
-          /(?:could not open mission database read-only|file is not a database)/u,
-        );
-      }
-      assert.equal(openDescriptorCount(corruptOptions.m2DatabasePath), 0);
-      assert.equal(openDescriptorCount(corruptOptions.missionDatabasePath), 0);
-    } finally {
-      rmSync(corruptRoot, { recursive: true, force: true });
-    }
+    exerciseRejectedOpenCleanup(options, canonicalBytes, unavailableCount);
+    assert.ok(unavailableProbeCalls > 0);
   });
 
   test("concurrent read-only HTTP downloads return one canonical bundle", async () => {
@@ -752,14 +760,113 @@ function requiredItem<T>(values: readonly T[], index: number, label: string): T 
   return value;
 }
 
-function openDescriptorCount(path: string): number {
-  return readdirSync("/proc/self/fd").filter((descriptor) => {
+interface ProcfsDescriptorReader {
+  readonly readdir: (path: string) => readonly string[];
+  readonly readlink: (path: string) => string;
+}
+
+function tryOpenDescriptorCount(
+  path: string,
+  reader: ProcfsDescriptorReader = {
+    readdir: (directory) => readdirSync(directory),
+    readlink: (descriptor) => readlinkSync(descriptor),
+  },
+): number | null {
+  let descriptors: readonly string[];
+  try {
+    descriptors = reader.readdir("/proc/self/fd");
+  } catch {
+    return null;
+  }
+  return descriptors.filter((descriptor) => {
     try {
-      return readlinkSync(join("/proc/self/fd", descriptor)) === path;
+      return reader.readlink(join("/proc/self/fd", descriptor)) === path;
     } catch {
       return false;
     }
   }).length;
+}
+
+function exerciseRejectedOpenCleanup(
+  source: MissionEvidenceBuildOptions,
+  expectedBundle: string,
+  descriptorCount: (path: string) => number | null,
+): void {
+  const probeRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-cleanup-"));
+  try {
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      const cycleRoot = join(probeRoot, `cycle-${cycle}`);
+      mkdirSync(cycleRoot);
+      const probe: MissionEvidenceBuildOptions = {
+        ...source,
+        m2DatabasePath: join(cycleRoot, "m2.sqlite"),
+        factoryDatabasePath: join(cycleRoot, "factory.sqlite"),
+        missionDatabasePath: join(cycleRoot, "mission.sqlite"),
+        trueforgeDatabasePath: join(cycleRoot, "trueforge.sqlite"),
+      };
+      copyFileSync(source.m2DatabasePath, probe.m2DatabasePath);
+      copyFileSync(source.factoryDatabasePath, probe.factoryDatabasePath);
+      copyFileSync(source.trueforgeDatabasePath, probe.trueforgeDatabasePath);
+      writeFileSync(probe.missionDatabasePath, "not a SQLite database", "utf8");
+
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        assert.throws(
+          () => exportMissionEvidenceBundle(probe),
+          /(?:could not open mission database read-only|file is not a database)/u,
+        );
+      }
+      assertExactDescriptorCountWhenAvailable(probe.m2DatabasePath, descriptorCount);
+      assertExactDescriptorCountWhenAvailable(
+        probe.missionDatabasePath,
+        descriptorCount,
+      );
+
+      const movedM2Path = join(cycleRoot, "m2.ownership-probe.sqlite");
+      renameSync(probe.m2DatabasePath, movedM2Path);
+      renameSync(movedM2Path, probe.m2DatabasePath);
+      rmSync(probe.missionDatabasePath);
+      copyFileSync(source.missionDatabasePath, probe.missionDatabasePath);
+
+      assert.throws(
+        () => exportMissionEvidenceBundle(probe),
+        /database instance identities conflict/u,
+      );
+      for (const path of databasePaths(probe)) {
+        assertExactDescriptorCountWhenAvailable(path, descriptorCount);
+        const reopened = new DatabaseSync(path, { readOnly: true });
+        try {
+          const row = reopened.prepare("SELECT 1 AS ready").get();
+          assert.equal(row?.["ready"], 1);
+        } finally {
+          reopened.close();
+        }
+        assertExactDescriptorCountWhenAvailable(path, descriptorCount);
+      }
+      assert.equal(exportMissionEvidenceBundle(source), expectedBundle);
+
+      rmSync(cycleRoot, { recursive: true });
+      assert.equal(existsSync(cycleRoot), false);
+    }
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
+function assertExactDescriptorCountWhenAvailable(
+  path: string,
+  descriptorCount: (path: string) => number | null,
+): void {
+  const count = descriptorCount(path);
+  if (count !== null) assert.equal(count, 0, `open descriptor leaked for ${path}`);
+}
+
+function databasePaths(paths: MissionEvidenceBuildOptions): readonly string[] {
+  return [
+    paths.m2DatabasePath,
+    paths.factoryDatabasePath,
+    paths.missionDatabasePath,
+    paths.trueforgeDatabasePath,
+  ];
 }
 
 function durableSnapshot(
