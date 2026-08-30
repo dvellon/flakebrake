@@ -7,15 +7,22 @@ import { Builder, By, until, type WebDriver } from "selenium-webdriver";
 import firefox from "selenium-webdriver/firefox.js";
 
 import { startRecoveryDemoServer } from "../src/recovery-demo-ui.js";
+import {
+  createRecoveryBrowserCleanup,
+  finishRecoveryBrowserSmoke,
+} from "./recovery-demo-browser-lifecycle.js";
 
-const directory = mkdtempSync(join(tmpdir(), "flakebrake-recovery-browser-"));
-const running = await startRecoveryDemoServer({
-  dataRoot: directory,
-  port: 4177,
-  cleanupDataOnClose: false,
-});
+let directory: string | null = null;
+let running: Awaited<ReturnType<typeof startRecoveryDemoServer>> | null = null;
 let browser: WebDriver | null = null;
+let primaryError: unknown | null = null;
 try {
+  directory = mkdtempSync(join(tmpdir(), "flakebrake-recovery-browser-"));
+  running = await startRecoveryDemoServer({
+    dataRoot: directory,
+    port: 4177,
+    cleanupDataOnClose: false,
+  });
   const options = new firefox.Options().addArguments("-headless");
   const explicitFirefox = process.env["FLAKEBRAKE_FIREFOX_BINARY"];
   const localSnapFirefox = "/snap/firefox/current/usr/lib/firefox/firefox";
@@ -46,12 +53,41 @@ try {
     "return window.__recoveryDemoErrors || [];",
   );
   assert.deepEqual(errors, []);
-  process.stdout.write("Recovery demonstration browser smoke passed on port 4177.\n");
-} finally {
-  await browser?.quit();
-  await running.close();
-  rmSync(directory, { recursive: true, force: true });
+} catch (error: unknown) {
+  primaryError = error;
 }
+
+const cleanup = createRecoveryBrowserCleanup([
+  {
+    name: "browser",
+    run: async () => {
+      await browser?.quit();
+      browser = null;
+      if (process.env["FLAKEBRAKE_RECOVERY_INJECT_DRIVER_QUIT_FAILURE"] === "1") {
+        throw new Error("injected Recovery Selenium shutdown failure");
+      }
+    },
+  },
+  {
+    name: "server",
+    run: async () => {
+      await running?.close();
+      running = null;
+      if (process.env["FLAKEBRAKE_RECOVERY_INJECT_SERVER_CLOSE_FAILURE"] === "1") {
+        throw new Error("injected Recovery server shutdown failure");
+      }
+    },
+  },
+  {
+    name: "directory",
+    run: () => {
+      if (directory !== null) rmSync(directory, { recursive: true, force: true });
+      directory = null;
+    },
+  },
+]);
+await finishRecoveryBrowserSmoke(primaryError, cleanup);
+process.stdout.write("Recovery demonstration browser smoke passed on port 4177.\n");
 
 async function exercise(
   browser: WebDriver,

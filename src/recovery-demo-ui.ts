@@ -17,7 +17,7 @@ import {
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { canonicalSerialize } from "./canonical.js";
+import { canonicalClone, canonicalSerialize, deepFreeze } from "./canonical.js";
 import {
   inspectRecoveryDemo,
   interruptRecoveryDemonstration,
@@ -33,6 +33,7 @@ import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const RECOVERY_STATE_SCHEMA = "flakebrake-recovery-demo-state/v1";
+const RECOVERY_SCENARIO_ID = "deterministic_exact_once_recovery";
 const OWNERSHIP_MARKER = ".flakebrake-recovery-demo-owned-v1";
 const MAX_BODY_BYTES = 8 * 1024;
 
@@ -48,6 +49,9 @@ export type RecoveryDemoStage =
 export interface RecoveryDemoState {
   readonly schemaVersion: typeof RECOVERY_STATE_SCHEMA;
   readonly mode: "recovery_demonstration";
+  readonly scenarioId: typeof RECOVERY_SCENARIO_ID;
+  readonly runId: string;
+  readonly restartGeneration: number;
   readonly revision: number;
   readonly stage: RecoveryDemoStage;
   readonly boundary: RecoveryDemoBoundary | null;
@@ -96,6 +100,8 @@ export class RecoveryDemoCoordinator {
   readonly #cleanupDataOnClose: boolean;
   readonly #paths: RecoveryDemoPaths;
   readonly #timeline: RecoveryDemoState["timeline"][number][] = [];
+  #runId = recoveryRunId();
+  #restartGeneration = 0;
   #revision = 0;
   #stage: RecoveryDemoStage = "idle";
   #boundary: RecoveryDemoBoundary | null = null;
@@ -147,6 +153,7 @@ export class RecoveryDemoCoordinator {
 
   public restart(): RecoveryDemoState {
     this.#requireStage("interrupted");
+    this.#restartGeneration += 1;
     try {
       this.#after = restartRecoveryDemonstration(
         this.#paths,
@@ -224,6 +231,8 @@ export class RecoveryDemoCoordinator {
     }
     removeOwnedDatabaseArtifacts(this.#paths);
     this.#timeline.length = 0;
+    this.#runId = recoveryRunId();
+    this.#restartGeneration = 0;
     this.#stage = "idle";
     this.#boundary = null;
     this.#before = null;
@@ -258,6 +267,9 @@ export class RecoveryDemoCoordinator {
     return {
       schemaVersion: RECOVERY_STATE_SCHEMA,
       mode: "recovery_demonstration",
+      scenarioId: RECOVERY_SCENARIO_ID,
+      runId: this.#runId,
+      restartGeneration: this.#restartGeneration,
       revision: this.#revision,
       stage: this.#stage,
       boundary: this.#boundary,
@@ -352,6 +364,11 @@ export interface RunningRecoveryDemoServer {
   close(): Promise<void>;
 }
 
+interface RecoveryDemoApiResult {
+  readonly replayed: boolean;
+  readonly state: RecoveryDemoState;
+}
+
 export async function startRecoveryDemoServer(
   options: StartRecoveryDemoServerOptions,
 ): Promise<RunningRecoveryDemoServer> {
@@ -364,7 +381,7 @@ export async function startRecoveryDemoServer(
     options.assetRoot ?? fileURLToPath(new URL("../ui/recovery/", import.meta.url));
   const idempotency = new Map<
     string,
-    { readonly digest: string; readonly response: unknown }
+    { readonly digest: string; readonly response: RecoveryDemoApiResult }
   >();
   let origin = "";
   let closePromise: Promise<void> | null = null;
@@ -426,7 +443,7 @@ export async function startRecoveryDemoServer(
         if (prior.digest !== inputDigest) {
           throw new RecoveryDemoRequestError(409, "idempotency_conflict", "Request ID was reused with different input");
         }
-        sendJson(response, 200, { replayed: true, state: coordinator.state() });
+        sendJson(response, 200, { ...prior.response, replayed: true });
         return;
       }
       const state = operation === "interrupt"
@@ -438,7 +455,10 @@ export async function startRecoveryDemoServer(
             : operation === "replay"
               ? coordinator.replay()
               : coordinator.reset();
-      const result = { replayed: false, state };
+      const result = deepFreeze(canonicalClone<RecoveryDemoApiResult>({
+        replayed: false,
+        state,
+      }));
       idempotency.set(requestId, { digest: inputDigest, response: result });
       sendJson(response, 200, result);
       return;
@@ -460,13 +480,15 @@ export async function startRecoveryDemoServer(
       server.listen(port, LOOPBACK_HOST, resolveListen);
     });
   } catch (error: unknown) {
-    coordinator.close();
-    throw error;
+    return await failRecoveryDemoStartup(server, coordinator, error);
   }
   const address = server.address();
   if (address === null || typeof address === "string") {
-    coordinator.close();
-    throw new Error("Recovery demonstration server has no TCP address");
+    return await failRecoveryDemoStartup(
+      server,
+      coordinator,
+      new Error("Recovery demonstration server has no TCP address"),
+    );
   }
   origin = `http://${LOOPBACK_HOST}:${String(address.port)}`;
   return {
@@ -475,22 +497,64 @@ export async function startRecoveryDemoServer(
     coordinator,
     close(): Promise<void> {
       if (closePromise !== null) return closePromise;
-      closePromise = new Promise<void>((resolveClose, rejectClose) => {
-        server.close((error) => {
-          try {
-            coordinator.close();
-          } catch (closeError: unknown) {
-            rejectClose(closeError);
-            return;
-          }
-          if (error === undefined) resolveClose();
-          else rejectClose(error);
-        });
-        server.closeAllConnections();
-      });
+      closePromise = closeRecoveryDemoServer(server, coordinator);
       return closePromise;
     },
   };
+}
+
+async function closeRecoveryDemoServer(
+  server: ReturnType<typeof createServer>,
+  coordinator: RecoveryDemoCoordinator,
+): Promise<void> {
+  const serverClose = new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => {
+      if (error === undefined) resolveClose();
+      else rejectClose(error);
+    });
+    server.closeAllConnections();
+  });
+  const serverResult = await Promise.allSettled([serverClose]);
+  const coordinatorResult = await Promise.allSettled([
+    Promise.resolve().then(() => coordinator.close()),
+  ]);
+  const errors = [...serverResult, ...coordinatorResult]
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason as unknown);
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Recovery demonstration server cleanup failed");
+  }
+}
+
+async function failRecoveryDemoStartup(
+  server: ReturnType<typeof createServer>,
+  coordinator: RecoveryDemoCoordinator,
+  primaryError: unknown,
+): Promise<never> {
+  const cleanupTasks: Promise<void>[] = [
+    Promise.resolve().then(() => coordinator.close()),
+  ];
+  if (server.listening) {
+    cleanupTasks.unshift(new Promise<void>((resolveClose, rejectClose) => {
+      server.close((error) => {
+        if (error === undefined) resolveClose();
+        else rejectClose(error);
+      });
+      server.closeAllConnections();
+    }));
+  }
+  const results = await Promise.allSettled(cleanupTasks);
+  const cleanupErrors = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason as unknown);
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [primaryError, ...cleanupErrors],
+      "Recovery demonstration startup and cleanup failed",
+      { cause: primaryError instanceof Error ? primaryError : undefined },
+    );
+  }
+  throw primaryError;
 }
 
 function establishOwnedDataRoot(dataRoot: string): void {
@@ -660,4 +724,8 @@ function digest(value: unknown): string {
 
 export function recoveryDemoRequestId(operation: string): string {
   return `recovery:${operation}:${randomUUID()}`;
+}
+
+function recoveryRunId(): string {
+  return `recovery-run:${randomUUID()}`;
 }

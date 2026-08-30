@@ -23,8 +23,22 @@ const stageLabels = {
 let state = null;
 let actionInFlight = false;
 let requestSequence = 0;
+let responseGeneration = 1;
+let responseSequence = 0;
+let latestAppliedSequence = 0;
 let lastStage = null;
 let toastTimer = null;
+let poll = null;
+const scenarioId = "deterministic_exact_once_recovery";
+const stageOrder = {
+  idle: 0,
+  interrupted: 1,
+  restarted: 2,
+  verified: 3,
+  replayed: 4,
+  failed: 5,
+  closed: 6,
+};
 
 async function api(path, options = {}) {
   const response = await fetch(path, { cache: "no-store", ...options });
@@ -38,14 +52,17 @@ function requestId(operation) {
   return `recovery:${operation}:${Date.now().toString(36)}:${requestSequence.toString(36)}`;
 }
 
-async function refresh() {
+async function refresh(intent = "poll", boundary = null) {
+  const token = responseToken(intent, boundary);
   try {
     const candidate = await api("/api/recovery");
-    state = candidate;
+    applyState(candidate, token);
+    if (!isCurrentResponse(token)) return;
     nodes["connection-dot"].classList.add("connected");
     nodes["connection-label"].textContent = "Loopback connected";
-    render();
   } catch (error) {
+    if (!isCurrentResponse(token)) return;
+    invalidateResponses();
     nodes["connection-dot"].classList.remove("connected");
     nodes["connection-label"].textContent = "Reconnecting…";
     showError(error instanceof Error ? error.message : "State refresh failed safely");
@@ -59,21 +76,105 @@ async function act(operation) {
   const boundary = operation === "interrupt"
     ? document.querySelector('input[name="boundary"]:checked')?.value ?? null
     : null;
+  invalidateResponses();
+  const token = responseToken(operation, boundary);
   try {
     const result = await api("/api/recovery", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ operation, boundary, requestId: requestId(operation) }),
     });
-    state = result.state;
-    render();
+    applyState(result.state, token);
   } catch (error) {
     showError(error instanceof Error ? error.message : "Action failed safely");
-    await refresh();
+    await refresh(operation, boundary);
   } finally {
     actionInFlight = false;
     render();
   }
+}
+
+function responseToken(intent, boundary = null) {
+  responseSequence += 1;
+  return {
+    generation: responseGeneration,
+    sequence: responseSequence,
+    intent,
+    boundary,
+    sourceRevision: state?.revision ?? null,
+    sourceRunId: state?.runId ?? null,
+    sourceRestartGeneration: state?.restartGeneration ?? null,
+    sourceBoundary: state?.boundary ?? null,
+  };
+}
+
+function invalidateResponses() {
+  responseGeneration += 1;
+  latestAppliedSequence = 0;
+}
+
+function isCurrentResponse(token) {
+  return token.generation === responseGeneration && token.sequence >= latestAppliedSequence;
+}
+
+function validRecoveryState(candidate) {
+  return candidate !== null && typeof candidate === "object" &&
+    candidate.mode === "recovery_demonstration" &&
+    candidate.scenarioId === scenarioId &&
+    typeof candidate.runId === "string" && candidate.runId.length > 0 &&
+    Number.isSafeInteger(candidate.revision) && candidate.revision >= 0 &&
+    Number.isSafeInteger(candidate.restartGeneration) && candidate.restartGeneration >= 0 &&
+    Object.hasOwn(stageOrder, candidate.stage) &&
+    (candidate.boundary === null || [
+      "after_execution_fence_before_factory_mutation",
+      "after_factory_commit_before_m2_binding",
+    ].includes(candidate.boundary));
+}
+
+function tokenMatchesCurrent(token) {
+  return state !== null &&
+    token.sourceRevision === state.revision &&
+    token.sourceRunId === state.runId &&
+    token.sourceRestartGeneration === state.restartGeneration &&
+    token.sourceBoundary === state.boundary;
+}
+
+function applyState(candidate, token) {
+  if (!isCurrentResponse(token) || !validRecoveryState(candidate)) return false;
+  if (state !== null) {
+    const matchesCurrent = tokenMatchesCurrent(token);
+    const explicitReset = token.intent === "reset" && matchesCurrent &&
+      candidate.runId !== state.runId && candidate.boundary === null &&
+      candidate.restartGeneration === 0 && candidate.revision > state.revision;
+    if (candidate.runId !== state.runId) {
+      if (!explicitReset) return false;
+    } else {
+      const explicitInterrupt = token.intent === "interrupt" && matchesCurrent &&
+        state.stage === "idle" && state.boundary === null &&
+        token.boundary === candidate.boundary;
+      if (candidate.boundary !== state.boundary && !explicitInterrupt) return false;
+      if (candidate.restartGeneration < state.restartGeneration) return false;
+      if (candidate.restartGeneration > state.restartGeneration) {
+        const explicitRestart = token.intent === "restart" && matchesCurrent &&
+          candidate.restartGeneration === state.restartGeneration + 1;
+        if (!explicitRestart) return false;
+      }
+      if (candidate.revision < state.revision) return false;
+      if (candidate.revision === state.revision) {
+        latestAppliedSequence = token.sequence;
+        return false;
+      }
+      const currentTerminal = state.stage === "verified" || state.stage === "replayed";
+      const candidateTerminal = candidate.stage === "verified" || candidate.stage === "replayed";
+      if (currentTerminal && !candidateTerminal) return false;
+      if (state.stage === "failed" && candidate.stage !== "failed") return false;
+      if (stageOrder[candidate.stage] < stageOrder[state.stage]) return false;
+    }
+  }
+  latestAppliedSequence = token.sequence;
+  state = candidate;
+  render();
+  return true;
 }
 
 function render() {
@@ -193,6 +294,22 @@ nodes["recover-button"].addEventListener("click", () => void act("recover"));
 nodes["replay-button"].addEventListener("click", () => void act("replay"));
 nodes["reset-button"].addEventListener("click", () => void act("reset"));
 
+function startPolling() {
+  if (poll !== null) window.clearInterval(poll);
+  poll = window.setInterval(() => void refresh(), 500);
+}
+
+function stopPolling() {
+  if (poll === null) return;
+  window.clearInterval(poll);
+  poll = null;
+}
+
 void refresh();
-const poll = window.setInterval(() => void refresh(), 500);
-window.addEventListener("pagehide", () => window.clearInterval(poll));
+startPolling();
+window.addEventListener("pagehide", stopPolling);
+window.addEventListener("pageshow", (event) => {
+  if (event?.persisted !== true) return;
+  startPolling();
+  void refresh();
+});
