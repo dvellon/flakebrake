@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#09100c">
   <title>FlakeBrake — a commitment firewall for humans and agents</title>
-  <meta name="description" content="FlakeBrake is a commitment firewall for humans and agents. TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay before anyone must rely on the claim.">
+  <meta name="description" content="FlakeBrake is a commitment firewall for humans and agents. TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay before anyone relies on the consequential outcome.">
   <meta property="og:type" content="website">
   <meta property="og:title" content="FlakeBrake — a commitment firewall for humans and agents">
   <meta property="og:description" content="TrueForge coordinates the agents; FlakeBrake sits behind the consequential MCP boundaries and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay. Built on TrueForge 0.1.4.">
@@ -173,8 +173,23 @@
         <p class="eyebrow"><span class="idx">03</span>The commitment firewall</p>
         <h2 id="honest-title">How agents keep each other honest</h2>
         <div class="prose">
-          <p>TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect. <strong>FlakeBrake sits behind the consequential MCP boundaries</strong> and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay — before another agent, or a human, must rely on the claim.</p>
-          <p>In the current mission the three specialists investigate and recommend, but only the root agent acts — and the root <strong>rechecks every specialist recommendation through MCP</strong> before acting on it. To be precise about what that means: FlakeBrake doesn't referee arbitrary prose between agents, and it isn't deception detection. Its job is narrower and mechanical — an <em>unsupported, stale, conflicting, duplicated, or unverified</em> consequential claim simply cannot pass the boundary.</p>
+          <p>TrueForge coordinates specialist agents, tool calls, sandbox execution, approval pauses, and reconnect. <strong>FlakeBrake sits behind the consequential MCP boundaries</strong> and checks capacity, authorization, denied-effect equivalence, execution identity, factory results, and replay — before another agent, or a human, relies on the consequential outcome.</p>
+        </div>
+        <div class="pull">Agents can propose anything; they cannot make it true. Every consequential effect must pass current-state checks, authorization, fenced execution, and independent verification.</div>
+        <div class="prose">
+          <p>Specialists recommend. Before a recommendation can become a consequential effect, <strong>the root's change-control call and FlakeBrake's stores independently re-evaluate the exact action against current authoritative state</strong>. Only the root invokes the consequential change-control tools, and in the deterministic fixture the effect arguments are constructed from authoritative SQLite state — raw prose cannot authorize, mutate, verify, or replay an effect. That precision matters, so the firewall's claim comes in two distinct layers:</p>
+        </div>
+        <div class="boundary">
+          <article class="is-rec">
+            <p class="who">Layer 1 · Recorded recommendation</p>
+            <h3>Preserved, not certified</h3>
+            <p>TrueForge keeps each specialist thread and its output in durable history — context the root works from, evidence a judge can read. FlakeBrake makes no claim to understand or certify arbitrary prose, and this isn't deception detection: another agent can consume the authoritative domain outcome, but nothing verifies the semantic truth of a specialist sentence.</p>
+          </article>
+          <article class="is-gov">
+            <p class="who">Layer 2 · Governed effect</p>
+            <h3>Authoritatively enforced</h3>
+            <p>Capacity, authorization, equivalent denial, execution identity, read-back, and replay are enforced against current authoritative M1–M4 state before another agent or human relies on the consequential outcome. An <em>unsupported, stale, conflicting, duplicated, or unverified</em> consequential claim is mechanically unusable.</p>
+          </article>
         </div>
 
         <ul class="checks">

@@ -25,7 +25,10 @@ that proves the one promise it keeps.
 FlakeBrake is a commitment firewall for humans and agents: it sits behind the
 consequential MCP boundaries and checks capacity, authorization, denied-effect
 equivalence, execution identity, factory results, and replay before another
-agent or a human must rely on the claim. A rush order
+agent or a human relies on the consequential outcome. Specialists recommend;
+before a recommendation can become a consequential effect, the root's
+change-control call and FlakeBrake's stores independently re-evaluate the
+exact action against current authoritative state. A rush order
 hits a synthetic microfactory whose protected, important, and best-effort work
 already consumes finite human-review, agent-work, and production-cell capacity.
 Instead of letting the agent say yes, FlakeBrake evaluates the complete

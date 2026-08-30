@@ -363,6 +363,10 @@ h3 { font-size: 1.12rem; font-weight: 800; letter-spacing: -.02em; }
 .boundary .is-policy .who { color: var(--blue); }
 .boundary h3 { font-size: 1.15rem; }
 .boundary p { color: var(--muted); font-size: .93rem; margin: .7rem 0 0; }
+.boundary article.is-rec { border-color: rgb(114 201 255 / 35%); }
+.boundary article.is-rec .who { color: var(--blue); }
+.boundary article.is-gov { border-color: rgb(201 244 91 / 35%); }
+.boundary article.is-gov .who { color: var(--lime); }
 .digest-note {
   margin-top: 2rem; max-width: 60rem; border: 1px dashed var(--line); border-radius: .8rem;
   padding: 1rem 1.2rem; color: var(--muted); font-size: .9rem;
