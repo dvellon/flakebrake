@@ -553,7 +553,7 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     assert.equal(count, 2);
   });
 
-  test("failed-open cleanup remains meaningful without procfs", () => {
+  test("portable reopen and cleanup integration still runs without procfs", () => {
     let unavailableProbeCalls = 0;
     const unavailableCount = (path: string): number | null => {
       unavailableProbeCalls += 1;

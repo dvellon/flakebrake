@@ -13,6 +13,7 @@ import {
   readAuthoritativeFactoryExecution,
 } from "./factory-environment.js";
 import { stableTupleId } from "./identity.js";
+import { withEvidenceHandleOwnership } from "./mission-evidence-lifecycle.js";
 import {
   canonicalDatabasePath,
   databaseInstanceIdentityFromHandle,
@@ -521,34 +522,45 @@ export function isMissionEvidenceReady(
 ): boolean {
   requireText(options.missionId, "missionId");
   if (!existsSync(options.missionDatabasePath)) return false;
-  let mission: DatabaseSync | undefined;
-  let m2: DatabaseSync | undefined;
   try {
-    mission = openReadOnlyDatabase(options.missionDatabasePath, "mission");
-    const missionRow = mission
-      .prepare(
-        `SELECT current_turn_id FROM m4_missions WHERE mission_id = ?`,
-      )
-      .get(options.missionId) as Record<string, unknown> | undefined;
-    if (
-      missionRow === undefined ||
-      typeof missionRow["current_turn_id"] !== "string" ||
-      missionRow["current_turn_id"].length === 0
-    ) {
-      return false;
-    }
-    if (!existsSync(options.m2DatabasePath)) {
-      throw new MissionEvidenceError(
-        "terminal mission binding exists without its durable M2 database",
-      );
-    }
-    m2 = openReadOnlyDatabase(options.m2DatabasePath, "M2");
-    return (
-      countRows(
-        m2,
-        `SELECT COUNT(*) AS count FROM reservation_events
-          WHERE event_kind = 'terminal_verified'`,
-      ) > 0
+    return withEvidenceHandleOwnership(
+      (request) => openReadOnlyDatabase(request.path, request.label),
+      ({ acquire }) => {
+        const mission = acquire({
+          key: "mission",
+          path: options.missionDatabasePath,
+          label: "mission",
+        });
+        const missionRow = mission
+          .prepare(
+            `SELECT current_turn_id FROM m4_missions WHERE mission_id = ?`,
+          )
+          .get(options.missionId) as Record<string, unknown> | undefined;
+        if (
+          missionRow === undefined ||
+          typeof missionRow["current_turn_id"] !== "string" ||
+          missionRow["current_turn_id"].length === 0
+        ) {
+          return false;
+        }
+        if (!existsSync(options.m2DatabasePath)) {
+          throw new MissionEvidenceError(
+            "terminal mission binding exists without its durable M2 database",
+          );
+        }
+        const m2 = acquire({
+          key: "m2",
+          path: options.m2DatabasePath,
+          label: "M2",
+        });
+        return (
+          countRows(
+            m2,
+            `SELECT COUNT(*) AS count FROM reservation_events
+              WHERE event_kind = 'terminal_verified'`,
+          ) > 0
+        );
+      },
     );
   } catch (error: unknown) {
     if (error instanceof MissionEvidenceError) throw error;
@@ -558,12 +570,6 @@ export function isMissionEvidenceReady(
       }`,
       { cause: error },
     );
-  } finally {
-    try {
-      m2?.close();
-    } finally {
-      mission?.close();
-    }
   }
 }
 
@@ -571,15 +577,12 @@ export function buildMissionEvidenceBundle(
   options: MissionEvidenceBuildOptions,
 ): MissionEvidenceBundle {
   validateBuildOptions(options);
-  let m2: DatabaseSync | undefined;
-  let factory: DatabaseSync | undefined;
-  let mission: DatabaseSync | undefined;
-  let trueforge: DatabaseSync | undefined;
-  try {
-    m2 = openReadOnlyDatabase(options.m2DatabasePath, "M2");
-    mission = openReadOnlyDatabase(options.missionDatabasePath, "mission");
-    factory = openReadOnlyDatabase(options.factoryDatabasePath, "factory");
-    trueforge = openReadOnlyDatabase(options.trueforgeDatabasePath, "TrueForge");
+  function projectEvidenceFromHandles(
+    m2: DatabaseSync,
+    mission: DatabaseSync,
+    factory: DatabaseSync,
+    trueforge: DatabaseSync,
+  ): MissionEvidenceBundle {
     const missionRow = requireOneRow(
       mission,
       `SELECT mission_id, environment_id, trueforge_agent_id, trueforge_session_id,
@@ -1097,14 +1100,8 @@ export function buildMissionEvidenceBundle(
           `SELECT COUNT(*) AS count FROM execution_fence_events
              WHERE event_kind = 'factory_result_bound'`,
         ),
-        factoryMutations: countFactoryRows(
-          options.factoryDatabasePath,
-          "mutation_events",
-        ),
-        mutationReceipts: countFactoryRows(
-          options.factoryDatabasePath,
-          "execution_results",
-        ),
+        factoryMutations: countFactoryRows(factory, "mutation_events"),
+        mutationReceipts: countFactoryRows(factory, "execution_results"),
         terminalEvents: countRows(
           m2,
           `SELECT COUNT(*) AS count FROM reservation_events
@@ -1146,26 +1143,41 @@ export function buildMissionEvidenceBundle(
       payloadDigest: sha256(canonicalSerialize(parsedPayload)),
       payload: parsedPayload,
     });
+  }
+
+  try {
+    return withEvidenceHandleOwnership(
+      (request) => openReadOnlyDatabase(request.path, request.label),
+      ({ acquire }) =>
+        projectEvidenceFromHandles(
+          acquire({
+            key: "m2",
+            path: options.m2DatabasePath,
+            label: "M2",
+          }),
+          acquire({
+            key: "mission",
+            path: options.missionDatabasePath,
+            label: "mission",
+          }),
+          acquire({
+            key: "factory",
+            path: options.factoryDatabasePath,
+            label: "factory",
+          }),
+          acquire({
+            key: "trueforge",
+            path: options.trueforgeDatabasePath,
+            label: "TrueForge",
+          }),
+        ),
+    );
   } catch (error: unknown) {
     if (error instanceof MissionEvidenceError) throw error;
     throw new MissionEvidenceError(
       `mission evidence export failed: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
-  } finally {
-    try {
-      trueforge?.close();
-    } finally {
-      try {
-        factory?.close();
-      } finally {
-        try {
-          mission?.close();
-        } finally {
-          m2?.close();
-        }
-      }
-    }
   }
 }
 
@@ -3228,13 +3240,11 @@ function openReadOnlyDatabase(path: string, label: string): DatabaseSync {
   }
 }
 
-function countFactoryRows(path: string, table: "execution_results" | "mutation_events"): number {
-  const database = openReadOnlyDatabase(path, "factory");
-  try {
-    return countRows(database, `SELECT COUNT(*) AS count FROM ${table}`);
-  } finally {
-    database.close();
-  }
+function countFactoryRows(
+  database: DatabaseSync,
+  table: "execution_results" | "mutation_events",
+): number {
+  return countRows(database, `SELECT COUNT(*) AS count FROM ${table}`);
 }
 
 function allRows(
