@@ -23,6 +23,32 @@
     </header>
 
     <main id="main">
+      <section class="harness-ribbon" aria-labelledby="harness-title">
+        <div class="harness-lockup">
+          <span class="harness-mark" aria-hidden="true">TF</span>
+          <div class="harness-name-block">
+            <p id="harness-title" class="harness-name">TrueForge harness</p>
+            <p class="harness-sub">Agent loop owned by the TrueForge server · <span id="harness-provider">Deterministic judge profile</span></p>
+          </div>
+          <span id="harness-state" class="pill pill-neutral harness-state" role="status">Ready</span>
+        </div>
+        <dl class="harness-facts">
+          <div><dt>Session</dt><dd id="harness-session">Not started</dd></div>
+          <div><dt>Turn</dt><dd id="harness-turn">—</dd></div>
+          <div><dt>Runtime</dt><dd id="harness-runtime">—</dd></div>
+          <div><dt>MCP</dt><dd id="harness-mcp">—</dd></div>
+          <div><dt>Sandbox</dt><dd id="harness-sandbox">—</dd></div>
+          <div><dt>Subagents</dt><dd id="harness-subagents">—</dd></div>
+          <div><dt>Approval gate</dt><dd id="harness-gate">—</dd></div>
+          <div id="harness-replay-row" hidden><dt>Replay</dt><dd id="harness-replay">—</dd></div>
+        </dl>
+        <p id="harness-pause" class="harness-pause" hidden>TrueForge paused this turn for your decision.</p>
+        <details class="harness-why">
+          <summary>Why TrueForge matters</summary>
+          <p>TrueForge owns sessions and turns, MCP routing, sandbox execution, subagents, approval pauses, and reconnect. FlakeBrake owns admission policy, exact authorization, mechanical alternate-representation denial, fenced mutation, and independent verification.</p>
+        </details>
+      </section>
+
       <section class="hero" aria-labelledby="hero-title">
         <div>
           <p class="eyebrow">Deterministic TrueForge mission</p>

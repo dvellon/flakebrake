@@ -12,7 +12,10 @@ const nodes = Object.fromEntries(
     "proof-winner-note", "proof-owner-result", "proof-owner-note", "proof-outcome-result",
     "proof-outcome-note", "proof-control-summary", "proof-decisions", "proof-capacity-summary",
     "proof-capacity-impact", "proof-durable-summary", "proof-durable-proof",
-    "proof-technical-evidence", "counterfactual-copy", "toast",
+    "proof-technical-evidence", "counterfactual-copy", "harness-state", "harness-provider",
+    "harness-session", "harness-turn", "harness-runtime", "harness-mcp", "harness-sandbox",
+    "harness-subagents", "harness-gate", "harness-replay-row", "harness-replay",
+    "harness-pause", "toast",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -187,12 +190,55 @@ function applyState(candidate, token) {
 function render() {
   if (!state) return;
   renderHeader();
+  renderHarness();
   renderProofCenter();
   renderApproval();
   renderHero();
   renderActivity();
   renderTimeline();
   renderExecution();
+}
+
+function renderHarness() {
+  const harness = state.harness;
+  const stateLabels = {
+    idle: "Ready",
+    running: "Running",
+    awaiting_approval: "Paused for human",
+    verifying: "Running",
+    verified: "Verified",
+    failed: "Failed",
+    closed: "Closed",
+  };
+  const active = ["running", "awaiting_approval", "verifying"].includes(state.run.status);
+  nodes["harness-state"].textContent = stateLabels[state.run.status] ?? "Ready";
+  nodes["harness-state"].className = `pill harness-state ${state.run.status === "verified" ? "pill-verified" : state.run.status === "failed" ? "pill-denied" : active ? "pill-pending" : "pill-neutral"}`;
+  nodes["harness-provider"].textContent = harness.providerProfile;
+  nodes["harness-session"].textContent = state.mission.sessionId ?? "Not started";
+  nodes["harness-turn"].textContent = state.mission.currentTurnId ?? "—";
+  nodes["harness-runtime"].textContent = `TrueForge ${harness.serverVersion} · SDK ${harness.sdkVersion}`;
+  const reachedServices = state.activity.mcpServers.length;
+  nodes["harness-mcp"].textContent = reachedServices > 0
+    ? `${reachedServices}/${harness.mcpConfigured.length} services reached`
+    : `${harness.mcpConfigured.length} services configured`;
+  nodes["harness-sandbox"].textContent = state.activity.sandboxExecutions > 0
+    ? `${state.activity.sandboxExecutions} executed`
+    : harness.sandboxConfigured ? "Configured" : "—";
+  nodes["harness-subagents"].textContent = state.activity.subagents.length > 0
+    ? `${state.activity.subagents.length} threads evidenced`
+    : harness.dynamicSubagentsConfigured ? "Dynamic · configured" : "—";
+  nodes["harness-gate"].textContent = state.pendingApproval
+    ? "Holding this turn"
+    : state.run.ownerCallsThisProcess > 0
+      ? `Native · ${state.run.ownerCallsThisProcess} owner call${state.run.ownerCallsThisProcess === 1 ? "" : "s"}`
+      : `Native · ${harness.approvalGatedToolCount} gated tool${harness.approvalGatedToolCount === 1 ? "" : "s"}`;
+  const replayEvidence = state.mission.disconnectedAndResumed || state.run.connection === "replayed" ||
+    (state.run.status === "verified" && reattachedTerminal);
+  nodes["harness-replay-row"].hidden = !replayEvidence;
+  nodes["harness-replay"].textContent = !replayEvidence
+    ? "—"
+    : state.mission.disconnectedAndResumed ? "Durable session replayed" : "Reconnected to durable session";
+  nodes["harness-pause"].hidden = state.pendingApproval === null;
 }
 
 function rationalText(value) {

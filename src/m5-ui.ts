@@ -47,6 +47,13 @@ import {
   type DeterministicM4MissionResult,
 } from "./m4-runner.js";
 import { createStore } from "./store.js";
+import {
+  DETERMINISTIC_MODEL_NAME,
+  FLAKEBRAKE_ROOT_AGENT_NAME,
+  flakeBrakeRootAgentSpec,
+  TRUEFORGE_SDK_VERSION,
+  TRUEFORGE_SERVER_VERSION,
+} from "./trueforge-runtime.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const OWNER_SOURCE_IDENTITY = "owner/judge-ui";
@@ -95,6 +102,18 @@ export interface M5JudgeState {
     readonly currentTurnId: string | null;
     readonly terminalProjectionDigest: string | null;
     readonly disconnectedAndResumed: boolean;
+  };
+  readonly harness: {
+    readonly framework: "TrueForge";
+    readonly serverVersion: string;
+    readonly sdkVersion: string;
+    readonly providerProfile: "Deterministic judge profile";
+    readonly modelName: string;
+    readonly rootAgentName: string;
+    readonly mcpConfigured: readonly string[];
+    readonly sandboxConfigured: boolean;
+    readonly dynamicSubagentsConfigured: boolean;
+    readonly approvalGatedToolCount: number;
   };
   readonly hero: {
     readonly directDecision: "REPLAN";
@@ -211,6 +230,26 @@ export interface M5JudgeState {
     readonly unauthorizedMutationCount: number;
   };
 }
+
+const HARNESS_PROJECTION: M5JudgeState["harness"] = (() => {
+  const spec = flakeBrakeRootAgentSpec(DETERMINISTIC_MODEL_NAME);
+  const mcpServers = spec.mcpServers ?? [];
+  return {
+    framework: "TrueForge",
+    serverVersion: TRUEFORGE_SERVER_VERSION,
+    sdkVersion: TRUEFORGE_SDK_VERSION,
+    providerProfile: "Deterministic judge profile",
+    modelName: DETERMINISTIC_MODEL_NAME,
+    rootAgentName: FLAKEBRAKE_ROOT_AGENT_NAME,
+    mcpConfigured: mcpServers.map((server) => server.name),
+    sandboxConfigured: spec.config?.sandbox?.enabled === true,
+    dynamicSubagentsConfigured: spec.config?.dynamicSubAgents?.enabled === true,
+    approvalGatedToolCount: mcpServers.reduce(
+      (total, server) => total + (server.requireApprovalForTools?.length ?? 0),
+      0,
+    ),
+  };
+})();
 
 export interface M5DemoCoordinatorOptions {
   readonly dataRoot: string;
@@ -519,6 +558,7 @@ export class M5DemoCoordinator {
         disconnectedAndResumed:
           (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
       },
+      harness: HARNESS_PROJECTION,
       hero: {
         directDecision: direct.decision,
         portfolioVersion: portfolio.versions.portfolioVersion,

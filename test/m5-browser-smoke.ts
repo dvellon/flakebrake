@@ -120,6 +120,17 @@ try {
   await waitText(browser, By.id("proof-winner-result"), "10 → 8");
   assert.match(await browser.findElement(By.id("proof-winner-note")).getText(), /Deliver best-effort display stands/u);
   assert.match(await browser.findElement(By.id("proof-direct-note")).getText(), /Agent work over by 2.*Owner decisions over by 1/u);
+  await waitText(browser, By.id("harness-state"), "Ready");
+  assert.equal(await browser.findElement(By.id("harness-mcp")).getText(), "4 services configured");
+  assert.equal(await browser.findElement(By.id("harness-sandbox")).getText(), "Configured");
+  assert.equal(await browser.findElement(By.id("harness-subagents")).getText(), "Dynamic · configured");
+  assert.equal(await browser.findElement(By.id("harness-runtime")).getText(), "TrueForge 0.1.4 · SDK 0.1.3");
+  assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), false, "the pause line stays hidden while idle");
+  assert.equal(
+    await browser.executeScript("return document.querySelector('.harness-why').open;"),
+    false,
+    "the TrueForge disclosure starts collapsed",
+  );
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
   assert.equal((await browser.findElements(By.css("progress.capacity-baseline"))).length, 3);
   assert.equal((await browser.findElements(By.css("[style]"))).length, 0, "CSP-safe UI has no inline style attributes");
@@ -198,6 +209,13 @@ try {
     );
     smokeStage = `owner_${ownerCall}_visible`;
     actionDigests.add(digest);
+    await waitText(browser, By.id("harness-state"), "Paused for human");
+    assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), true);
+    assert.equal(
+      await browser.findElement(By.id("harness-pause")).getText(),
+      "TrueForge paused this turn for your decision.",
+    );
+    assert.equal(await browser.findElement(By.id("harness-gate")).getText(), "Holding this turn");
 
     if (ownerCall === 2) {
       assert.equal(
@@ -289,6 +307,14 @@ try {
   assert.match(documentText, /1 receipt · 1 terminal event · 2 actual facts/u);
   assert.match(documentText, /only mutation is the approved 09:40–10:10 interval/u);
   assert.equal(await browser.findElement(By.id("connection-label")).getText(), "Mission complete");
+  await waitText(browser, By.id("harness-state"), "Verified");
+  assert.equal(await browser.findElement(By.id("harness-mcp")).getText(), "4/4 services reached");
+  assert.equal(await browser.findElement(By.id("harness-sandbox")).getText(), "1 executed");
+  assert.equal(await browser.findElement(By.id("harness-subagents")).getText(), "3 threads evidenced");
+  assert.match(await browser.findElement(By.id("harness-gate")).getText(), /Native · 4 owner calls/u);
+  const harnessSessionBeforeRefresh = await browser.findElement(By.id("harness-session")).getText();
+  assert.match(harnessSessionBeforeRefresh, /^[0-9a-z]{20,}$/u, "the ribbon shows the genuine TrueForge session identifier");
+  assert.equal(await browser.findElement(By.id("harness-pause")).isDisplayed(), false);
   assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
   assert.equal((await browser.findElements(By.css("#timeline li.pending"))).length, 0);
   assert.equal((await browser.findElements(By.css(".agent-node.child"))).length, 3);
@@ -315,6 +341,18 @@ try {
   await waitText(browser, By.id("connection-label"), "Durable replay restored", 60_000);
   assert.match((await browser.findElement(By.id("proof-durable-proof")).getAttribute("textContent")) ?? "", /browser is attached to a durable replay/u);
   assert.equal(await browser.findElement(By.id("session-id")).getText(), sessionBeforeRefresh);
+  assert.equal(
+    await browser.findElement(By.id("harness-session")).getText(),
+    harnessSessionBeforeRefresh,
+    "refresh preserves the harness session identity",
+  );
+  assert.equal(await browser.findElement(By.id("harness-replay-row")).isDisplayed(), true);
+  assert.equal(
+    await browser.findElement(By.id("harness-replay")).getText(),
+    "Durable session replayed",
+    "the recovered mission carries genuine durable-replay evidence",
+  );
+  await waitText(browser, By.id("harness-state"), "Verified");
   assert.deepEqual(
     await Promise.all(
       (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),

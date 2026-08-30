@@ -186,6 +186,115 @@ describe("M5 operator proof center", () => {
   });
 });
 
+describe("M5 TrueForge harness ribbon", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-harness-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  test("names the harness, the pause, and the ownership boundary without unsupported claims", () => {
+    assert.match(document, /class="harness-name">TrueForge harness</u);
+    assert.match(document, /id="harness-pause"[^>]*hidden>TrueForge paused this turn for your decision\.</u);
+    assert.match(document, /Why TrueForge matters/u);
+    assert.match(
+      document,
+      /TrueForge owns sessions and turns, MCP routing, sandbox execution, subagents, approval pauses, and reconnect\. FlakeBrake owns admission policy, exact authorization, mechanical alternate-representation denial, fenced mutation, and independent verification\./u,
+    );
+    assert.doesNotMatch(document, /OpenAI|Daytona/u);
+    assert.doesNotMatch(application, /OpenAI|Daytona/u);
+    assert.match(application, /services configured/u);
+    assert.match(application, /services reached/u);
+  });
+
+  test("projects only authoritative harness facts", () => {
+    assert.deepEqual(idle.harness, {
+      framework: "TrueForge",
+      serverVersion: "0.1.4",
+      sdkVersion: "0.1.3",
+      providerProfile: "Deterministic judge profile",
+      modelName: "m4-mission",
+      rootAgentName: "flakebrake-root-obligation-commander",
+      mcpConfigured: [
+        "factory-orders",
+        "factory-capacity",
+        "factory-simulator",
+        "factory-change-control",
+      ],
+      sandboxConfigured: true,
+      dynamicSubagentsConfigured: true,
+      approvalGatedToolCount: 4,
+    });
+  });
+
+  test("reports state, pause, and configured-versus-evidenced wording from state alone", async () => {
+    const pending = uiProjection(idle, 2, "awaiting_approval");
+    const verifiedBase = uiProjection(idle, 3, "verified");
+    const terminal: M5JudgeState = {
+      ...verifiedBase,
+      run: { ...verifiedBase.run, ownerCallsThisProcess: 4 },
+      activity: {
+        ...idle.activity,
+        mcpServers: [...idle.harness.mcpConfigured].sort(),
+        sandboxExecutions: 1,
+        subagents: [
+          { threadId: "thread/a", title: "Portfolio and order analyst", status: "done" },
+          { threadId: "thread/b", title: "Capacity and schedule analyst", status: "done" },
+          { threadId: "thread/c", title: "Assurance and simulation engineer", status: "done" },
+        ],
+      },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const replayed: M5JudgeState = {
+      ...terminal,
+      revision: 4,
+      mission: { ...terminal.mission, disconnectedAndResumed: true },
+    };
+    const harness = await createPollingHarness(idle, [
+      Promise.resolve(pending),
+      Promise.resolve(terminal),
+      Promise.resolve(replayed),
+    ]);
+    assert.equal(harness.text("harness-state"), "Ready");
+    assert.equal(harness.text("harness-mcp"), "4 services configured");
+    assert.equal(harness.text("harness-sandbox"), "Configured");
+    assert.equal(harness.text("harness-subagents"), "Dynamic · configured");
+    assert.equal(harness.text("harness-gate"), "Native · 4 gated tools");
+    assert.equal(harness.evaluate("document.getElementById('harness-pause').hidden"), true);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("harness-state"), "Paused for human");
+    assert.equal(harness.text("harness-gate"), "Holding this turn");
+    assert.equal(harness.evaluate("document.getElementById('harness-pause').hidden"), false);
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.text("harness-state"), "Verified");
+    assert.equal(harness.text("harness-mcp"), "4/4 services reached");
+    assert.equal(harness.text("harness-sandbox"), "1 executed");
+    assert.equal(harness.text("harness-subagents"), "3 threads evidenced");
+    assert.equal(harness.text("harness-gate"), "Native · 4 owner calls");
+    await harness.evaluate<Promise<void>>("refresh()");
+    assert.equal(harness.evaluate("document.getElementById('harness-replay-row').hidden"), false);
+    assert.equal(harness.text("harness-replay"), "Durable session replayed");
+
+    const failedState: M5JudgeState = {
+      ...idle,
+      revision: 2,
+      run: { ...idle.run, status: "failed", generation: 1, errorCode: "controlled_failure" },
+    };
+    const failedHarness = await createPollingHarness(failedState, []);
+    assert.equal(failedHarness.text("harness-state"), "Failed");
+  });
+});
+
 describe("Qodo Round 2: executable session error-capture arming", () => {
   test("arming registers the observer before any navigation and clears the probe", async () => {
     const session = createFakeBrowserSession();
@@ -1254,6 +1363,11 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(terminal.activity.subagents.length, 3);
     assert.equal(terminal.activity.sandboxExecutions, 1);
     assert.equal(terminal.activity.mcpServers.length, 4);
+    assert.deepEqual(
+      [...terminal.activity.mcpServers].sort(),
+      [...terminal.harness.mcpConfigured].sort(),
+      "every configured MCP service is evidenced as reached at terminal",
+    );
     const decisionEvidence = terminal.evidenceTimeline.filter((item) => item.kind.startsWith("approval:"));
     assert.equal(decisionEvidence.length, terminal.approvals.length);
     assert.equal(decisionEvidence.some((item) => item.status === "pending"), false);
