@@ -658,13 +658,25 @@ export class M5DemoCoordinator {
       );
     }
     await Promise.all([this.#runPromise, this.#challengePromise]);
+    if (this.#cleanupDataOnClose) {
+      const cleanupErrors: unknown[] = [];
+      for (const cleanup of [
+        () => cleanupAdversarialChallengeLab(this.#dataRoot),
+        () => cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths),
+      ]) {
+        try {
+          cleanup();
+        } catch (error: unknown) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(cleanupErrors, "M5 invocation cleanup did not complete");
+      }
+    }
     this.#status = "closed";
     this.#challengeStatus = "closed";
     this.#closed = true;
-    if (this.#cleanupDataOnClose) {
-      cleanupAdversarialChallengeLab(this.#dataRoot);
-      cleanupOwnedDemoArtifacts(this.#dataRoot, this.#paths);
-    }
     this.#bumpRevision();
   }
 

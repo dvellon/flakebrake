@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -196,10 +197,7 @@ export function readAdversarialChallengeLab(
   for (const [index, directory] of directories.entries()) {
     const challenge = value.challenges[index];
     if (challenge === undefined) throw new Error("The durable challenge result is incomplete");
-    const current = completeEvidence({
-      m2: join(root, directory, "m2.sqlite"),
-      factory: join(root, directory, "factory.sqlite"),
-    });
+    const current = completeEvidence(durableScenarioPaths(root, directory));
     if (
       canonicalSerialize(publicEvidence(current)) !== canonicalSerialize(challenge.after) ||
       canonicalSerialize(challenge.before) !== canonicalSerialize(challenge.after)
@@ -242,6 +240,42 @@ function requireChallengeRoot(root: string): void {
   ) {
     throw new Error("The challenge-lab ownership marker is invalid");
   }
+}
+
+function durableScenarioPaths(root: string, directory: string): FixturePaths {
+  const canonicalRoot = realpathSync(root);
+  const scenario = join(root, directory);
+  if (!existsSync(scenario)) {
+    throw new Error("The durable challenge scenario directory is missing");
+  }
+  const scenarioStat = lstatSync(scenario);
+  if (!scenarioStat.isDirectory() || scenarioStat.isSymbolicLink()) {
+    throw new Error("The durable challenge scenario directory must not be a symbolic link");
+  }
+  const canonicalScenario = realpathSync(scenario);
+  if (canonicalScenario !== join(canonicalRoot, directory)) {
+    throw new Error("The durable challenge scenario escaped its owned root");
+  }
+  const paths = {
+    m2: join(scenario, "m2.sqlite"),
+    factory: join(scenario, "factory.sqlite"),
+  };
+  for (const [name, path] of [
+    ["m2.sqlite", paths.m2],
+    ["factory.sqlite", paths.factory],
+  ] as const) {
+    if (!existsSync(path)) {
+      throw new Error("A durable challenge database is missing");
+    }
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("A durable challenge database must be a regular non-symbolic-link file");
+    }
+    if (realpathSync(path) !== join(canonicalScenario, name)) {
+      throw new Error("A durable challenge database escaped its owned scenario");
+    }
+  }
+  return paths;
 }
 
 async function identitySubstitutionChallenge(

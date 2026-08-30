@@ -212,6 +212,7 @@ try {
         "the session network observer did not record the pre-refresh controlled failure",
       );
       await screenshot(browser, join(screenshots, "03-pending-approval.png"));
+      await settleApplicationPolling(browser);
       await browser.navigate().refresh();
       await browser.wait(until.elementLocated(By.id("approval-panel")), 60_000);
       await browser.wait(
@@ -297,6 +298,7 @@ try {
   await screenshot(browser, join(screenshots, "06-readback-proof.png"));
 
   const sessionBeforeRefresh = await browser.findElement(By.id("session-id")).getText();
+  await settleApplicationPolling(browser);
   await browser.navigate().refresh();
   await waitText(browser, By.id("outcome"), "Verified success", 60_000);
   await waitText(browser, By.id("connection-label"), "Durable replay restored", 60_000);
@@ -497,6 +499,11 @@ async function waitText(
     timeout,
   );
   return element;
+}
+
+async function settleApplicationPolling(driver: WebDriver): Promise<void> {
+  await driver.executeScript("window.dispatchEvent(new Event('pagehide'));");
+  await driver.sleep(400);
 }
 
 async function screenshot(driver: WebDriver, path: string): Promise<void> {

@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -88,8 +96,71 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
         canonicalSerialize(await runAdversarialChallengeLab(directory)),
         canonicalSerialize(result),
       );
+
+      const challengeRoot = join(directory, "challenge-lab-v1");
+      const identityRoot = join(challengeRoot, "01-identity");
+      const m2Path = join(identityRoot, "m2.sqlite");
+      const copiedM2Path = join(identityRoot, "m2-copy.sqlite");
+      renameSync(m2Path, copiedM2Path);
+      try {
+        symlinkSync(copiedM2Path, m2Path);
+        assert.throws(
+          () => readAdversarialChallengeLab(directory),
+          /regular non-symbolic-link file/u,
+        );
+      } finally {
+        rmSync(m2Path, { force: true });
+        renameSync(copiedM2Path, m2Path);
+      }
+
+      const copiedIdentityRoot = join(challengeRoot, "01-identity-copy");
+      renameSync(identityRoot, copiedIdentityRoot);
+      try {
+        symlinkSync(copiedIdentityRoot, identityRoot, "dir");
+        assert.throws(
+          () => readAdversarialChallengeLab(directory),
+          /scenario directory must not be a symbolic link/u,
+        );
+      } finally {
+        rmSync(identityRoot, { force: true });
+        renameSync(copiedIdentityRoot, identityRoot);
+      }
     } finally {
       await coordinator.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("challenge cleanup cannot skip core cleanup and remains retryable", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "flakebrake-challenge-cleanup-"));
+    const coordinator = new M5DemoCoordinator({
+      dataRoot: directory,
+      cleanupDataOnClose: true,
+    });
+    const challengeRoot = join(directory, "challenge-lab-v1");
+    const challengeMarker = join(challengeRoot, ".flakebrake-challenge-owned-v1");
+    const coreFiles = ["m2.sqlite", "factory.sqlite", "mission.sqlite", "trueforge.sqlite"];
+    try {
+      mkdirSync(challengeRoot, { mode: 0o700 });
+      writeFileSync(challengeMarker, "invalid\n");
+      for (const file of coreFiles) writeFileSync(join(directory, file), "owned fixture\n");
+      mkdirSync(join(directory, "trueforge-data", "owned"), { recursive: true });
+      writeFileSync(join(directory, "trueforge-data", "owned", "sentinel"), "owned\n");
+
+      await assert.rejects(coordinator.close(), (error: unknown) => {
+        assert.equal(error instanceof AggregateError, true);
+        assert.match(String(error), /M5 invocation cleanup did not complete/u);
+        return true;
+      });
+      assert.equal(coreFiles.every((file) => !existsSync(join(directory, file))), true);
+      assert.equal(existsSync(join(directory, "trueforge-data")), false);
+      assert.equal(existsSync(challengeRoot), true);
+
+      writeFileSync(challengeMarker, "flakebrake-adversarial-challenge/v1\n");
+      await coordinator.close();
+      assert.equal(existsSync(challengeRoot), false);
+    } finally {
+      await coordinator.close().catch(() => undefined);
       rmSync(directory, { recursive: true, force: true });
     }
   });
