@@ -493,7 +493,7 @@ describe("Qodo Round 4: failure-atomic capture arming", () => {
   const armNetwork = (session: FakeNetworkSession): ReturnType<typeof armSessionNetworkCapture> =>
     armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL, session.transportProbe);
 
-  test("the cleanup stack releases in reverse order, exhaustively, exactly once", async () => {
+  test("the cleanup stack releases in reverse order and a successful release is terminal", async () => {
     const order: string[] = [];
     const stack = sessionCleanupStack();
     stack.own(async () => {
@@ -501,19 +501,19 @@ describe("Qodo Round 4: failure-atomic capture arming", () => {
     });
     stack.own(async () => {
       order.push("second");
-      throw new Error("controlled release failure");
     });
     stack.own(async () => {
       order.push("third");
     });
-    await assert.rejects(stack.release(), (error: unknown) => {
-      assert.equal(error instanceof AggregateError, true);
-      assert.match(String((error as AggregateError).errors[0]), /controlled release failure/u);
-      return true;
-    });
-    assert.deepEqual(order, ["third", "second", "first"]);
     await stack.release();
     assert.deepEqual(order, ["third", "second", "first"]);
+    await stack.release();
+    assert.deepEqual(order, ["third", "second", "first"], "a released stack never reruns callbacks");
+    assert.throws(
+      () => stack.own(async () => undefined),
+      /cannot own a release after cleanup has started/u,
+      "ownership after release fails closed",
+    );
   });
 
   test("error-capture arming failures release the observer at every boundary", async () => {
@@ -612,6 +612,180 @@ describe("Qodo Round 4: failure-atomic capture arming", () => {
     assert.equal(failing.events.filter((event) => event === "remove").length, 1);
     assert.equal(failing.registeredHandlerCount(), 0);
     assert.equal(failing.registeredFetchErrorHandlerCount(), 0);
+  });
+});
+
+describe("Qodo Round 5: cleanup-stack lifecycle state machine", () => {
+  const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+  const TRANSPORT_PROBE_URL = "http://transport.invalid/m5-controlled-transport-failure-probe";
+
+  function flakyRelease(log: string[], name: string, failuresBeforeSuccess: number): () => Promise<void> {
+    let remainingFailures = failuresBeforeSuccess;
+    return async () => {
+      log.push(name);
+      if (remainingFailures > 0) {
+        remainingFailures -= 1;
+        throw new Error(`controlled ${name} release failure`);
+      }
+    };
+  }
+
+  test("a failed release keeps failed callbacks owned and a retry runs only those", async () => {
+    const log: string[] = [];
+    const stack = sessionCleanupStack();
+    stack.own(flakyRelease(log, "first", 1));
+    stack.own(flakyRelease(log, "second", 0));
+    stack.own(flakyRelease(log, "third", 0));
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    assert.deepEqual(log, ["third", "second", "first"], "the first attempt is exhaustive and reverse ordered");
+    await stack.release();
+    assert.deepEqual(log, ["third", "second", "first", "first"], "the retry runs only the failed callback");
+    await stack.release();
+    assert.deepEqual(log, ["third", "second", "first", "first"], "a successful release makes later releases no-ops");
+  });
+
+  test("repeated retry failures keep rejecting until every callback succeeds", async () => {
+    const log: string[] = [];
+    const stack = sessionCleanupStack();
+    stack.own(flakyRelease(log, "stubborn", 2));
+    stack.own(flakyRelease(log, "reliable", 0));
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    assert.deepEqual(log, ["reliable", "stubborn"]);
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    assert.deepEqual(log, ["reliable", "stubborn", "stubborn"]);
+    await stack.release();
+    assert.deepEqual(log, ["reliable", "stubborn", "stubborn", "stubborn"]);
+    await stack.release();
+    assert.deepEqual(log, ["reliable", "stubborn", "stubborn", "stubborn"]);
+  });
+
+  test("multiple failures aggregate in execution order and stay owned for retry", async () => {
+    const log: string[] = [];
+    const stack = sessionCleanupStack();
+    const firstFailure = new Error("controlled first release failure", { cause: new Error("first root cause") });
+    const thirdFailure = new Error("controlled third release failure");
+    let firstAttempts = 0;
+    let thirdAttempts = 0;
+    stack.own(async () => {
+      log.push("first");
+      firstAttempts += 1;
+      if (firstAttempts === 1) throw firstFailure;
+    });
+    stack.own(flakyRelease(log, "second", 0));
+    stack.own(async () => {
+      log.push("third");
+      thirdAttempts += 1;
+      if (thirdAttempts === 1) throw thirdFailure;
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      const aggregate = error as AggregateError;
+      assert.equal(aggregate.errors[0], thirdFailure, "failures aggregate in execution order");
+      assert.equal(aggregate.errors[1], firstFailure);
+      assert.equal((aggregate.errors[1] as Error).cause instanceof Error, true, "underlying causes are preserved");
+      return true;
+    });
+    assert.deepEqual(log, ["third", "second", "first"]);
+    await stack.release();
+    assert.deepEqual(log, ["third", "second", "first", "third", "first"], "the retry runs only failed callbacks, reverse ordered");
+  });
+
+  test("concurrent releases share one in-flight cleanup and settle together", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    let runs = 0;
+    stack.own(async () => {
+      runs += 1;
+      await gate.promise;
+    });
+    let firstSettled = false;
+    let secondSettled = false;
+    const first = stack.release().then(() => {
+      firstSettled = true;
+    });
+    const second = stack.release().then(() => {
+      secondSettled = true;
+    });
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(runs, 1, "concurrent callers do not start a second cleanup run");
+    assert.equal(firstSettled, false, "the first caller waits for the in-flight cleanup");
+    assert.equal(secondSettled, false, "the concurrent caller waits for the in-flight cleanup");
+    gate.resolve();
+    await first;
+    await second;
+    assert.equal(firstSettled && secondSettled, true);
+    await stack.release();
+    assert.equal(runs, 1, "a released stack never reruns callbacks");
+  });
+
+  test("concurrent releases reject together when the shared cleanup fails, then retry", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    let runs = 0;
+    stack.own(async () => {
+      runs += 1;
+      if (runs === 1) await gate.promise;
+    });
+    const outcomes: unknown[] = [];
+    const first = stack.release().catch((error: unknown) => {
+      outcomes.push(error);
+    });
+    const second = stack.release().catch((error: unknown) => {
+      outcomes.push(error);
+    });
+    gate.reject(new Error("controlled shared release failure"));
+    await first;
+    await second;
+    assert.equal(outcomes.length, 2, "every concurrent waiter observes the failure");
+    assert.equal(outcomes[0], outcomes[1], "both waiters receive the same cleanup failure");
+    assert.match(String((outcomes[0] as AggregateError).errors[0]), /controlled shared release failure/u);
+    await stack.release();
+    assert.equal(runs, 2, "the failed callback stays owned and the retry reruns it");
+  });
+
+  test("owning a release during an in-flight cleanup fails closed", async () => {
+    const stack = sessionCleanupStack();
+    const gate = deferred<void>();
+    stack.own(async () => {
+      await gate.promise;
+    });
+    const inFlight = stack.release();
+    assert.throws(
+      () => stack.own(async () => undefined),
+      /cannot own a release after cleanup has started/u,
+    );
+    gate.resolve();
+    await inFlight;
+  });
+
+  test("a failed capture dispose retains ownership and a retry completes it", async () => {
+    const networkSession = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, { failRemovalTimes: 1 });
+    const networkCapture = await armSessionNetworkCapture(
+      networkSession.observer,
+      networkSession.browser,
+      NETWORK_PROBE_URL,
+      networkSession.transportProbe,
+    );
+    await assert.rejects(networkCapture.dispose(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(String((error as AggregateError).errors[0]), /controlled removal failure/u);
+      return true;
+    });
+    assert.equal(networkSession.registeredHandlerCount(), 1, "a failed dispose leaves the channel owned, not lost");
+    assert.equal(networkSession.registeredFetchErrorHandlerCount(), 1);
+    await networkCapture.dispose();
+    assert.equal(networkSession.registeredHandlerCount(), 0);
+    assert.equal(networkSession.registeredFetchErrorHandlerCount(), 0);
+    assert.equal(networkSession.events.filter((event) => event === "remove").length, 1);
+
+    const errorSession = createFakeBrowserSession({ failRemovalTimes: 1 });
+    const errorCapture = await armSessionErrorCapture(errorSession.script, errorSession.browser);
+    await assert.rejects(errorCapture.dispose(), /session capture cleanup failed/u);
+    assert.equal(errorSession.registeredHandlerCount(), 1);
+    await errorCapture.dispose();
+    assert.equal(errorSession.registeredHandlerCount(), 0);
+    assert.equal(errorSession.events.filter((event) => event.startsWith("remove:")).length, 1);
   });
 });
 
@@ -1777,12 +1951,14 @@ function createFakeBrowserSession(options?: {
   readonly failNavigationToProbe?: boolean;
   readonly failRefresh?: boolean;
   readonly failRemoval?: boolean;
+  readonly failRemovalTimes?: number;
 }): FakeBrowserSession {
   const deliverLoadErrors = options?.deliverLoadErrors ?? true;
   const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
   const failNavigationToProbe = options?.failNavigationToProbe ?? false;
   const failRefresh = options?.failRefresh ?? false;
   const failRemoval = options?.failRemoval ?? false;
+  let remainingRemovalFailures = options?.failRemovalTimes ?? 0;
   const events: string[] = [];
   const handlers = new Map<number, (entry: unknown) => void>();
   let nextHandlerId = 41;
@@ -1806,6 +1982,10 @@ function createFakeBrowserSession(options?: {
       },
       removeJavaScriptErrorHandler: async (handlerId) => {
         if (failRemoval) throw new Error("controlled removal failure");
+        if (remainingRemovalFailures > 0) {
+          remainingRemovalFailures -= 1;
+          throw new Error("controlled removal failure");
+        }
         handlers.delete(handlerId);
         events.push(`remove:${String(handlerId)}`);
       },
@@ -1861,6 +2041,7 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
   readonly failNavigation?: boolean;
   readonly failRefresh?: boolean;
   readonly failRemoval?: boolean;
+  readonly failRemovalTimes?: number;
   readonly rejectWaitMessageMatching?: RegExp;
 }): FakeNetworkSession {
   const deliverResponses = options?.deliverResponses ?? true;
@@ -1874,6 +2055,7 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
   const failRefresh = options?.failRefresh ?? false;
   const failRemoval = options?.failRemoval ?? false;
   const rejectWaitMessageMatching = options?.rejectWaitMessageMatching ?? null;
+  let remainingRemovalFailures = options?.failRemovalTimes ?? 0;
   let transportTriggerCalls = 0;
   const events: string[] = [];
   const handlers = new Set<(entry: { url: string; status: number }) => void>();
@@ -1905,6 +2087,10 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
       },
       removeNetworkHandlers: async () => {
         if (failRemoval) throw new Error("controlled removal failure");
+        if (remainingRemovalFailures > 0) {
+          remainingRemovalFailures -= 1;
+          throw new Error("controlled removal failure");
+        }
         handlers.clear();
         fetchErrorHandlers.clear();
         events.push("remove");

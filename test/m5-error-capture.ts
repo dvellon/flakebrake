@@ -46,26 +46,45 @@ export interface SessionCleanupStack {
 }
 
 export function sessionCleanupStack(): SessionCleanupStack {
-  const releases: (() => Promise<void>)[] = [];
-  let released = false;
+  let state: "open" | "releasing" | "failed" | "released" = "open";
+  let pending: (() => Promise<void>)[] = [];
+  let inFlight: Promise<void> | null = null;
+  const runRelease = async (): Promise<void> => {
+    const attempt = [...pending];
+    const survivors: (() => Promise<void>)[] = [];
+    const failures: unknown[] = [];
+    for (let index = attempt.length - 1; index >= 0; index -= 1) {
+      const release = attempt[index] as () => Promise<void>;
+      try {
+        await release();
+      } catch (error: unknown) {
+        failures.push(error);
+        survivors.unshift(release);
+      }
+    }
+    pending = survivors;
+    if (failures.length > 0) {
+      state = "failed";
+      throw new AggregateError(failures, "session capture cleanup failed");
+    }
+    state = "released";
+  };
   return {
     own: (release) => {
-      releases.push(release);
+      if (state !== "open") {
+        throw new Error("the cleanup stack cannot own a release after cleanup has started");
+      }
+      pending.push(release);
     },
-    release: async () => {
-      if (released) return;
-      released = true;
-      const failures: unknown[] = [];
-      for (const release of [...releases].reverse()) {
-        try {
-          await release();
-        } catch (error: unknown) {
-          failures.push(error);
-        }
-      }
-      if (failures.length > 0) {
-        throw new AggregateError(failures, "session capture cleanup failed");
-      }
+    release: () => {
+      if (state === "released") return Promise.resolve();
+      if (state === "releasing" && inFlight !== null) return inFlight;
+      state = "releasing";
+      const attemptPromise = runRelease().finally(() => {
+        inFlight = null;
+      });
+      inFlight = attemptPromise;
+      return attemptPromise;
     },
   };
 }
