@@ -900,6 +900,104 @@ describe("Qodo Round 6: reentrant release safety", () => {
   });
 });
 
+describe("Qodo Round 7: asynchronous reentry provenance", () => {
+  test("asynchronous self-reentry rejects promptly without deadlock or duplication", async () => {
+    const stack = sessionCleanupStack();
+    let firstCalls = 0;
+    let reentrantCalls = 0;
+    let reentrantError: unknown = null;
+    stack.own(async () => {
+      firstCalls += 1;
+    });
+    stack.own(async () => {
+      reentrantCalls += 1;
+      await Promise.resolve();
+      try {
+        await stack.release();
+      } catch (error: unknown) {
+        reentrantError = error;
+      }
+    });
+    let deadlockTimer!: NodeJS.Timeout;
+    const outcome = await Promise.race([
+      stack.release().then(() => "released"),
+      new Promise<string>((resolveTimeout) => {
+        deadlockTimer = setTimeout(() => resolveTimeout("deadlocked"), 2_000);
+      }),
+    ]);
+    clearTimeout(deadlockTimer);
+    assert.equal(outcome, "released", "the outer release settles promptly despite async self-reentry");
+    assert.match(String(reentrantError), /release cannot be requested from within a cleanup callback/u);
+    assert.equal(firstCalls, 1, "no callback executed twice");
+    assert.equal(reentrantCalls, 1);
+    await stack.release();
+    assert.equal(firstCalls, 1, "the released stack stays idempotent");
+  });
+
+  test("a propagated async self-reentry failure stays owned and retries to success", async () => {
+    const stack = sessionCleanupStack();
+    let survivorCalls = 0;
+    let reentrantCalls = 0;
+    stack.own(async () => {
+      survivorCalls += 1;
+    });
+    stack.own(async () => {
+      reentrantCalls += 1;
+      if (reentrantCalls === 1) {
+        await Promise.resolve();
+        await stack.release();
+      }
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(
+        String((error as AggregateError).errors[0]),
+        /release cannot be requested from within a cleanup callback/u,
+      );
+      return true;
+    });
+    assert.equal(survivorCalls, 1, "the other callback still ran exactly once");
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "the failed callback stays owned and the retry reruns only it");
+    assert.equal(survivorCalls, 1, "successful callbacks are not rerun during retry");
+    await stack.release();
+    assert.equal(reentrantCalls, 2, "a successful final release remains idempotent");
+  });
+
+  test("provenance clears after callbacks so independent releases stay normal", async () => {
+    const stack = sessionCleanupStack();
+    let flakyCalls = 0;
+    stack.own(async () => {
+      flakyCalls += 1;
+      await Promise.resolve();
+      if (flakyCalls === 1) throw new Error("controlled first-pass failure");
+    });
+    await assert.rejects(stack.release(), /session capture cleanup failed/u);
+    await stack.release();
+    assert.equal(flakyCalls, 2, "the independent retry is not misclassified as callback reentry");
+    await stack.release();
+    assert.equal(flakyCalls, 2);
+  });
+
+  test("cleanup activity in one stack does not block releasing another", async () => {
+    const inner = sessionCleanupStack();
+    let innerReleased = false;
+    inner.own(async () => {
+      innerReleased = true;
+    });
+    const outer = sessionCleanupStack();
+    let crossOutcome: string | null = null;
+    outer.own(async () => {
+      await Promise.resolve();
+      await inner.release();
+      crossOutcome = innerReleased ? "inner released from outer callback" : "inner did not run";
+    });
+    await outer.release();
+    assert.equal(crossOutcome, "inner released from outer callback", "provenance is scoped per stack");
+    assert.equal(innerReleased, true);
+  });
+});
+
 const EXPECTED_APPROVAL_ROUTE = [
   ["select_portfolio_modification", "allow", "owner"],
   ["accept_promise", "allow", "owner"],

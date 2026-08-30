@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 export interface BrowserScriptErrorObserver {
   addJavaScriptErrorHandler(callback: (entry: unknown) => void): Promise<number>;
   removeJavaScriptErrorHandler(id: number): Promise<void>;
@@ -49,7 +51,7 @@ export function sessionCleanupStack(): SessionCleanupStack {
   let state: "open" | "releasing" | "failed" | "released" = "open";
   let pending: (() => Promise<void>)[] = [];
   let inFlight: Promise<void> | null = null;
-  let insideCallbackSynchronousWindow = false;
+  const callbackProvenance = new AsyncLocalStorage<true>();
   const runRelease = async (): Promise<void> => {
     const attempt = [...pending];
     const survivors: (() => Promise<void>)[] = [];
@@ -58,16 +60,10 @@ export function sessionCleanupStack(): SessionCleanupStack {
       const release = attempt[index] as () => Promise<void>;
       try {
         // Awaiting this stack's own in-flight release from inside one of its
-        // callbacks can never complete, so a release() call made during the
-        // callback's synchronous execution window rejects instead of joining.
-        insideCallbackSynchronousWindow = true;
-        let callbackSettlement: Promise<void>;
-        try {
-          callbackSettlement = release();
-        } finally {
-          insideCallbackSynchronousWindow = false;
-        }
-        await callbackSettlement;
+        // callbacks can never complete, so every release() call carrying this
+        // callback's provenance — synchronous or across later asynchronous
+        // boundaries — rejects instead of joining.
+        await callbackProvenance.run(true, release);
       } catch (error: unknown) {
         failures.push(error);
         survivors.unshift(release);
@@ -88,7 +84,7 @@ export function sessionCleanupStack(): SessionCleanupStack {
       pending.push(release);
     },
     release: () => {
-      if (insideCallbackSynchronousWindow) {
+      if (callbackProvenance.getStore() === true) {
         return Promise.reject(
           new Error("release cannot be requested from within a cleanup callback"),
         );
