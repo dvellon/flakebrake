@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer, IncomingMessage, Server } from "node:http";
+import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import { SyntheticFactoryEnvironment } from "../src/factory-environment.js";
 import {
@@ -15,6 +17,7 @@ import {
 import { startDeterministicM4Model } from "../src/m4-deterministic-model.js";
 import {
   DeterministicM4RunnerOwnership,
+  m4RunnerCleanupFailures,
   retainM4RunnerCleanupDiagnostics,
 } from "../src/m4-runner-lifecycle.js";
 import {
@@ -253,6 +256,299 @@ test(
     }
   },
 );
+
+test(
+  "MCP forced drain cancels a completed-body handler without injecting a stream error",
+  { timeout: 15_000 },
+  async (context) => {
+    const fixture = createHttpFixture("flakebrake-mcp-complete-body-stall-");
+    const stalled = installStalledMcpTransport();
+    const cancellation = new AbortController();
+    const signal = AbortSignal.any([context.signal, cancellation.signal]);
+    const primary = new Error("completed-body handler cancellation");
+    const client = new Socket();
+    client.on("error", () => undefined);
+    const service = await startFactoryMcpHttpService(
+      "factory-change-control",
+      httpServiceOptions(fixture, signal),
+    );
+    const server = serverForPort(service.port);
+    const acceptedSocket = nextConnection(server);
+    const originalClose = server.close;
+    let closeCalls = 0;
+    server.close = function (callback?: (error?: Error) => void): Server {
+      closeCalls += 1;
+      return originalClose.call(this, callback);
+    };
+    try {
+      await connectSocket(client, service.port, service.host);
+      const body = mcpRequestBody();
+      writeHttpRequest(client, service.host, body, body);
+      const socket = await acceptedSocket;
+      await stalled.started;
+      assert.equal(stalled.request()?.complete, true);
+      assert.equal(stalled.request()?.readableEnded, true);
+      const socketErrorListenersWithLifecycle = socket.listenerCount("error");
+      const requestErrorListeners = stalled.request()?.listenerCount("error");
+      const responseErrorListeners = stalled.response()?.listenerCount("error");
+
+      const abortStarted = Date.now();
+      cancellation.abort(primary);
+      const first = service.close();
+      const second = service.close();
+      assert.equal(first, second);
+      await Promise.all([first, second]);
+      assert.ok(Date.now() - abortStarted >= 400);
+      assert.equal(closeCalls, 1);
+      assert.equal(stalled.transportCloseCalls(), 1);
+      assert.equal(stalled.handlerSettled(), true);
+      assert.equal(stalled.request()?.destroyed, true);
+      assert.equal(stalled.response()?.destroyed, true);
+      assert.equal(socket.destroyed, true);
+      assert.equal(await connectionCount(server), 0);
+      assert.equal(
+        socket.listenerCount("error"),
+        socketErrorListenersWithLifecycle - 1,
+      );
+      assert.equal(stalled.request()?.listenerCount("error"), requestErrorListeners);
+      assert.equal(
+        stalled.response()?.listenerCount("error"),
+        responseErrorListeners,
+      );
+      const diagnostics = m4RunnerCleanupFailures(primary);
+      assert.equal(diagnostics.length, 1);
+      assert.match(
+        String(diagnostics[0]),
+        /shutdown aborted an incomplete request/u,
+      );
+
+      await service.close();
+      assert.equal(closeCalls, 1);
+    } finally {
+      server.close = originalClose;
+      client.destroy();
+      cancellation.abort(primary);
+      await service.close().catch(() => undefined);
+      stalled.restore();
+      fixture.remove();
+    }
+  },
+);
+
+test(
+  "MCP completed-body forced drain exits a real subprocess without a stream crash",
+  { timeout: 20_000 },
+  async (context) => {
+    const source = `
+      import assert from "node:assert/strict";
+      import { mkdtempSync, rmSync } from "node:fs";
+      import { IncomingMessage, ServerResponse } from "node:http";
+      import { Socket } from "node:net";
+      import { tmpdir } from "node:os";
+      import { join } from "node:path";
+      import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+      import { SyntheticFactoryEnvironment } from "./dist/src/factory-environment.js";
+      import { HERO_HORIZON_END, createHeroInitialState } from "./dist/src/hero-fixture.js";
+      import { m4RunnerCleanupFailures } from "./dist/src/m4-runner-lifecycle.js";
+      import { startFactoryMcpHttpService } from "./dist/src/mcp-http.js";
+      import { createStore } from "./dist/src/store.js";
+      const root = mkdtempSync(join(tmpdir(), "flakebrake-forced-drain-child-"));
+      const m2DatabasePath = join(root, "m2.sqlite");
+      const factoryDatabasePath = join(root, "factory.sqlite");
+      createStore({ path: m2DatabasePath, initialState: createHeroInitialState(), now: () => HERO_HORIZON_END }).close();
+      new SyntheticFactoryEnvironment({ path: factoryDatabasePath, now: () => HERO_HORIZON_END }).close();
+      const ordering = [];
+      const record = (event, details = {}) => {
+        ordering.push({ event, ...details });
+        process.stdout.write(JSON.stringify(ordering.at(-1)) + "\\n");
+      };
+      process.on("uncaughtExceptionMonitor", (error, origin) => record("uncaught-exception", { origin, message: error.message }));
+      let markStarted;
+      const started = new Promise((resolve) => { markStarted = resolve; });
+      let release;
+      const originalHandle = StreamableHTTPServerTransport.prototype.handleRequest;
+      const originalTransportClose = StreamableHTTPServerTransport.prototype.close;
+      StreamableHTTPServerTransport.prototype.handleRequest = async function (request, response) {
+        assert.ok(request instanceof IncomingMessage);
+        assert.ok(response instanceof ServerResponse);
+        request.removeAllListeners("error");
+        const originalDestroy = request.destroy.bind(request);
+        request.destroy = function (error) {
+          record("request-destroy", { injectedError: error?.message ?? null, errorListeners: this.listenerCount("error") });
+          if (error !== undefined) queueMicrotask(() => this.emit("error", error));
+          this.destroy = originalDestroy;
+          return originalDestroy();
+        };
+        record("handler-stalled", { complete: request.complete, readableEnded: request.readableEnded, requestErrorListeners: request.listenerCount("error"), responseErrorListeners: response.listenerCount("error") });
+        markStarted();
+        await new Promise((resolve) => { release = resolve; });
+        record("handler-settled");
+      };
+      StreamableHTTPServerTransport.prototype.close = async function () {
+        record("transport-close");
+        release?.();
+        await originalTransportClose.call(this);
+      };
+      const controller = new AbortController();
+      const primary = new Error("subprocess forced drain");
+      const service = await startFactoryMcpHttpService("factory-change-control", {
+        m2DatabasePath,
+        factoryDatabasePath,
+        now: () => HERO_HORIZON_END,
+        enableM4Tools: true,
+        signal: controller.signal,
+      });
+      const server = process._getActiveHandles().find((handle) => {
+        if (handle?.constructor?.name !== "Server") return false;
+        const address = handle.address?.();
+        return typeof address === "object" && address?.port === service.port;
+      });
+      assert.ok(server);
+      let accepted;
+      let socketErrorListenersWithLifecycle = 0;
+      server.once("connection", (socket) => {
+        accepted = socket;
+        socketErrorListenersWithLifecycle = socket.listenerCount("error");
+        socket.once("close", () => record("server-socket-close"));
+        record("server-socket-accepted");
+      });
+      server.once("close", () => record("server-close"));
+      const client = new Socket();
+      client.on("error", () => undefined);
+      client.once("close", () => record("client-socket-close"));
+      await new Promise((resolve, reject) => {
+        client.once("error", reject);
+        client.connect(service.port, service.host, resolve);
+      });
+      const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "record_current_admission", arguments: {} } });
+      client.write("POST /mcp HTTP/1.1\\r\\nHost: " + service.host + "\\r\\nContent-Type: application/json\\r\\nAccept: application/json, text/event-stream\\r\\nMCP-Protocol-Version: 2025-03-26\\r\\nContent-Length: " + Buffer.byteLength(body) + "\\r\\nConnection: keep-alive\\r\\n\\r\\n" + body);
+      record("complete-request-written");
+      await started;
+      record("abort-triggered");
+      controller.abort(primary);
+      await service.close();
+      record("close-completed");
+      const deadline = Date.now() + 1000;
+      while (!client.destroyed && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(client.destroyed, true);
+      assert.equal(accepted?.destroyed, true);
+      assert.equal(accepted?.listenerCount("error"), socketErrorListenersWithLifecycle - 1);
+      assert.equal(await new Promise((resolve, reject) => server.getConnections((error, count) => error ? reject(error) : resolve(count))), 0);
+      const diagnostics = m4RunnerCleanupFailures(primary);
+      assert.equal(diagnostics.length, 1);
+      assert.match(String(diagnostics[0]), /shutdown aborted an incomplete request/u);
+      StreamableHTTPServerTransport.prototype.handleRequest = originalHandle;
+      StreamableHTTPServerTransport.prototype.close = originalTransportClose;
+      rmSync(root, { recursive: true, force: true });
+      record("result", { ownedServers: 0, ownedSockets: 0, diagnostics: diagnostics.length });
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        TMPDIR: tmpdir(),
+        TMP: tmpdir(),
+        TEMP: tmpdir(),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const output = collectChildOutput(child);
+    const stopOnTestAbort = (): void => {
+      child.kill("SIGTERM");
+    };
+    context.signal.addEventListener("abort", stopOnTestAbort, { once: true });
+    try {
+      const exit = await childExit(child);
+      const captured = await output;
+      assert.deepEqual(exit, { code: 0, signal: null }, captured.stderr);
+      assert.doesNotMatch(captured.stdout, /uncaught-exception/u);
+      assert.match(
+        captured.stdout,
+        /"event":"request-destroy","injectedError":null,"errorListeners":0/u,
+      );
+      assert.match(captured.stdout, /"handler-settled"/u);
+      assert.match(captured.stdout, /"close-completed"/u);
+      assert.match(
+        captured.stdout,
+        /"event":"result","ownedServers":0,"ownedSockets":0,"diagnostics":1/u,
+      );
+    } finally {
+      context.signal.removeEventListener("abort", stopOnTestAbort);
+    }
+  },
+);
+
+test("unexpected MCP socket error remains visible and cleanup can retry", async () => {
+  const fixture = createHttpFixture("flakebrake-mcp-socket-error-");
+  const service = await startFactoryMcpHttpService(
+    "factory-change-control",
+    httpServiceOptions(fixture),
+  );
+  const server = serverForPort(service.port);
+  const acceptedSocket = nextConnection(server);
+  const client = new Socket();
+  client.on("error", () => undefined);
+  const failure = new Error("unexpected owned MCP socket error");
+  try {
+    await connectSocket(client, service.port, service.host);
+    const socket = await acceptedSocket;
+    const socketErrorListenersWithLifecycle = socket.listenerCount("error");
+    socket.emit("error", failure);
+    await assert.rejects(service.close(), (error: unknown) => error === failure);
+    await service.close();
+    await service.close();
+    assert.equal(socket.destroyed, true);
+    assert.equal(
+      socket.listenerCount("error"),
+      socketErrorListenersWithLifecycle - 1,
+    );
+  } finally {
+    client.destroy();
+    await service.close().catch(() => undefined);
+    fixture.remove();
+  }
+});
+
+test("client disconnect racing MCP forced drain settles only the owned socket", async () => {
+  const fixture = createHttpFixture("flakebrake-mcp-disconnect-race-");
+  const cancellation = new AbortController();
+  const observer = observeIncomingBody();
+  const unrelated = createServer((_request, response) => response.end("unrelated"));
+  await listen(unrelated);
+  const service = await startFactoryMcpHttpService(
+    "factory-change-control",
+    httpServiceOptions(fixture, cancellation.signal),
+  );
+  const server = serverForPort(service.port);
+  const acceptedSocket = nextConnection(server);
+  const client = new Socket();
+  client.on("error", () => undefined);
+  try {
+    await connectSocket(client, service.port, service.host);
+    const socket = await acceptedSocket;
+    const socketErrorListenersWithLifecycle = socket.listenerCount("error");
+    const body = mcpRequestBody();
+    writeHttpRequest(client, service.host, body, body.slice(0, 1));
+    await observer.started;
+    cancellation.abort(new Error("client disconnect race"));
+    client.destroy();
+    await service.close();
+    assert.equal(socket.destroyed, true);
+    assert.equal(
+      socket.listenerCount("error"),
+      socketErrorListenersWithLifecycle - 1,
+    );
+    assert.equal(await connectionCount(server), 0);
+    assert.equal(unrelated.listening, true);
+  } finally {
+    observer.restore();
+    client.destroy();
+    cancellation.abort();
+    await service.close().catch(() => undefined);
+    await closeServer(unrelated);
+    fixture.remove();
+  }
+});
 
 test("MCP close failure remains visible and retains ownership for retry", async () => {
   const fixture = createHttpFixture("flakebrake-mcp-close-retry-");
@@ -587,6 +883,91 @@ interface HttpFixture {
   readonly m2DatabasePath: string;
   readonly factoryDatabasePath: string;
   readonly remove: () => void;
+}
+
+function installStalledMcpTransport(): {
+  readonly started: Promise<void>;
+  readonly request: () => IncomingMessage | undefined;
+  readonly response: () => ServerResponse | undefined;
+  readonly handlerSettled: () => boolean;
+  readonly transportCloseCalls: () => number;
+  readonly restore: () => void;
+} {
+  const originalHandle = StreamableHTTPServerTransport.prototype.handleRequest;
+  const originalClose = StreamableHTTPServerTransport.prototype.close;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let releaseHandler: (() => void) | undefined;
+  let capturedRequest: IncomingMessage | undefined;
+  let capturedResponse: ServerResponse | undefined;
+  let settled = false;
+  let closeCalls = 0;
+  StreamableHTTPServerTransport.prototype.handleRequest = async function (
+    request,
+    response,
+  ) {
+    capturedRequest = request;
+    capturedResponse = response;
+    markStarted?.();
+    await new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    settled = true;
+  };
+  StreamableHTTPServerTransport.prototype.close = async function () {
+    closeCalls += 1;
+    releaseHandler?.();
+    await originalClose.call(this);
+  };
+  return {
+    started,
+    request: () => capturedRequest,
+    response: () => capturedResponse,
+    handlerSettled: () => settled,
+    transportCloseCalls: () => closeCalls,
+    restore: () => {
+      releaseHandler?.();
+      StreamableHTTPServerTransport.prototype.handleRequest = originalHandle;
+      StreamableHTTPServerTransport.prototype.close = originalClose;
+    },
+  };
+}
+
+function nextConnection(server: Server): Promise<Socket> {
+  return new Promise((resolve) => {
+    server.once("connection", resolve);
+  });
+}
+
+function collectChildOutput(
+  child: ReturnType<typeof spawn>,
+): Promise<{ readonly stdout: string; readonly stderr: string }> {
+  assert.ok(child.stdout);
+  assert.ok(child.stderr);
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  return new Promise((resolve) => {
+    child.once("close", () => resolve({ stdout, stderr }));
+  });
+}
+
+function childExit(
+  child: ReturnType<typeof spawn>,
+): Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }> {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
 }
 
 function createHttpFixture(prefix: string): HttpFixture {

@@ -15,13 +15,16 @@ const CLEANUP_FAILURE_SOURCES = new WeakMap<Error, (readonly unknown[])[]>();
 interface OwnedHttpHandler {
   readonly request: IncomingMessage;
   readonly response: ServerResponse;
+  readonly cancellation: AbortController;
   readonly done: Promise<void>;
   readonly resolveDone: () => void;
+  forcedDrainReason?: Error;
 }
 
 interface OwnedHttpSocket {
   readonly done: Promise<void>;
   readonly resolveDone: () => void;
+  readonly observeError: (error: Error) => void;
 }
 
 export interface OwnedHttpServerLifecycleOptions {
@@ -44,6 +47,8 @@ export class OwnedHttpServerLifecycle {
   readonly #options: OwnedHttpServerLifecycleOptions;
   readonly #handlers = new Set<OwnedHttpHandler>();
   readonly #sockets = new Map<Socket, OwnedHttpSocket>();
+  readonly #cleanupDiagnostics: unknown[] = [];
+  readonly #transportFailures: unknown[] = [];
   #listenerState: ListenerState = "idle";
   #underlyingListenSettled: Promise<void> = Promise.resolve();
   #rejectStartupAbort: ((reason: unknown) => void) | undefined;
@@ -121,7 +126,7 @@ export class OwnedHttpServerLifecycle {
   public runHandler(
     request: IncomingMessage,
     response: ServerResponse,
-    operation: () => Promise<void>,
+    operation: (signal: AbortSignal) => Promise<void>,
   ): Promise<void> {
     let resolveDone: (() => void) | undefined;
     const done = new Promise<void>((resolve) => {
@@ -130,12 +135,13 @@ export class OwnedHttpServerLifecycle {
     const handler: OwnedHttpHandler = {
       request,
       response,
+      cancellation: new AbortController(),
       done,
       resolveDone: () => resolveDone?.(),
     };
     this.#handlers.add(handler);
     return Promise.resolve()
-      .then(operation)
+      .then(() => operation(handler.cancellation.signal))
       .finally(() => {
         this.#handlers.delete(handler);
         handler.resolveDone();
@@ -175,9 +181,20 @@ export class OwnedHttpServerLifecycle {
     );
     if (!drained) {
       for (const handler of this.#handlers) {
-        const error = new Error(this.#options.incompleteRequestMessage);
-        handler.request.destroy(error);
-        handler.response.destroy(error);
+        const reason =
+          handler.forcedDrainReason ??
+          new Error(this.#options.incompleteRequestMessage);
+        handler.forcedDrainReason = reason;
+        if (!handler.cancellation.signal.aborted) {
+          this.#recordCleanupDiagnostic(reason);
+          handler.cancellation.abort(reason);
+        }
+        // The reason is retained on the owned handler signal and, for runner
+        // cancellation, on the primary error's cleanup diagnostics. It must
+        // not be injected into EventEmitter streams that may have no error
+        // observer at this lifecycle boundary.
+        handler.request.destroy();
+        handler.response.destroy();
       }
     }
 
@@ -227,6 +244,7 @@ export class OwnedHttpServerLifecycle {
         ),
       );
     }
+    failures.push(...this.#transportFailures.splice(0));
     if (failures.length > 0) {
       throw failures.length === 1
         ? failures[0]
@@ -295,17 +313,31 @@ export class OwnedHttpServerLifecycle {
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve;
     });
+    const observeError = (error: Error): void => {
+      this.#transportFailures.push(error);
+    };
     const owned: OwnedHttpSocket = {
       done,
       resolveDone: () => resolveDone?.(),
+      observeError,
     };
     this.#sockets.set(socket, owned);
+    socket.on("error", observeError);
     socket.once("close", () => {
+      socket.off("error", owned.observeError);
       this.#sockets.delete(socket);
       owned.resolveDone();
     });
     if (this.#closing) socket.destroy();
   };
+
+  #recordCleanupDiagnostic(reason: Error): void {
+    this.#cleanupDiagnostics.push(reason);
+    const primary = this.#options.signal?.reason;
+    if (primary instanceof Error) {
+      retainM4RunnerCleanupDiagnostics(primary, this.#cleanupDiagnostics);
+    }
+  }
 
   readonly #observeServerClose = (): void => {
     this.#serverCloseObserved = true;

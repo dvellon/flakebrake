@@ -76,7 +76,7 @@ export async function startFactoryMcpHttpService(
   let lifecycle: OwnedHttpServerLifecycle;
   const httpServer = createServer((request, response) => {
     void lifecycle
-      .runHandler(request, response, async () => {
+      .runHandler(request, response, async (handlerSignal) => {
         try {
           await handleHttpRequest(
             serviceName,
@@ -84,8 +84,10 @@ export async function startFactoryMcpHttpService(
             durableBinding,
             request,
             response,
+            handlerSignal,
           );
-        } catch {
+        } catch (error: unknown) {
+          if (handlerSignal.aborted && error === handlerSignal.reason) return;
           if (response.destroyed) return;
           try {
             if (!response.headersSent) {
@@ -145,6 +147,7 @@ export async function startFactoryMcpHttpService(
     binding: FactoryMcpDatabaseBinding,
     request: IncomingMessage,
     response: import("node:http").ServerResponse,
+    signal: AbortSignal,
   ): Promise<void> {
     if (lifecycle.closing) {
       writeJsonRpcError(response, 503, -32000, "Server is shutting down");
@@ -163,9 +166,10 @@ export async function startFactoryMcpHttpService(
     let parsedBody: unknown;
     try {
       parsedBody = parseJsonRejectingDuplicateKeys(
-        await readBoundedUtf8Body(request),
+        await waitForHandlerOperation(signal, () => readBoundedUtf8Body(request)),
       );
     } catch (error: unknown) {
+      if (signal.aborted && error === signal.reason) throw error;
       const status =
         error instanceof FrameTooLargeError || error instanceof Utf8FrameError
           ? 400
@@ -180,12 +184,42 @@ export async function startFactoryMcpHttpService(
     // not alter the runtime transport or wrap it in an in-process substitute.
     const transport = new StreamableHTTPServerTransport();
     try {
-      await service.server.connect(transport as unknown as Transport);
-      await transport.handleRequest(request, response, parsedBody);
+      await waitForHandlerOperation(signal, () =>
+        service.server.connect(transport as unknown as Transport),
+      );
+      await waitForHandlerOperation(signal, () =>
+        transport.handleRequest(request, response, parsedBody),
+      );
     } finally {
       await transport.close();
       await service.close();
     }
+  }
+}
+
+async function waitForHandlerOperation<T>(
+  signal: AbortSignal,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = (): void => rejectAbort?.(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  let pending: Promise<T>;
+  try {
+    pending = Promise.resolve(operation());
+  } catch (error: unknown) {
+    signal.removeEventListener("abort", onAbort);
+    throw error;
+  }
+  // Promise.race observes a late operation rejection after cancellation wins.
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
