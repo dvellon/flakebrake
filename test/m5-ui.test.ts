@@ -796,6 +796,239 @@ describe("M5 agent trust — agents checking agents", () => {
   });
 });
 
+describe("Qodo PR16 Round 2: durable sandbox evidence survives restart", () => {
+  const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
+  const roots: string[] = [];
+
+  after(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  const newRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-round2-"));
+    roots.push(root);
+    return root;
+  };
+
+  const bindHeroMission = async (root: string, sessionId: string): Promise<void> => {
+    const { M4MissionStore } = await import("../src/m4-mission-store.js");
+    const store = new M4MissionStore({ path: join(root, "mission.sqlite") });
+    try {
+      store.bindMission({
+        missionId: HERO_MISSION_ID,
+        environmentId: "env/hero-microfactory",
+        trueforgeAgentId: "agent/test",
+        trueforgeSessionId: sessionId,
+        m2EnvironmentIdentity: "m2/test",
+        factoryEnvironmentIdentity: "factory/test",
+      });
+    } finally {
+      store.close();
+    }
+  };
+
+  const ownRoot = async (root: string): Promise<void> => {
+    const owner = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    await owner.close();
+  };
+
+  const sandboxEntryOf = (state: M5JudgeState): M5JudgeState["evidenceTimeline"][number] | undefined =>
+    state.evidenceTimeline.find((item) => item.kind === "sandbox");
+
+  test("regression 1+5: sandbox evidence observed live survives a complete coordinator restart identically", async () => {
+    const root = newRoot();
+    const live = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    let liveState: M5JudgeState | null = null;
+    try {
+      live.start();
+      const deadline = Date.now() + 120_000;
+      while (Date.now() < deadline) {
+        const current = live.state();
+        if (sandboxEntryOf(current) !== undefined) {
+          liveState = current;
+          break;
+        }
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+      }
+    } finally {
+      await live.close();
+    }
+    assert.ok(liveState !== null, "the live mission produced authoritative sandbox.created evidence");
+    assert.ok(liveState.mission.sessionId !== null, "the mission bound a durable TrueForge session");
+    const liveEntry = sandboxEntryOf(liveState);
+    assert.ok(liveEntry !== undefined);
+    const liveHarness = await createPollingHarness(liveState, []);
+    assert.equal(liveHarness.text("chain-sandbox"), "Observed");
+
+    const restarted = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    try {
+      const resumed = restarted.state();
+      const resumedEntry = sandboxEntryOf(resumed);
+      assert.ok(
+        resumedEntry !== undefined,
+        "a full coordinator restart must not regress durable sandbox evidence to Configured",
+      );
+      assert.equal(resumedEntry.title, liveEntry.title, "live and restarted projections converge");
+      assert.equal(resumedEntry.detail, liveEntry.detail);
+      assert.equal(resumed.mission.sessionId, liveState.mission.sessionId, "same durable session");
+      const resumedHarness = await createPollingHarness(resumed, []);
+      assert.equal(
+        resumedHarness.text("chain-sandbox"),
+        "Observed",
+        "the resumed Sandbox station stays Observed for this mission/session",
+      );
+      assert.equal(resumedHarness.text("chain-agents"), "Configured", "no invented agent evidence appears");
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  test("regression 2: a restart before any sandbox evidence stays Configured", async () => {
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/pre-sandbox");
+    const restarted = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    try {
+      const resumed = restarted.state();
+      assert.equal(sandboxEntryOf(resumed), undefined);
+      const harness = await createPollingHarness(resumed, []);
+      assert.equal(harness.text("chain-sandbox"), "Configured");
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  test("regression 3: evidence from another mission or session never promotes", async () => {
+    const crossSession = newRoot();
+    await ownRoot(crossSession);
+    await bindHeroMission(crossSession, "session/current");
+    writeFileSync(
+      join(crossSession, "m5-sandbox-evidence.json"),
+      JSON.stringify({
+        missionId: HERO_MISSION_ID,
+        trueforgeSessionId: "session/another",
+        trueforgeTurnId: "turn/foreign",
+      }),
+    );
+    const crossSessionCoordinator = new M5DemoCoordinator({ dataRoot: crossSession, cleanupDataOnClose: false });
+    try {
+      assert.equal(
+        sandboxEntryOf(crossSessionCoordinator.state()),
+        undefined,
+        "another session's sandbox evidence cannot promote this mission",
+      );
+    } finally {
+      await crossSessionCoordinator.close();
+    }
+    const crossMission = newRoot();
+    await ownRoot(crossMission);
+    await bindHeroMission(crossMission, "session/current");
+    writeFileSync(
+      join(crossMission, "m5-sandbox-evidence.json"),
+      JSON.stringify({
+        missionId: "mission/some-other",
+        trueforgeSessionId: "session/current",
+        trueforgeTurnId: "turn/foreign",
+      }),
+    );
+    const crossMissionCoordinator = new M5DemoCoordinator({ dataRoot: crossMission, cleanupDataOnClose: false });
+    try {
+      assert.equal(sandboxEntryOf(crossMissionCoordinator.state()), undefined);
+    } finally {
+      await crossMissionCoordinator.close();
+    }
+    const malformed = newRoot();
+    await ownRoot(malformed);
+    await bindHeroMission(malformed, "session/current");
+    writeFileSync(join(malformed, "m5-sandbox-evidence.json"), "not json {");
+    const malformedCoordinator = new M5DemoCoordinator({ dataRoot: malformed, cleanupDataOnClose: false });
+    try {
+      assert.equal(sandboxEntryOf(malformedCoordinator.state()), undefined, "a malformed marker fails closed");
+    } finally {
+      await malformedCoordinator.close();
+    }
+  });
+
+  test("regression 4: a stale poll cannot regress the observed Sandbox station", async () => {
+    const root = newRoot();
+    const coordinator = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    let idle!: M5JudgeState;
+    try {
+      idle = coordinator.state();
+    } finally {
+      await coordinator.close();
+    }
+    const observed: M5JudgeState = {
+      ...uiProjection(idle, 6, "awaiting_approval"),
+      evidenceTimeline: [
+        ...idle.evidenceTimeline,
+        {
+          sequence: idle.evidenceTimeline.length + 1,
+          kind: "sandbox",
+          title: "Assurance sandbox created",
+          detail: "TrueForge Code Mode opened an isolated deterministic assurance run.",
+          technicalIdentity: null,
+          status: "informational",
+        },
+      ],
+    };
+    const stale = deferred<unknown>();
+    const harness = await createPollingHarness(observed, [stale.promise]);
+    assert.equal(harness.text("chain-sandbox"), "Observed");
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    stale.resolve(uiProjection(idle, 2, "awaiting_approval"));
+    await oldPoll;
+    assert.equal(
+      harness.text("chain-sandbox"),
+      "Observed",
+      "a stale cross-generation projection cannot regress or contaminate the station",
+    );
+  });
+
+  test("regressions 6+7: terminal rules and replay keep truthful stations without new owner calls", async () => {
+    const root = newRoot();
+    const coordinator = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    let idle!: M5JudgeState;
+    try {
+      idle = coordinator.state();
+    } finally {
+      await coordinator.close();
+    }
+    const sandboxEntry = {
+      sequence: idle.evidenceTimeline.length + 1,
+      kind: "sandbox",
+      title: "Assurance sandbox created",
+      detail: "TrueForge Code Mode opened an isolated deterministic assurance run.",
+      technicalIdentity: null,
+      status: "informational" as const,
+    };
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const replayed: M5JudgeState = {
+      ...verifiedBase,
+      run: { ...verifiedBase.run, ownerCallsThisProcess: 0 },
+      mission: { ...verifiedBase.mission, disconnectedAndResumed: true },
+      activity: { ...verifiedBase.activity, sandboxExecutions: 1 },
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const replayHarness = await createPollingHarness(replayed, []);
+    assert.equal(replayHarness.text("chain-sandbox"), "Observed", "replay preserves sandbox observation");
+    assert.equal(replayHarness.text("chain-sandbox"), "Observed");
+    assert.notEqual(replayHarness.text("chain-sandbox"), "Verified", "sandbox observation alone is never Verified");
+    assert.equal(replayHarness.text("chain-verified"), "Verified", "exact terminal verification promotes the verified station");
+    assert.equal(replayHarness.text("chain-resume"), "Observed");
+    const failedTerminal: M5JudgeState = {
+      ...idle,
+      revision: 9,
+      run: { ...idle.run, status: "failed" },
+      evidenceTimeline: [...idle.evidenceTimeline, sandboxEntry],
+      execution: { ...idle.execution, mutationCount: 1, terminalEventCount: 1, terminalStatus: "terminal_reconciled" },
+    };
+    const failedHarness = await createPollingHarness(failedTerminal, []);
+    assert.equal(failedHarness.text("chain-sandbox"), "Observed", "a terminal failure does not erase sandbox evidence");
+    assert.equal(failedHarness.text("chain-verified"), "—", "terminal reconciliation alone never promotes Verified");
+  });
+});
+
 describe("Qodo PR16 Round 1: truthful failure, terminal, and chain evidence", () => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-round1-"));
   let coordinator!: M5DemoCoordinator;

@@ -47,6 +47,7 @@ import {
   type DeterministicM4MissionResult,
 } from "./m4-runner.js";
 import { createStore } from "./store.js";
+import { parseJsonRejectingDuplicateKeys } from "./strict-json.js";
 import {
   DETERMINISTIC_MODEL_NAME,
   DETERMINISTIC_MODEL_PROVIDER_NAME,
@@ -288,6 +289,7 @@ interface DemoPaths {
   readonly mission: string;
   readonly trueforge: string;
   readonly sandboxes: string;
+  readonly sandboxEvidence: string;
 }
 
 export class M5RequestError extends Error {
@@ -339,8 +341,67 @@ export class M5DemoCoordinator {
       mission: join(this.#dataRoot, "mission.sqlite"),
       trueforge: join(this.#dataRoot, "trueforge.sqlite"),
       sandboxes: join(this.#dataRoot, "trueforge-data"),
+      sandboxEvidence: join(this.#dataRoot, "m5-sandbox-evidence.json"),
     };
     establishOwnedDataRoot(this.#dataRoot);
+    this.#restoreDurableSandboxEvidence();
+  }
+
+  /**
+   * The sandbox.created checkpoint is relayed once per mission by the live
+   * TrueForge stream and is never re-emitted after the persisted resume
+   * cursor passes it. The coordinator therefore persists that authoritative
+   * observation, bound to the exact mission and session, and every
+   * projection — live or after a full process restart — flows through the
+   * same #recordSandboxEvidence path. A marker from another mission or
+   * session, or a malformed marker, fails closed and promotes nothing.
+   */
+  #restoreDurableSandboxEvidence(): void {
+    if (!existsSync(this.#paths.sandboxEvidence)) return;
+    try {
+      const marker = objectValue(
+        parseJsonRejectingDuplicateKeys(readFileSync(this.#paths.sandboxEvidence, "utf8")),
+      );
+      const snapshot = this.#readMissionSnapshot();
+      if (
+        marker === null ||
+        snapshot === null ||
+        stringValue(marker["missionId"]) !== snapshot.mission.missionId ||
+        stringValue(marker["trueforgeSessionId"]) !== snapshot.mission.trueforgeSessionId ||
+        snapshot.mission.missionId !== M4_HERO_MISSION_ID
+      ) {
+        return;
+      }
+      this.#recordSandboxEvidence();
+    } catch {
+      // A malformed marker is ignored; the station honestly stays Configured.
+    }
+  }
+
+  #recordSandboxEvidence(): void {
+    this.#upsertEvidence(
+      "sandbox",
+      "Assurance sandbox created",
+      "TrueForge Code Mode opened an isolated deterministic assurance run.",
+      "informational",
+    );
+  }
+
+  #persistSandboxEvidence(): void {
+    const snapshot = this.#readMissionSnapshot();
+    if (snapshot === null) return;
+    try {
+      writeFileSync(
+        this.#paths.sandboxEvidence,
+        `${JSON.stringify({
+          missionId: snapshot.mission.missionId,
+          trueforgeSessionId: snapshot.mission.trueforgeSessionId,
+          trueforgeTurnId: snapshot.mission.currentTurnId,
+        })}\n`,
+      );
+    } catch {
+      // Persistence is best effort; the live in-memory evidence still renders.
+    }
   }
 
   public start(): M5JudgeState {
@@ -778,12 +839,8 @@ export class M5DemoCoordinator {
 
   #observeCheckpoint(checkpoint: M4MissionCheckpoint): void {
     if (checkpoint.phase === "running_turn") {
-      this.#upsertEvidence(
-        "sandbox",
-        "Assurance sandbox created",
-        "TrueForge Code Mode opened an isolated deterministic assurance run.",
-        "informational",
-      );
+      this.#persistSandboxEvidence();
+      this.#recordSandboxEvidence();
     } else if (checkpoint.phase === "approval_bridge_bound") {
       if (!this.#observedApprovals.some((item) => item.bridgeKey === checkpoint.approval.bridgeKey)) {
         this.#observedApprovals.push(checkpoint.approval);
@@ -1423,6 +1480,7 @@ function cleanupOwnedDemoArtifacts(dataRoot: string, paths: DemoPaths): void {
       rmSync(artifact, { force: true });
     }
   }
+  rmSync(paths.sandboxEvidence, { force: true });
   rmSync(paths.sandboxes, { recursive: true, force: true });
 }
 
