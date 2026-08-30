@@ -268,7 +268,7 @@ export async function runCapacityShockMission(
       },
     });
 
-    mechanicalDenialBridge({
+    await mechanicalDenialBridge({
       missionStore,
       store,
       sessionId,
@@ -621,7 +621,7 @@ function approvalBound(
   return result === undefined ? null : (result as unknown as M4ApprovalRecord);
 }
 
-function mechanicalDenialBridge(input: {
+async function mechanicalDenialBridge(input: {
   readonly missionStore: M4MissionStore;
   readonly store: FlakeBrakeStore;
   readonly sessionId: string;
@@ -629,7 +629,7 @@ function mechanicalDenialBridge(input: {
   readonly fresh: AdmissionRecordBody;
   readonly primaryEffect: EffectFingerprint;
   readonly checkpointObserver?: CapacityShockMissionOptions["checkpointObserver"];
-}): void {
+}): Promise<void> {
   const action = input.missionStore.recordBridgeAction({
     missionId: CAPACITY_SHOCK_MISSION_ID,
     trueforgeSessionId: input.sessionId,
@@ -677,7 +677,7 @@ function mechanicalDenialBridge(input: {
   };
   input.missionStore.recordBridgeOutcome(action.bridgeKey, "approval_bound", asJson(record));
   input.missionStore.advanceCursor(CAPACITY_SHOCK_MISSION_ID, record.turnId, 4);
-  void input.checkpointObserver?.({ phase: "approval_bridge_bound", approval: record });
+  await input.checkpointObserver?.({ phase: "approval_bridge_bound", approval: record });
 }
 
 function executeAlternative(

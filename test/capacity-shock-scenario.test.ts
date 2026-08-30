@@ -114,6 +114,59 @@ describe("capacity-shock deterministic fixture", () => {
 });
 
 describe("capacity-shock durable mission", { concurrency: false }, () => {
+  test("awaits the mechanical-denial checkpoint and propagates observer failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "flakebrake-capacity-shock-checkpoint-test-"));
+    let ownerCalls = 0;
+    let releaseCheckpoint!: (error: Error) => void;
+    let observeMechanicalDenial!: () => void;
+    const mechanicalDenialObserved = new Promise<void>((resolve) => {
+      observeMechanicalDenial = resolve;
+    });
+    const checkpointFailure = new Promise<void>((_resolve, reject) => {
+      releaseCheckpoint = reject;
+    });
+    try {
+      const running = runCapacityShockMission({
+        m2DatabasePath: join(root, "m2.sqlite"),
+        factoryDatabasePath: join(root, "factory.sqlite"),
+        missionDatabasePath: join(root, "mission.sqlite"),
+        ownerDecisionProvider: (request) => {
+          ownerCalls += 1;
+          const deny =
+            request.toolName === "create_schedule_reservation" &&
+            canonicalSerialize(request.arguments).includes("09:12:00");
+          return m4OwnerDecisionResponse(
+            request,
+            "owner/test-capacity-shock-checkpoint",
+            deny
+              ? {
+                  status: "deny",
+                  reason: "The primary interval overlaps the spindle calibration hold",
+                }
+              : { status: "allow" },
+          );
+        },
+        checkpointObserver: (checkpoint) => {
+          if (
+            checkpoint.phase === "approval_bridge_bound" &&
+            checkpoint.approval.source === "active_m2_denial"
+          ) {
+            observeMechanicalDenial();
+            return checkpointFailure;
+          }
+          return undefined;
+        },
+      });
+      await mechanicalDenialObserved;
+      assert.equal(ownerCalls, 3);
+      releaseCheckpoint(new Error("mechanical checkpoint failed"));
+      await assert.rejects(running, /mechanical checkpoint failed/);
+      assert.equal(ownerCalls, 3);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("records exact decisions and one effect, then replays without duplication", async () => {
     const root = mkdtempSync(join(tmpdir(), "flakebrake-capacity-shock-runner-test-"));
     let ownerCalls = 0;

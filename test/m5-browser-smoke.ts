@@ -30,12 +30,18 @@ const { Network: createBidiNetwork } = requireModule("selenium-webdriver/bidi/ne
 };
 
 const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-browser-"));
+let running: Awaited<ReturnType<typeof startM5JudgeServer>>;
+try {
+  running = await startM5JudgeServer({
+    dataRoot: root,
+    port: 4176,
+    cleanupDataOnClose: true,
+  });
+} catch (error: unknown) {
+  rmSync(root, { recursive: true, force: true });
+  throw error;
+}
 const screenshots = mkdtempSync(join(tmpdir(), "flakebrake-m5-screenshots-"));
-const running = await startM5JudgeServer({
-  dataRoot: root,
-  port: 4176,
-  cleanupDataOnClose: true,
-});
 const transportKillServer = createServer((socket) => socket.destroy());
 await new Promise<void>((resolveListen) => {
   transportKillServer.listen(0, "127.0.0.1", resolveListen);
