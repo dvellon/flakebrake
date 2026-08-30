@@ -22,6 +22,7 @@ import {
   CONTROLLED_ERROR_PROBE_URL,
   formatFailedResponse,
   formatTransportFailure,
+  sessionCleanupStack,
   type BrowserNetworkObserver,
   type BrowserScriptErrorObserver,
   type ObserverSessionBrowser,
@@ -482,6 +483,135 @@ describe("Qodo Round 3: executable session network-failure capture", () => {
     assert.equal(session.emitFailedResponse("http://application.invalid/late.js", 503), 0);
     assert.equal(session.emitTransportFailure("http://application.invalid/late-poll", "NS_ERROR_NET_RESET"), 0);
     assert.deepEqual(capture.failedResponses(), []);
+  });
+});
+
+describe("Qodo Round 4: failure-atomic capture arming", () => {
+  const NETWORK_PROBE_URL = "http://application.invalid/m5-controlled-missing-resource-probe";
+  const TRANSPORT_PROBE_URL = "http://transport.invalid/m5-controlled-transport-failure-probe";
+
+  const armNetwork = (session: FakeNetworkSession): ReturnType<typeof armSessionNetworkCapture> =>
+    armSessionNetworkCapture(session.observer, session.browser, NETWORK_PROBE_URL, session.transportProbe);
+
+  test("the cleanup stack releases in reverse order, exhaustively, exactly once", async () => {
+    const order: string[] = [];
+    const stack = sessionCleanupStack();
+    stack.own(async () => {
+      order.push("first");
+    });
+    stack.own(async () => {
+      order.push("second");
+      throw new Error("controlled release failure");
+    });
+    stack.own(async () => {
+      order.push("third");
+    });
+    await assert.rejects(stack.release(), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(String((error as AggregateError).errors[0]), /controlled release failure/u);
+      return true;
+    });
+    assert.deepEqual(order, ["third", "second", "first"]);
+    await stack.release();
+    assert.deepEqual(order, ["third", "second", "first"]);
+  });
+
+  test("error-capture arming failures release the observer at every boundary", async () => {
+    const boundaries = [
+      { label: "probe navigation", options: { failNavigationToProbe: true }, message: /controlled probe navigation failure/u },
+      { label: "load observation", options: { deliverLoadErrors: false }, message: /did not capture the controlled load-time probe error/u },
+      { label: "refresh", options: { failRefresh: true }, message: /controlled refresh failure/u },
+      { label: "refresh re-observation", options: { dropHandlersOnRefresh: true }, message: /did not keep capturing the probe error across refresh/u },
+    ];
+    for (const boundary of boundaries) {
+      const session = createFakeBrowserSession(boundary.options);
+      await assert.rejects(armSessionErrorCapture(session.script, session.browser), boundary.message, boundary.label);
+      assert.equal(session.registeredHandlerCount(), 0, `${boundary.label}: observer released`);
+      assert.equal(
+        session.events.filter((event) => event.startsWith("remove:")).length,
+        1,
+        `${boundary.label}: exactly one removal`,
+      );
+    }
+  });
+
+  test("error-capture cleanup failure is preserved alongside the arming failure", async () => {
+    const session = createFakeBrowserSession({ deliverLoadErrors: false, failRemoval: true });
+    await assert.rejects(armSessionErrorCapture(session.script, session.browser), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      const aggregate = error as AggregateError;
+      assert.match(String(aggregate.errors[0]), /did not capture the controlled load-time probe error/u);
+      const cleanupFailure = aggregate.errors[1] as AggregateError;
+      assert.match(String(cleanupFailure.errors[0]), /controlled removal failure/u);
+      assert.match(String((aggregate.cause as Error).message), /did not capture the controlled load-time probe error/u);
+      return true;
+    });
+  });
+
+  test("error-capture dispose is exact-once and idempotent", async () => {
+    const session = createFakeBrowserSession();
+    const capture = await armSessionErrorCapture(session.script, session.browser);
+    await capture.dispose();
+    await capture.dispose();
+    assert.equal(session.registeredHandlerCount(), 0);
+    assert.equal(session.events.filter((event) => event.startsWith("remove:")).length, 1);
+  });
+
+  test("network arming failures release both channels at every boundary", async () => {
+    const boundaries = [
+      { label: "fetch-error registration", options: { failFetchErrorRegistration: true }, message: /controlled fetch-error registration failure/u },
+      { label: "first transport trigger", options: { failTransportTriggerOnCall: 1 }, message: /controlled transport trigger failure/u },
+      { label: "transport observation", options: { deliverTransportEvents: false }, message: /did not observe the controlled transport-failure probe/u },
+      { label: "probe navigation", options: { failNavigation: true }, message: /controlled probe navigation failure/u },
+      { label: "missing-resource observation", options: { deliverResponses: false }, message: /did not observe the controlled missing-resource probe/u },
+      { label: "refresh", options: { failRefresh: true }, message: /controlled refresh failure/u },
+      { label: "missing-resource re-observation", options: { dropHandlersOnRefresh: true }, message: /did not keep observing the missing-resource probe across refresh/u },
+      { label: "transport re-observation", options: { dropFetchErrorHandlersOnRefresh: true }, message: /did not keep observing the transport-failure probe across refresh/u },
+      { label: "second transport trigger", options: { failTransportTriggerOnCall: 2 }, message: /controlled transport trigger failure/u },
+      { label: "evidence settling", options: { rejectWaitMessageMatching: /did not settle/u }, message: /did not settle before clearing/u },
+    ];
+    for (const boundary of boundaries) {
+      const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, boundary.options);
+      await assert.rejects(armNetwork(session), boundary.message, boundary.label);
+      assert.equal(session.registeredHandlerCount(), 0, `${boundary.label}: response channel released`);
+      assert.equal(session.registeredFetchErrorHandlerCount(), 0, `${boundary.label}: fetch-error channel released`);
+      assert.equal(
+        session.events.filter((event) => event === "remove").length,
+        1,
+        `${boundary.label}: exactly one removal`,
+      );
+    }
+  });
+
+  test("network cleanup failure is preserved alongside the arming failure", async () => {
+    const session = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, {
+      deliverTransportEvents: false,
+      failRemoval: true,
+    });
+    await assert.rejects(armNetwork(session), (error: unknown) => {
+      assert.equal(error instanceof AggregateError, true);
+      const aggregate = error as AggregateError;
+      assert.match(String(aggregate.errors[0]), /did not observe the controlled transport-failure probe/u);
+      const cleanupFailure = aggregate.errors[1] as AggregateError;
+      assert.match(String(cleanupFailure.errors[0]), /controlled removal failure/u);
+      assert.match(String((aggregate.cause as Error).message), /did not observe the controlled transport-failure probe/u);
+      return true;
+    });
+  });
+
+  test("network dispose is exact-once and a rejected arming releases exactly once", async () => {
+    const healthy = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL);
+    const capture = await armNetwork(healthy);
+    await capture.dispose();
+    await capture.dispose();
+    assert.equal(healthy.events.filter((event) => event === "remove").length, 1);
+    const failing = createFakeNetworkSession(NETWORK_PROBE_URL, TRANSPORT_PROBE_URL, {
+      deliverTransportEvents: false,
+    });
+    await assert.rejects(armNetwork(failing), /did not observe the controlled transport-failure probe/u);
+    assert.equal(failing.events.filter((event) => event === "remove").length, 1);
+    assert.equal(failing.registeredHandlerCount(), 0);
+    assert.equal(failing.registeredFetchErrorHandlerCount(), 0);
   });
 });
 
@@ -1644,9 +1774,15 @@ interface FakeBrowserSession {
 function createFakeBrowserSession(options?: {
   readonly deliverLoadErrors?: boolean;
   readonly dropHandlersOnRefresh?: boolean;
+  readonly failNavigationToProbe?: boolean;
+  readonly failRefresh?: boolean;
+  readonly failRemoval?: boolean;
 }): FakeBrowserSession {
   const deliverLoadErrors = options?.deliverLoadErrors ?? true;
   const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
+  const failNavigationToProbe = options?.failNavigationToProbe ?? false;
+  const failRefresh = options?.failRefresh ?? false;
+  const failRemoval = options?.failRemoval ?? false;
   const events: string[] = [];
   const handlers = new Map<number, (entry: unknown) => void>();
   let nextHandlerId = 41;
@@ -1669,6 +1805,7 @@ function createFakeBrowserSession(options?: {
         return handlerId;
       },
       removeJavaScriptErrorHandler: async (handlerId) => {
+        if (failRemoval) throw new Error("controlled removal failure");
         handlers.delete(handlerId);
         events.push(`remove:${String(handlerId)}`);
       },
@@ -1677,10 +1814,14 @@ function createFakeBrowserSession(options?: {
       get: async (url) => {
         currentUrl = url;
         events.push(url === CONTROLLED_ERROR_PROBE_URL ? "navigate:probe" : `navigate:${url}`);
+        if (failNavigationToProbe && url === CONTROLLED_ERROR_PROBE_URL) {
+          throw new Error("controlled probe navigation failure");
+        }
         deliverProbeLoadError();
       },
       refresh: async () => {
         events.push("refresh");
+        if (failRefresh) throw new Error("controlled refresh failure");
         if (dropHandlersOnRefresh) handlers.clear();
         deliverProbeLoadError();
       },
@@ -1715,12 +1856,25 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
   readonly registerFetchError?: boolean;
   readonly dropHandlersOnRefresh?: boolean;
   readonly dropFetchErrorHandlersOnRefresh?: boolean;
+  readonly failFetchErrorRegistration?: boolean;
+  readonly failTransportTriggerOnCall?: number;
+  readonly failNavigation?: boolean;
+  readonly failRefresh?: boolean;
+  readonly failRemoval?: boolean;
+  readonly rejectWaitMessageMatching?: RegExp;
 }): FakeNetworkSession {
   const deliverResponses = options?.deliverResponses ?? true;
   const deliverTransportEvents = options?.deliverTransportEvents ?? true;
   const registerFetchError = options?.registerFetchError ?? true;
   const dropHandlersOnRefresh = options?.dropHandlersOnRefresh ?? false;
   const dropFetchErrorHandlersOnRefresh = options?.dropFetchErrorHandlersOnRefresh ?? false;
+  const failFetchErrorRegistration = options?.failFetchErrorRegistration ?? false;
+  const failTransportTriggerOnCall = options?.failTransportTriggerOnCall ?? 0;
+  const failNavigation = options?.failNavigation ?? false;
+  const failRefresh = options?.failRefresh ?? false;
+  const failRemoval = options?.failRemoval ?? false;
+  const rejectWaitMessageMatching = options?.rejectWaitMessageMatching ?? null;
+  let transportTriggerCalls = 0;
   const events: string[] = [];
   const handlers = new Set<(entry: { url: string; status: number }) => void>();
   const fetchErrorHandlers = new Set<(entry: { url: string; errorText: string }) => void>();
@@ -1745,10 +1899,12 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
         events.push("register-response");
       },
       addFetchErrorHandler: async (callback) => {
+        if (failFetchErrorRegistration) throw new Error("controlled fetch-error registration failure");
         if (registerFetchError) fetchErrorHandlers.add(callback);
         events.push("register-fetch-error");
       },
       removeNetworkHandlers: async () => {
+        if (failRemoval) throw new Error("controlled removal failure");
         handlers.clear();
         fetchErrorHandlers.clear();
         events.push("remove");
@@ -1758,15 +1914,18 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
       get: async (url) => {
         currentUrl = url;
         events.push(url === probeUrl ? "navigate:probe" : `navigate:${url}`);
+        if (failNavigation && url === probeUrl) throw new Error("controlled probe navigation failure");
         deliverProbeResponse();
       },
       refresh: async () => {
         events.push("refresh");
+        if (failRefresh) throw new Error("controlled refresh failure");
         if (dropHandlersOnRefresh) handlers.clear();
         if (dropFetchErrorHandlersOnRefresh) fetchErrorHandlers.clear();
         deliverProbeResponse();
       },
       wait: async (condition, _timeoutMs, message) => {
+        if (rejectWaitMessageMatching?.test(message) === true) throw new Error(message);
         for (let turn = 0; turn < 8; turn += 1) {
           if (condition()) return;
           await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
@@ -1777,7 +1936,11 @@ function createFakeNetworkSession(probeUrl: string, transportProbeUrl: string, o
     transportProbe: {
       url: transportProbeUrl,
       trigger: async () => {
+        transportTriggerCalls += 1;
         events.push("transport-probe");
+        if (failTransportTriggerOnCall === transportTriggerCalls) {
+          throw new Error("controlled transport trigger failure");
+        }
         if (deliverTransportEvents) deliverToFetchErrorHandlers(transportProbeUrl, "NS_ERROR_NET_RESET");
       },
     },
