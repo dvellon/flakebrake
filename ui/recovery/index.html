@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>FlakeBrake · Recovery demonstration</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#controls">Skip to recovery controls</a>
+    <header class="topbar">
+      <div class="brand"><span aria-hidden="true">FB</span><strong>FlakeBrake</strong></div>
+      <div class="mode-badge">Explicit mode · Recovery demonstration</div>
+      <div class="connection" role="status" aria-live="polite">
+        <span id="connection-dot" aria-hidden="true"></span>
+        <span id="connection-label">Connecting…</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Deterministic exact-once recovery</p>
+          <h1 id="page-title">Stop at the seam.<br><span>Converge once.</span></h1>
+          <p>This isolated mode deliberately closes an invocation-owned runner at one exact durability boundary, reopens the same databases, and proves recovery plus replay.</p>
+        </div>
+        <aside class="isolation-note" aria-label="Isolation guarantees">
+          <strong>Isolated by construction</strong>
+          <span>Loopback only</span>
+          <span>Invocation-owned SQLite databases</span>
+          <span>No credentials or process kill</span>
+          <span>Unavailable in the standard hero flow</span>
+        </aside>
+      </section>
+
+      <section id="controls" class="panel controls" aria-labelledby="controls-title">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Controlled boundary</p><h2 id="controls-title">Choose exactly where the runner stops</h2></div>
+          <span id="stage-pill" class="pill">Idle</span>
+        </div>
+        <fieldset id="boundary-fieldset">
+          <legend>Interruption point</legend>
+          <label class="boundary-option">
+            <input type="radio" name="boundary" value="after_execution_fence_before_factory_mutation" checked>
+            <span><strong>Fence durable · before mutation</strong><small>M2 has one active execution fence. Factory writes remain zero.</small></span>
+          </label>
+          <label class="boundary-option">
+            <input type="radio" name="boundary" value="after_factory_commit_before_m2_binding">
+            <span><strong>Factory committed · before M2 binding</strong><small>The mutation and receipt exist. M2 has not bound or verified them.</small></span>
+          </label>
+        </fieldset>
+        <div class="actions" aria-label="Recovery demonstration actions">
+          <button id="interrupt-button" class="button primary" type="button">1 · Run to interruption</button>
+          <button id="restart-button" class="button" type="button" disabled>2 · Restart runner</button>
+          <button id="recover-button" class="button" type="button" disabled>3 · Recover and verify</button>
+          <button id="replay-button" class="button" type="button" disabled>4 · Replay completion</button>
+          <button id="reset-button" class="button quiet" type="button" disabled>Reset</button>
+        </div>
+        <p id="action-guidance" class="guidance">Select a boundary, then run until the deterministic stop.</p>
+        <p id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="stage-title">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Lifecycle</p><h2 id="stage-title" tabindex="-1">Ready to demonstrate recovery</h2></div>
+          <strong id="runner-state" class="runner-state">Runner not started</strong>
+        </div>
+        <ol id="stage-list" class="stage-list">
+          <li data-phase="setup"><span>1</span><div><strong>Prepare</strong><small>Durable claim and bounded authorization</small></div></li>
+          <li data-phase="interruption"><span>2</span><div><strong>Interrupt</strong><small>Reach exact boundary and close owner</small></div></li>
+          <li data-phase="restart"><span>3</span><div><strong>Restart</strong><small>Reopen the same database identities</small></div></li>
+          <li data-phase="recovery"><span>4</span><div><strong>Recover</strong><small>Use existing executor or fence recovery</small></div></li>
+          <li data-phase="verification"><span>5</span><div><strong>Verify</strong><small>Independent read-back and terminal facts</small></div></li>
+          <li data-phase="replay"><span>6</span><div><strong>Replay</strong><small>Prove the completed action is a no-op</small></div></li>
+        </ol>
+      </section>
+
+      <div class="evidence-grid">
+        <section class="panel evidence before" aria-labelledby="before-title">
+          <p class="eyebrow">Before interruption</p>
+          <h2 id="before-title">What was durable</h2>
+          <p id="durable-before">Choose a boundary to expose its exact durable cut.</p>
+          <dl class="identity-list">
+            <div><dt>Fence</dt><dd id="before-fence">—</dd></div>
+            <div><dt>Receipt</dt><dd id="before-receipt">—</dd></div>
+            <div><dt>Claim</dt><dd id="before-claim">—</dd></div>
+          </dl>
+        </section>
+        <section class="panel evidence after" aria-labelledby="after-title">
+          <p class="eyebrow">After restart</p>
+          <h2 id="after-title">What recovery completed</h2>
+          <p id="recovered-after">Recovery evidence will appear after the fresh runner resumes.</p>
+          <dl class="identity-list">
+            <div><dt>Fence</dt><dd id="after-fence">—</dd></div>
+            <div><dt>Receipt</dt><dd id="after-receipt">—</dd></div>
+            <div><dt>Claim</dt><dd id="after-claim">—</dd></div>
+          </dl>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="counts-title">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Exact-once ledger</p><h2 id="counts-title">Durable counts</h2></div>
+          <span id="exact-once-pill" class="pill">Pending</span>
+        </div>
+        <div class="count-table" role="table" aria-label="Counts before interruption and after recovery">
+          <div class="count-row count-header" role="row"><span role="columnheader">Fact</span><span role="columnheader">Before</span><span role="columnheader">After</span></div>
+          <div class="count-row" role="row"><strong role="rowheader">Acceptance</strong><span id="before-acceptances">0</span><span id="after-acceptances">0</span></div>
+          <div class="count-row" role="row"><strong role="rowheader">Attempt</strong><span id="before-attempts">0</span><span id="after-attempts">0</span></div>
+          <div class="count-row" role="row"><strong role="rowheader">Fence binding</strong><span id="before-bindings">0</span><span id="after-bindings">0</span></div>
+          <div class="count-row highlight" role="row"><strong role="rowheader">Factory mutation</strong><span id="before-mutations">0</span><span id="after-mutations">0</span></div>
+          <div class="count-row highlight" role="row"><strong role="rowheader">Receipt</strong><span id="before-receipts">0</span><span id="after-receipts">0</span></div>
+          <div class="count-row highlight" role="row"><strong role="rowheader">Terminal event</strong><span id="before-terminals">0</span><span id="after-terminals">0</span></div>
+          <div class="count-row" role="row"><strong role="rowheader">Actual facts</strong><span id="before-actuals">0</span><span id="after-actuals">0</span></div>
+        </div>
+        <div class="invariants">
+          <div id="no-mixed-invariant"><span aria-hidden="true">○</span><strong>No terminal-failure + mutation mix</strong></div>
+          <div id="actuals-invariant"><span aria-hidden="true">○</span><strong>Expected actuals: agent 6 · production 30</strong></div>
+          <div id="replay-invariant"><span aria-hidden="true">○</span><strong id="replay-proof">Replay proof pending</strong></div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="timeline-title">
+        <div class="panel-heading"><div><p class="eyebrow">Visible evidence</p><h2 id="timeline-title">Durability and recovery log</h2></div></div>
+        <ol id="timeline" class="timeline"><li class="empty">No run has started.</li></ol>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="alert"></div>
+    <footer>Deterministic recovery mode · loopback · invocation-owned state · port 4177 by default</footer>
+  </body>
+</html>

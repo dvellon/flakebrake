@@ -11,7 +11,6 @@ import { startDeterministicM4Model } from "./m4-deterministic-model.js";
 import { M4MissionStore } from "./m4-mission-store.js";
 import {
   startFactoryMcpHttpCluster,
-  type RunningFactoryMcpHttpCluster,
 } from "./mcp-http.js";
 import {
   HERO_ENVIRONMENT_ID,
@@ -30,7 +29,10 @@ import {
   startTrueForgeServer,
   type RunningTrueForgeServer,
 } from "./trueforge-runtime.js";
-import type { RunningDeterministicM4Model } from "./m4-deterministic-model.js";
+import {
+  DeterministicM4RunnerOwnership,
+  retainM4RunnerCleanupDiagnostics,
+} from "./m4-runner-lifecycle.js";
 
 export const M4_HERO_MISSION_ID = "mission/flakebrake-m4-hero";
 
@@ -40,6 +42,7 @@ export interface DeterministicM4MissionOptions {
   readonly missionDatabasePath: string;
   readonly trueforgeDatabasePath: string;
   readonly localSandboxRootParent: string;
+  readonly signal?: AbortSignal;
   readonly missionId?: string;
   readonly ownerDecisionProvider?: M4OwnerDecisionProvider;
   readonly disconnectInitialStreamAfterEvents?: number;
@@ -69,36 +72,62 @@ export interface DeterministicM4MissionResult {
 export async function runDeterministicM4Mission(
   options: DeterministicM4MissionOptions,
 ): Promise<DeterministicM4MissionResult> {
+  const ownership = new DeterministicM4RunnerOwnership(options.signal);
+  ownership.throwIfAborted();
   initializeEnvironment(options);
   const missionId = options.missionId ?? M4_HERO_MISSION_ID;
-  const missionStore = new M4MissionStore({
-    path: options.missionDatabasePath,
-    now: () => HERO_HORIZON_END,
-  });
-  let http: RunningFactoryMcpHttpCluster | undefined;
-  let model: RunningDeterministicM4Model | undefined;
-  let trueforge: RunningTrueForgeServer | undefined;
-  try {
-    http = await startFactoryMcpHttpCluster({
-      factoryDatabasePath: options.factoryDatabasePath,
-      m2DatabasePath: options.m2DatabasePath,
+  const missionStore = ownership.own(
+    new M4MissionStore({
+      path: options.missionDatabasePath,
       now: () => HERO_HORIZON_END,
-      enableM4Tools: true,
-    });
-    model = await startDeterministicM4Model({
-      m2DatabasePath: options.m2DatabasePath,
-      factoryDatabasePath: options.factoryDatabasePath,
-    });
-    trueforge = await startTrueForgeServer({
-      sqlitePath: options.trueforgeDatabasePath,
-      localSandboxRootParent: options.localSandboxRootParent,
-    });
-    const connectors = await registerFactoryMcpConnectors(
-      trueforge.client,
-      http,
+    }),
+    (store) => store.close(),
+  );
+  let trueforge: RunningTrueForgeServer | undefined;
+  let primaryError: Error | undefined;
+  try {
+    const acquiredHttp = await ownership.acquire(
+      () =>
+        startFactoryMcpHttpCluster({
+          factoryDatabasePath: options.factoryDatabasePath,
+          m2DatabasePath: options.m2DatabasePath,
+          now: () => HERO_HORIZON_END,
+          enableM4Tools: true,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        }),
+      (running) => running.close(),
     );
-    await configureDeterministicModelProvider(trueforge.client, model.baseUrl);
-    const agent = await ensureFlakeBrakeRootAgent(trueforge.client);
+    const acquiredModel = await ownership.acquire(
+      () =>
+        startDeterministicM4Model({
+          m2DatabasePath: options.m2DatabasePath,
+          factoryDatabasePath: options.factoryDatabasePath,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        }),
+      (running) => running.close(),
+    );
+    const acquiredTrueForge = await ownership.acquire(
+      () =>
+        startTrueForgeServer({
+          sqlitePath: options.trueforgeDatabasePath,
+          localSandboxRootParent: options.localSandboxRootParent,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        }),
+      (running) => running.close(),
+    );
+    trueforge = acquiredTrueForge;
+    const connectors = await ownership.wait(() =>
+      registerFactoryMcpConnectors(acquiredTrueForge.client, acquiredHttp),
+    );
+    await ownership.wait(() =>
+      configureDeterministicModelProvider(
+        acquiredTrueForge.client,
+        acquiredModel.baseUrl,
+      ),
+    );
+    const agent = await ownership.wait(() =>
+      ensureFlakeBrakeRootAgent(acquiredTrueForge.client),
+    );
     const existing = missionStore.getSnapshotOrNull(missionId)?.mission ?? null;
     if (existing !== null && existing.trueforgeAgentId !== agent.id) {
       throw new Error("Persisted M4 mission is bound to a different TrueForge agent");
@@ -106,31 +135,36 @@ export async function runDeterministicM4Mission(
     const sessionId =
       existing?.trueforgeSessionId ??
       (
-        await trueforge.client.sessions.create({
-          agent: { name: agent.name },
-        })
+        await ownership.wait(() =>
+          acquiredTrueForge.client.sessions.create({
+            agent: { name: agent.name },
+          }),
+        )
       ).data.id;
     if (existing !== null) {
-      await trueforge.client.sessions.get(sessionId);
+      await ownership.wait(() =>
+        acquiredTrueForge.client.sessions.get(sessionId),
+      );
     }
     const controller = new M4MissionController({
       missionId,
       environmentId: HERO_ENVIRONMENT_ID,
       trueforgeAgentId: agent.id,
       trueforgeSessionId: sessionId,
-      trueforgeClient: trueforge.client,
+      trueforgeClient: acquiredTrueForge.client,
       missionStore,
       m2DatabasePath: options.m2DatabasePath,
       factoryDatabasePath: options.factoryDatabasePath,
       ownerDecisionProvider:
         options.ownerDecisionProvider ?? deterministicM4OwnerDecisions(),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
       disconnectInitialStreamAfterEvents:
         options.disconnectInitialStreamAfterEvents ?? 4,
       ...(options.checkpointObserver === undefined
         ? {}
         : { checkpointObserver: options.checkpointObserver }),
     });
-    const mission = await controller.runToCompletion();
+    const mission = await ownership.wait(() => controller.runToCompletion());
     const store = createStore({
       path: options.m2DatabasePath,
       authoritativeFactoryDatabasePath: options.factoryDatabasePath,
@@ -178,27 +212,47 @@ export async function runDeterministicM4Mission(
         ),
         activeDenials: store.getDenials(),
         actualConsumptionFacts,
-        trueforgeModelRequests: model.requestCount(),
+        trueforgeModelRequests: acquiredModel.requestCount(),
       };
     } finally {
       store.close();
     }
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `${message}${
-        trueforge === undefined
-          ? ""
-          : `; TrueForge diagnostic: ${trueforge.safeDiagnosticLog()}`
-      }`,
-      { cause: error },
+    primaryError = retainM4RunnerCleanupDiagnostics(
+      missionFailure(error, options.signal, trueforge),
+      ownership.cleanupFailures,
     );
+    throw primaryError;
   } finally {
-    missionStore.close();
-    await trueforge?.close();
-    await model?.close();
-    await http?.close();
+    const cleanupFailures = await ownership.close();
+    if (primaryError === undefined && cleanupFailures.length > 0) {
+      throw new AggregateError(
+        cleanupFailures,
+        "Deterministic M4 mission teardown failed",
+      );
+    }
   }
+}
+
+function missionFailure(
+  error: unknown,
+  signal: AbortSignal | undefined,
+  trueforge: RunningTrueForgeServer | undefined,
+): Error {
+  if (signal?.aborted === true && error === signal.reason) {
+    return error instanceof Error
+      ? error
+      : new Error(String(error), { cause: error });
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(
+    `${message}${
+      trueforge === undefined
+        ? ""
+        : `; TrueForge diagnostic: ${trueforge.safeDiagnosticLog()}`
+    }`,
+    { cause: error },
+  );
 }
 
 function initializeEnvironment(options: DeterministicM4MissionOptions): void {

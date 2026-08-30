@@ -34,6 +34,7 @@ import {
   ExecutionAttemptConflictError,
   StatefulInputError,
 } from "./stateful-domain.js";
+import { reachRecoveryDemoFactoryCommitBoundary } from "./recovery-demo-seam.js";
 
 export type FactoryScheduleReservation =
   | {
@@ -146,6 +147,19 @@ export interface CreateFactoryEnvironmentOptions {
   readonly path: string;
   readonly environmentId?: string;
   readonly now?: () => string;
+  /** Additive deterministic-fixture seed data; omitted values preserve the hero exactly. */
+  readonly initialScheduleCommitments?: readonly FactoryScheduleCommitmentSeed[];
+  readonly incomingProposals?: readonly JsonValue[];
+}
+
+export interface FactoryScheduleCommitmentSeed {
+  readonly reservationId: string;
+  readonly orderId: string;
+  readonly productionCellId: string;
+  readonly start: string;
+  readonly end: string;
+  readonly quantity: number;
+  readonly status: "committed";
 }
 
 export class SyntheticFactoryEnvironment {
@@ -153,6 +167,8 @@ export class SyntheticFactoryEnvironment {
   readonly #databasePath: string;
   readonly #environmentId: string;
   readonly #now: () => string;
+  readonly #initialScheduleCommitments: readonly FactoryScheduleCommitmentSeed[];
+  readonly #incomingProposals: readonly JsonValue[];
   #closed = false;
 
   public constructor(options: CreateFactoryEnvironmentOptions) {
@@ -164,6 +180,12 @@ export class SyntheticFactoryEnvironment {
       "environmentId",
     );
     this.#now = options.now ?? (() => HERO_HORIZON_END);
+    this.#initialScheduleCommitments = canonicalClone(
+      options.initialScheduleCommitments ?? HERO_SCHEDULE_COMMITMENTS,
+    );
+    this.#incomingProposals = canonicalClone(
+      options.incomingProposals ?? [createHeroProposal()],
+    );
     this.#databasePath = databaseIdentityPath(options.path);
     this.#database = openInitializedSqlite(
       options.path,
@@ -294,8 +316,8 @@ export class SyntheticFactoryEnvironment {
       }
     }
 
-    return m2Store.runWithExecutionFence(fenceId, (fence) =>
-      inImmediateTransaction(this.#database, () => {
+    return m2Store.runWithExecutionFence(fenceId, (fence) => {
+      const completed = inImmediateTransaction(this.#database, () => {
         const prior = this.#readExecutionResult(request.executionAttemptId);
         if (prior !== null) {
           if (prior.requestBytes !== canonicalRequestBytes) {
@@ -443,8 +465,12 @@ export class SyntheticFactoryEnvironment {
           );
         const response = deepFreeze({ replayed: false, result });
         return { value: response, binding: resultBinding(result) };
-      }),
-    );
+      });
+      if (!completed.value.replayed) {
+        reachRecoveryDemoFactoryCommitBoundary(completed.value.result);
+      }
+      return completed;
+    });
   }
 
   #seedIfEmpty(): void {
@@ -467,7 +493,7 @@ export class SyntheticFactoryEnvironment {
          VALUES (1, 'microfactory-environment/v1', ?, 1)`,
       )
       .run(this.#environmentId);
-    for (const commitment of HERO_SCHEDULE_COMMITMENTS) {
+    for (const commitment of this.#initialScheduleCommitments) {
       const reservation: FactoryScheduleReservation = {
         ...commitment,
         sourceExecutionAttemptId: null,
@@ -489,13 +515,20 @@ export class SyntheticFactoryEnvironment {
           canonicalSerialize(reservation),
         );
     }
-    const proposal = createHeroProposal();
-    this.#database
-      .prepare(
-        `INSERT INTO incoming_proposals
-           (proposal_id, body_json) VALUES (?, ?)`,
-      )
-      .run(proposal.obligationId, canonicalSerialize(proposal));
+    for (const proposal of this.#incomingProposals) {
+      if (!isPlainObject(proposal) || typeof proposal["obligationId"] !== "string") {
+        throw new StatefulInputError(
+          "incomingProposals",
+          "each proposal must have a string obligationId",
+        );
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO incoming_proposals
+             (proposal_id, body_json) VALUES (?, ?)`,
+        )
+        .run(proposal["obligationId"], canonicalSerialize(proposal));
+    }
   }
 
   #readScheduleState(): FactoryScheduleState {
