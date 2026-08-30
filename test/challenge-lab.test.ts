@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   ChallengeEvidenceSession,
@@ -625,9 +626,51 @@ describe("deterministic adversarial challenge lab", { concurrency: false }, () =
         // The intact representation still replays after every restoration.
         assertReplayReturnsOriginal(directory, expected);
       });
+
+      await context.test("a fully self-consistent rewrite of both files is inside the documented trust boundary", () => {
+        // Documented limitation, preserved deliberately: the co-located
+        // digest is not producer authentication, so a writer controlling the
+        // evidence root that rewrites the complete representation
+        // self-consistently passes internal-consistency validation.
+        const tamperedResult = JSON.parse(originalResultBytes) as MutableChallengeResult;
+        const first = tamperedResult.challenges[0];
+        assert.ok(first !== undefined);
+        first.title = `${first.title} (self-consistent rewrite)`;
+        const tamperedResultBytes = canonicalSerialize(tamperedResult);
+        const bundle = JSON.parse(
+          readFileSync(evidencePath, "utf8"),
+        ) as MutableChallengeEvidenceBundle;
+        bundle.resultDigest = sha256OfBytes(tamperedResultBytes);
+        writeFileSync(resultPath, tamperedResultBytes, "utf8");
+        writeFileSync(evidencePath, canonicalSerialize(bundle), "utf8");
+        try {
+          const replayed = readAdversarialChallengeLab(directory);
+          assert.equal(canonicalSerialize(replayed), tamperedResultBytes);
+          assert.notEqual(canonicalSerialize(replayed), expected);
+        } finally {
+          rmSync(evidencePath, { force: true });
+          writeFileSync(evidencePath, originalEvidenceBytes, "utf8");
+          rmSync(resultPath, { force: true });
+          writeFileSync(resultPath, originalResultBytes, "utf8");
+        }
+        assertReplayReturnsOriginal(directory, expected);
+      });
     } finally {
       await coordinator.close();
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("the published assurance contract states the restart-representation limits", () => {
+    const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+    const contract =
+      "The co-located digest is not producer authentication and does not prevent a writer controlling the evidence root from rewriting the complete representation self-consistently.";
+    for (const relative of ["docs/architecture.md", "src/challenge-lab.ts"]) {
+      const normalized = readFileSync(join(repositoryRoot, relative), "utf8")
+        .replaceAll(/^\s*\*/gmu, " ")
+        .replaceAll(/\s+/gu, " ");
+      assert.equal(normalized.includes(contract), true, relative);
+      assert.doesNotMatch(normalized, /tamper-?proof/iu, relative);
     }
   });
 

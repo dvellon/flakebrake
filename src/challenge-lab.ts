@@ -169,7 +169,12 @@ export interface ChallengeScenarioEvidenceRecord {
  * representation and never reopens the mutable scenario databases. It binds
  * scenario order, mission and lab session, database incarnation identities,
  * durable counts, terminal state, content digests, and the exact canonical
- * result bytes. It is integrity-bound evidence, not a producer signature.
+ * result bytes. The restart representation is validated for canonical
+ * encoding, exact bindings, counts, terminal state, and internal digest
+ * consistency. Malformed, torn, mixed, or inconsistently modified evidence
+ * fails closed. The co-located digest is not producer authentication and
+ * does not prevent a writer controlling the evidence root from rewriting
+ * the complete representation self-consistently.
  */
 export interface AdversarialChallengeEvidenceBundle {
   readonly schemaVersion: typeof CHALLENGE_EVIDENCE_SCHEMA_VERSION;
@@ -381,11 +386,15 @@ function publishDurableChallengeFile(destination: string, serialized: string): v
 
 /**
  * Replay the durable challenge result from its canonical, scenario-bound
- * evidence representation. The mutable scenario databases are never reopened:
- * the representation is validated for canonical byte-exactness, internal
- * consistency (digests, counts, terminal state, and database identities are
- * recomputed from the embedded snapshot content), and its binding to the
- * exact durable result bytes. Any mismatch fails closed.
+ * evidence representation. Unlike live evidence, which is read from held
+ * authoritative database connections, restart evidence is validated for
+ * internal consistency only: canonical byte-exactness, exact bindings, and
+ * digests, counts, terminal state, and database identities recomputed from
+ * the embedded snapshot content. The mutable scenario databases are never
+ * reopened. Malformed, torn, mixed, or inconsistently modified evidence
+ * fails closed; a writer controlling the evidence root can still rewrite
+ * the complete representation self-consistently, because the co-located
+ * digest is not producer authentication.
  */
 export function readAdversarialChallengeLab(
   ownedDataRootValue: string,

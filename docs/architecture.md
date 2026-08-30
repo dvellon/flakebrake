@@ -115,8 +115,13 @@ held for the scenario's lifetime; every snapshot pins one read transaction per
 database before any row is read, and all counts derive from that same row set.
 The completed run persists a canonical, scenario-bound evidence representation
 beside the result. Durable lab replay consumes that representation alone and
-never reopens the scenario databases; tampering, missing bindings, mixed
-snapshots, or malformed records fail closed.
+never reopens the scenario databases. Live evidence is produced from held
+authoritative database connections; the restart representation is validated
+for canonical encoding, exact bindings, counts, terminal state, and internal
+digest consistency. Malformed, torn, mixed, or inconsistently modified
+evidence fails closed. The co-located digest is not producer authentication
+and does not prevent a writer controlling the evidence root from rewriting
+the complete representation self-consistently.
 
 ## Hero authorization sequence
 
