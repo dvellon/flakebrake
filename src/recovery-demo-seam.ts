@@ -7,6 +7,8 @@ export const RECOVERY_DEMO_FACTORY_BOUNDARY =
 
 interface RecoveryDemoScope {
   readonly boundary: typeof RECOVERY_DEMO_FACTORY_BOUNDARY;
+  readonly executionAttemptId: string;
+  armed: boolean;
 }
 
 const ACTIVE_RECOVERY_DEMO = new AsyncLocalStorage<RecoveryDemoScope>();
@@ -16,12 +18,23 @@ const ACTIVE_RECOVERY_DEMO = new AsyncLocalStorage<RecoveryDemoScope>();
  * the public barrel: normal executors cannot arm the demonstration seam.
  */
 export function runWithRecoveryDemoFactoryInterruption<T>(
+  executionAttemptId: string,
   operation: () => T,
 ): T {
-  return ACTIVE_RECOVERY_DEMO.run(
-    { boundary: RECOVERY_DEMO_FACTORY_BOUNDARY },
-    operation,
-  );
+  const scope: RecoveryDemoScope = {
+    boundary: RECOVERY_DEMO_FACTORY_BOUNDARY,
+    executionAttemptId,
+    armed: true,
+  };
+  return ACTIVE_RECOVERY_DEMO.run(scope, () => {
+    try {
+      return operation();
+    } finally {
+      // Async resources may retain an AsyncLocalStorage context. Clearing this
+      // invocation-owned arm makes every retained or restored context inert.
+      scope.armed = false;
+    }
+  });
 }
 
 export class RecoveryDemoFactoryInterruption extends Error {
@@ -36,8 +49,14 @@ export class RecoveryDemoFactoryInterruption extends Error {
 export function reachRecoveryDemoFactoryCommitBoundary(
   result: SyntheticMutationResult,
 ): void {
-  if (ACTIVE_RECOVERY_DEMO.getStore()?.boundary !== RECOVERY_DEMO_FACTORY_BOUNDARY) {
+  const scope = ACTIVE_RECOVERY_DEMO.getStore();
+  if (
+    scope?.boundary !== RECOVERY_DEMO_FACTORY_BOUNDARY ||
+    !scope.armed ||
+    scope.executionAttemptId !== result.executionAttemptId
+  ) {
     return;
   }
+  scope.armed = false;
   throw new RecoveryDemoFactoryInterruption(result);
 }

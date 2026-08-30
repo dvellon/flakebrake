@@ -3,7 +3,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 
+import * as publicApi from "../src/index.js";
 import {
   HERO_RESOURCE_KEYS,
   RecoveryDemoCoordinator,
@@ -16,6 +18,12 @@ import {
   type RecoveryDemoPaths,
 } from "../src/index.js";
 import { parseRecoveryDemoCliArguments } from "../src/recovery-demo-cli.js";
+import {
+  RecoveryDemoFactoryInterruption,
+  reachRecoveryDemoFactoryCommitBoundary,
+  runWithRecoveryDemoFactoryInterruption,
+} from "../src/recovery-demo-seam.js";
+import type { SyntheticMutationResult } from "../src/factory-environment.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -81,6 +89,62 @@ describe("deterministic recovery runner", () => {
       assert.deepEqual(replay.counts, recovered.counts);
     });
   }
+});
+
+describe("internal recovery demonstration seam", () => {
+  const target = {
+    executionAttemptId: "attempt/recovery-demo-scope-target",
+  } as SyntheticMutationResult;
+  const ordinary = {
+    executionAttemptId: "attempt/ordinary-concurrent-mutation",
+  } as SyntheticMutationResult;
+
+  test("is targeted, one-shot, and absent from the public barrel", () => {
+    assert.equal(
+      Object.hasOwn(publicApi, "runWithRecoveryDemoFactoryInterruption"),
+      false,
+    );
+    assert.doesNotThrow(() => reachRecoveryDemoFactoryCommitBoundary(target));
+
+    runWithRecoveryDemoFactoryInterruption(target.executionAttemptId, () => {
+      assert.doesNotThrow(() => reachRecoveryDemoFactoryCommitBoundary(ordinary));
+      assert.throws(
+        () => reachRecoveryDemoFactoryCommitBoundary(target),
+        RecoveryDemoFactoryInterruption,
+      );
+      assert.doesNotThrow(() => reachRecoveryDemoFactoryCommitBoundary(target));
+    });
+
+    assert.doesNotThrow(() => reachRecoveryDemoFactoryCommitBoundary(target));
+  });
+
+  test("restores inert state after failure and across later asynchronous work", async () => {
+    assert.throws(
+      () =>
+        runWithRecoveryDemoFactoryInterruption(target.executionAttemptId, () => {
+          reachRecoveryDemoFactoryCommitBoundary(target);
+        }),
+      RecoveryDemoFactoryInterruption,
+    );
+    assert.doesNotThrow(() => reachRecoveryDemoFactoryCommitBoundary(target));
+
+    let deferred: Promise<void> | null = null;
+    runWithRecoveryDemoFactoryInterruption(target.executionAttemptId, () => {
+      deferred = waitForImmediate().then(() => {
+        reachRecoveryDemoFactoryCommitBoundary(target);
+      });
+    });
+    await deferred;
+
+    await runWithRecoveryDemoFactoryInterruption(
+      target.executionAttemptId,
+      async () => {
+        await waitForImmediate();
+        reachRecoveryDemoFactoryCommitBoundary(target);
+      },
+    );
+    assert.doesNotThrow(() => reachRecoveryDemoFactoryCommitBoundary(target));
+  });
 });
 
 describe("explicit recovery coordinator and loopback server", () => {

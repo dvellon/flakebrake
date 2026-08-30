@@ -107,7 +107,7 @@ export function interruptRecoveryDemonstration(
     } else {
       let interruption: RecoveryDemoFactoryInterruption | null = null;
       try {
-        runWithRecoveryDemoFactoryInterruption(() =>
+        runWithRecoveryDemoFactoryInterruption(request.executionAttemptId, () =>
           factory.executeAuthorizedScheduleMutation(store, request),
         );
       } catch (error: unknown) {
