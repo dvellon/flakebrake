@@ -67,6 +67,7 @@ export interface M4MissionControllerOptions {
   readonly m2DatabasePath: string;
   readonly factoryDatabasePath: string;
   readonly ownerDecisionProvider: M4OwnerDecisionProvider;
+  readonly signal?: AbortSignal;
   readonly disconnectInitialStreamAfterEvents?: number;
   readonly checkpointObserver?: (
     checkpoint: M4MissionCheckpoint,
@@ -185,6 +186,7 @@ export class M4MissionController {
   }
 
   public async runToCompletion(): Promise<M4MissionRunResult> {
+    this.#throwIfAborted();
     const identities = this.#databaseIdentities();
     this.#options.missionStore.bindMission({
       missionId: this.#options.missionId,
@@ -203,6 +205,7 @@ export class M4MissionController {
     let boundedContinuations = 0;
     let invalidApprovalRecoveries = 0;
     while (true) {
+      this.#throwIfAborted();
       this.#assertDatabaseBinding();
       if (turn.done.state.status !== "done") {
         recoveredFailedTurns += 1;
@@ -379,9 +382,11 @@ export class M4MissionController {
         },
       ]);
     }
-    const response = await this.#options.trueforgeClient.sessions.getTurn(
-      this.#options.trueforgeSessionId,
-      currentTurnId,
+    const response = await this.#wait(() =>
+      this.#options.trueforgeClient.sessions.getTurn(
+        this.#options.trueforgeSessionId,
+        currentTurnId,
+      ),
     );
     if (response.data.state.status === "running") {
       return this.#subscribeAndConsume(
@@ -429,9 +434,11 @@ export class M4MissionController {
       return this.#consumePersistedTurn(persisted);
     }
     if (claimed.intent.successorTurnId !== null) {
-      const successor = await this.#options.trueforgeClient.sessions.getTurn(
-        this.#options.trueforgeSessionId,
-        claimed.intent.successorTurnId,
+      const successor = await this.#wait(() =>
+        this.#options.trueforgeClient.sessions.getTurn(
+          this.#options.trueforgeSessionId,
+          claimed.intent.successorTurnId as string,
+        ),
       );
       return this.#consumePersistedTurn(successor.data);
     }
@@ -474,10 +481,12 @@ export class M4MissionController {
         return this.#consumePersistedTurn(recovered);
       }
       this.#assertDatabaseBinding();
-      const stream = await this.#options.trueforgeClient.sessions.createTurnStream(
-        this.#options.trueforgeSessionId,
-        { previousTurnId, input },
-        { timeoutInSeconds: 120 },
+      const stream = await this.#wait(() =>
+        this.#options.trueforgeClient.sessions.createTurnStream(
+          this.#options.trueforgeSessionId,
+          { previousTurnId, input },
+          { timeoutInSeconds: 120 },
+        ),
       );
       const result = await this.#consumeStream(stream, null, 0);
       this.#options.missionStore.resolveSuccessorIntent(
@@ -514,12 +523,14 @@ export class M4MissionController {
     if (expectedPrevious === "auto") {
       throw new Error("M4 successor reconciliation forbids auto previousTurnId");
     }
-    const page = await this.#options.trueforgeClient.sessions.listTurns(
-      this.#options.trueforgeSessionId,
-      { limit: 25 },
+    const page = await this.#wait(() =>
+      this.#options.trueforgeClient.sessions.listTurns(
+        this.#options.trueforgeSessionId,
+        { limit: 25 },
+      ),
     );
     const siblings: TrueForgeApi.Turn[] = [];
-    for await (const candidate of page) {
+    for (const candidate of await this.#collect(page)) {
       if (candidate.previousTurnId === expectedPrevious) siblings.push(candidate);
     }
     const expectedInput = canonicalSerialize(input);
@@ -546,7 +557,7 @@ export class M4MissionController {
     for (let attempt = 0; attempt < 400; attempt += 1) {
       const recovered = await this.#findExactSuccessor(previousTurnId, input);
       if (recovered !== null) return recovered;
-      await delay(25);
+      await abortableDelay(25, this.#options.signal);
     }
     return null;
   }
@@ -600,9 +611,11 @@ export class M4MissionController {
     }
     const intent = matching[0];
     if (intent?.successorTurnId === null || intent === undefined) return null;
-    const response = await this.#options.trueforgeClient.sessions.getTurn(
-      this.#options.trueforgeSessionId,
-      intent.successorTurnId,
+    const response = await this.#wait(() =>
+      this.#options.trueforgeClient.sessions.getTurn(
+        this.#options.trueforgeSessionId,
+        intent.successorTurnId as string,
+      ),
     );
     const successor = response.data;
     if (
@@ -621,11 +634,13 @@ export class M4MissionController {
     turnId: string,
     afterSequenceNumber: number,
   ): Promise<TurnResult> {
-    const stream = await this.#options.trueforgeClient.sessions.subscribeToTurn(
-      this.#options.trueforgeSessionId,
-      turnId,
-      { afterSequenceNumber },
-      { timeoutInSeconds: 120 },
+    const stream = await this.#wait(() =>
+      this.#options.trueforgeClient.sessions.subscribeToTurn(
+        this.#options.trueforgeSessionId,
+        turnId,
+        { afterSequenceNumber },
+        { timeoutInSeconds: 120 },
+      ),
     );
     return this.#consumeStream(stream, turnId, afterSequenceNumber);
   }
@@ -639,44 +654,59 @@ export class M4MissionController {
     let turnId = knownTurnId;
     let sequence = initialSequence;
     let deliberatelyDisconnected = false;
-    for await (const event of stream) {
-      sequence += 1;
-      events.push(event as TrueForgeApi.SessionEvent);
-      if (event.type === "turn.created") turnId = event.turnId;
-      if (turnId !== null) {
-        if (event.type === "sandbox.created") this.#sawSandboxCreated = true;
-        this.#options.missionStore.advanceCursor(
-          this.#options.missionId,
-          turnId,
-          sequence,
-        );
-        if (event.type === "sandbox.created") {
-          await this.#checkpoint({
-            phase: "running_turn",
+    const iterator = stream[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const next = await this.#wait(() => iterator.next());
+        if (next.done === true) break;
+        const event = next.value;
+        sequence += 1;
+        events.push(event as TrueForgeApi.SessionEvent);
+        if (event.type === "turn.created") turnId = event.turnId;
+        if (turnId !== null) {
+          if (event.type === "sandbox.created") this.#sawSandboxCreated = true;
+          this.#options.missionStore.advanceCursor(
+            this.#options.missionId,
             turnId,
-            eventType: "sandbox.created",
-          });
+            sequence,
+          );
+          if (event.type === "sandbox.created") {
+            await this.#checkpoint({
+              phase: "running_turn",
+              turnId,
+              eventType: "sandbox.created",
+            });
+          }
+        }
+        if (
+          turnId !== null &&
+          this.#disconnectPending !== null &&
+          sequence >= this.#disconnectPending &&
+          this.#sawSandboxCreated &&
+          event.type !== "turn.done"
+        ) {
+          this.#disconnectPending = null;
+          deliberatelyDisconnected = true;
+          break;
+        }
+        if (event.type === "turn.done") {
+          if (turnId === null) throw new Error("turn.done arrived before turn.created");
+          return {
+            turnId,
+            events,
+            done: event,
+            disconnectedAndResumed: deliberatelyDisconnected,
+          };
         }
       }
-      if (
-        turnId !== null &&
-        this.#disconnectPending !== null &&
-        sequence >= this.#disconnectPending &&
-        this.#sawSandboxCreated &&
-        event.type !== "turn.done"
-      ) {
-        this.#disconnectPending = null;
-        deliberatelyDisconnected = true;
-        break;
-      }
-      if (event.type === "turn.done") {
-        if (turnId === null) throw new Error("turn.done arrived before turn.created");
-        return {
-          turnId,
-          events,
-          done: event,
-          disconnectedAndResumed: deliberatelyDisconnected,
-        };
+    } finally {
+      const returned = iterator.return?.();
+      if (returned !== undefined) {
+        if (this.#options.signal?.aborted === true) {
+          void returned.catch(() => undefined);
+        } else {
+          await returned;
+        }
       }
     }
     if (turnId === null) throw new Error("TrueForge stream ended before turn.created");
@@ -920,7 +950,9 @@ export class M4MissionController {
       ...requestWithoutDigest,
       requestDigest: digest(requestWithoutDigest),
     };
-    const response = await this.#options.ownerDecisionProvider(request);
+    const response = await this.#wait(() =>
+      Promise.resolve(this.#options.ownerDecisionProvider(request)),
+    );
     this.#assertDatabaseBinding();
     const owner = validateOwnerDecisionResponse(response, request);
     this.#assertDatabaseBinding();
@@ -1076,25 +1108,26 @@ export class M4MissionController {
   async #listTurnEvents(
     turnId: string,
   ): Promise<readonly TrueForgeApi.SessionEvent[]> {
-    const page = await this.#options.trueforgeClient.sessions.listTurnEvents(
-      this.#options.trueforgeSessionId,
-      turnId,
-      { limit: 100, order: "asc" },
+    const page = await this.#wait(() =>
+      this.#options.trueforgeClient.sessions.listTurnEvents(
+        this.#options.trueforgeSessionId,
+        turnId,
+        { limit: 100, order: "asc" },
+      ),
     );
-    const events: TrueForgeApi.SessionEvent[] = [];
-    for await (const event of page) events.push(event);
-    return events;
+    return this.#collect(page);
   }
 
   async #listSessionEvents(
     lastTurnId: string,
   ): Promise<readonly TrueForgeApi.SessionEventItem[]> {
-    const page = await this.#options.trueforgeClient.sessions.listEvents(
-      this.#options.trueforgeSessionId,
-      { lastTurnId, limit: 100 },
+    const page = await this.#wait(() =>
+      this.#options.trueforgeClient.sessions.listEvents(
+        this.#options.trueforgeSessionId,
+        { lastTurnId, limit: 100 },
+      ),
     );
-    const events: TrueForgeApi.SessionEventItem[] = [];
-    for await (const event of page) events.push(event);
+    const events = await this.#collect(page);
     return events.reverse();
   }
 
@@ -1290,7 +1323,42 @@ export class M4MissionController {
   }
 
   async #checkpoint(checkpoint: M4MissionCheckpoint): Promise<void> {
-    await this.#options.checkpointObserver?.(checkpoint);
+    this.#throwIfAborted();
+    await this.#wait(() =>
+      Promise.resolve(this.#options.checkpointObserver?.(checkpoint)),
+    );
+    this.#throwIfAborted();
+  }
+
+  async #collect<T>(page: AsyncIterable<T>): Promise<T[]> {
+    const values: T[] = [];
+    const iterator = page[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const next = await this.#wait(() => iterator.next());
+        if (next.done === true) return values;
+        values.push(next.value);
+      }
+    } finally {
+      const returned = iterator.return?.();
+      if (returned !== undefined) {
+        if (this.#options.signal?.aborted === true) {
+          void returned.catch(() => undefined);
+        } else {
+          await returned;
+        }
+      }
+    }
+  }
+
+  #wait<T>(operation: () => Promise<T>): Promise<T> {
+    return abortableWait(operation, this.#options.signal);
+  }
+
+  #throwIfAborted(): void {
+    if (this.#options.signal?.aborted === true) {
+      throw abortReason(this.#options.signal);
+    }
   }
 }
 
@@ -1582,6 +1650,47 @@ function successorOwnerIsActive(ownerToken: string): boolean {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function abortableDelay(
+  milliseconds: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal === undefined) return delay(milliseconds);
+  return abortableWait(
+    () => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    signal,
+  );
+}
+
+async function abortableWait<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) return operation();
+  if (signal.aborted) throw abortReason(signal);
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = (): void => rejectAbort?.(abortReason(signal));
+  signal.addEventListener("abort", onAbort, { once: true });
+  let pending: Promise<T>;
+  try {
+    pending = Promise.resolve(operation());
+  } catch (error: unknown) {
+    signal.removeEventListener("abort", onAbort);
+    throw error;
+  }
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
 function digest(value: unknown): string {
