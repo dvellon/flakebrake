@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createConnection, type Socket } from "node:net";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
+import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -796,6 +809,361 @@ describe("M5 agent trust — agents checking agents", () => {
   });
 });
 
+interface MarkerSeamLike {
+  readonly openSync: (path: string, flags: string, mode?: number) => number;
+  readonly writeSync: (descriptor: number, payload: Uint8Array, offset?: number) => number;
+  readonly fsyncSync: (descriptor: number) => void;
+  readonly closeSync: (descriptor: number) => void;
+  readonly renameSync: (from: string, to: string) => void;
+  readonly rmSync: (path: string, options?: { readonly force?: boolean }) => void;
+}
+
+describe("Qodo PR16 Round 4: crash-durable publication and temporary ownership", () => {
+  const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
+  const MARKER_NAME = "m5-sandbox-evidence.json";
+  const roots: string[] = [];
+
+  after(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  const newRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-round4-"));
+    roots.push(root);
+    return root;
+  };
+
+  const ownRoot = async (root: string): Promise<void> => {
+    const owner = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    await owner.close();
+  };
+
+  const bindHeroMission = async (root: string, sessionId: string): Promise<void> => {
+    const { M4MissionStore } = await import("../src/m4-mission-store.js");
+    const store = new M4MissionStore({ path: join(root, "mission.sqlite") });
+    try {
+      store.bindMission({
+        missionId: HERO_MISSION_ID,
+        environmentId: "env/hero-microfactory",
+        trueforgeAgentId: "agent/test",
+        trueforgeSessionId: sessionId,
+        m2EnvironmentIdentity: "m2/test",
+        factoryEnvironmentIdentity: "factory/test",
+      });
+    } finally {
+      store.close();
+    }
+  };
+
+  const validMarker = (sessionId: string): string =>
+    `${JSON.stringify({ missionId: HERO_MISSION_ID, trueforgeSessionId: sessionId, trueforgeTurnId: "turn/test" })}\n`;
+
+  const loadPublisher = async (): Promise<
+    (destination: string, serialized: string, filesystem?: MarkerSeamLike) => void
+  > => {
+    const module_ = (await import("../src/m5-ui.js")) as Record<string, unknown>;
+    const publisher = module_["publishJsonFileAtomically"];
+    assert.equal(typeof publisher, "function");
+    return publisher as (destination: string, serialized: string, filesystem?: MarkerSeamLike) => void;
+  };
+
+  interface SeamRecorder {
+    readonly seam: MarkerSeamLike;
+    readonly log: string[];
+    directoryDescriptor: () => number | null;
+    temporaryPaths: () => readonly string[];
+  }
+
+  const recordingSeam = (root: string, overrides?: Partial<MarkerSeamLike>): SeamRecorder => {
+    const log: string[] = [];
+    let directoryDescriptor: number | null = null;
+    const temporaries: string[] = [];
+    const base: MarkerSeamLike = {
+      openSync: (path, flags, mode) => {
+        const descriptor = openSync(path, flags, mode);
+        if (resolve(path) === resolve(root)) {
+          directoryDescriptor = descriptor;
+          log.push(`open-directory:${resolve(path)}`);
+        } else {
+          if (flags === "wx") temporaries.push(path);
+          log.push(`open-file:${path}`);
+        }
+        return descriptor;
+      },
+      writeSync: (descriptor, payload, offset) => {
+        log.push("write");
+        return writeSync(descriptor, payload, offset);
+      },
+      fsyncSync: (descriptor) => {
+        log.push(descriptor === directoryDescriptor ? "fsync-directory" : "fsync-file");
+        fsyncSync(descriptor);
+      },
+      closeSync: (descriptor) => {
+        log.push(descriptor === directoryDescriptor ? "close-directory" : "close-file");
+        closeSync(descriptor);
+      },
+      renameSync: (from, to) => {
+        log.push(`rename:${from}→${to}`);
+        renameSync(from, to);
+      },
+      rmSync: (path, options) => {
+        log.push(`rm:${path}`);
+        rmSync(path, options);
+      },
+    };
+    return {
+      seam: { ...base, ...overrides },
+      log,
+      directoryDescriptor: () => directoryDescriptor,
+      temporaryPaths: () => temporaries,
+    };
+  };
+
+  test("reproduction 1: publication must not report success without directory-entry durability", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    const recorder = recordingSeam(root);
+    publish(destination, validMarker("session/current"), recorder.seam);
+    const renameIndex = recorder.log.findIndex((entry) => entry.startsWith("rename:"));
+    const directoryOpenIndex = recorder.log.indexOf(`open-directory:${resolve(root)}`);
+    const directoryFsyncIndex = recorder.log.indexOf("fsync-directory");
+    assert.ok(renameIndex >= 0, "the publication path runs through the injected filesystem seam");
+    assert.ok(
+      directoryOpenIndex > renameIndex,
+      "after rename, the containing directory is opened for durability",
+    );
+    assert.ok(
+      directoryFsyncIndex > directoryOpenIndex,
+      "the directory entry is fsynced before persistence is acknowledged",
+    );
+    assert.ok(recorder.log.indexOf("close-directory") > directoryFsyncIndex);
+
+    const failing = recordingSeam(root);
+    const fsyncFailure = new Error("injected directory fsync failure");
+    const failingSeam: MarkerSeamLike = {
+      ...failing.seam,
+      fsyncSync: (descriptor) => {
+        if (descriptor === failing.directoryDescriptor()) throw fsyncFailure;
+        failing.seam.fsyncSync(descriptor);
+      },
+    };
+    assert.throws(
+      () => publish(join(root, "second.json"), validMarker("session/current"), failingSeam),
+      (error: unknown) => error === fsyncFailure,
+      "a failed directory fsync must fail the publication instead of claiming durable success",
+    );
+  });
+
+  test("reproduction 2: constructor restore must not delete an active publication temporary", async () => {
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    const destination = join(root, MARKER_NAME);
+    const activeTemporary = `${destination}.99991.3.tmp`;
+    writeFileSync(activeTemporary, validMarker("session/current"));
+    const restored = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    try {
+      restored.state();
+    } finally {
+      await restored.close();
+    }
+    assert.equal(
+      existsSync(activeTemporary),
+      true,
+      "another writer's in-flight temporary survives a concurrent constructor restore",
+    );
+    renameSync(activeTemporary, destination);
+    assert.equal(readFileSync(destination, "utf8"), validMarker("session/current"));
+    const verifier = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    try {
+      assert.equal(
+        verifier.state().evidenceTimeline.some((item) => item.kind === "sandbox"),
+        true,
+        "the resumed publication completes and restores the observation",
+      );
+    } finally {
+      await verifier.close();
+    }
+  });
+
+  test("directory durability failures fail closed with preserved diagnostics", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const openFailure = new Error("injected directory open failure");
+    const openFailing = recordingSeam(root);
+    const openFailingSeam: MarkerSeamLike = {
+      ...openFailing.seam,
+      openSync: (path, flags, mode) => {
+        if (resolve(path) === resolve(root)) throw openFailure;
+        return openFailing.seam.openSync(path, flags, mode);
+      },
+    };
+    assert.throws(
+      () => publish(join(root, MARKER_NAME), validMarker("session/current"), openFailingSeam),
+      (error: unknown) => error === openFailure,
+      "a directory-open failure is never reported as durable success",
+    );
+
+    const closeFailure = new Error("injected directory close failure");
+    const closeFailing = recordingSeam(root);
+    const closeFailingSeam: MarkerSeamLike = {
+      ...closeFailing.seam,
+      closeSync: (descriptor) => {
+        if (descriptor === closeFailing.directoryDescriptor()) throw closeFailure;
+        closeFailing.seam.closeSync(descriptor);
+      },
+    };
+    assert.throws(
+      () => publish(join(root, "close-case.json"), validMarker("session/current"), closeFailingSeam),
+      (error: unknown) => error === closeFailure,
+      "a directory-close failure keeps its diagnostic instead of false success",
+    );
+
+    const bothFsync = new Error("injected fsync failure");
+    const bothClose = new Error("injected close failure");
+    const bothFailing = recordingSeam(root);
+    const bothSeam: MarkerSeamLike = {
+      ...bothFailing.seam,
+      fsyncSync: (descriptor) => {
+        if (descriptor === bothFailing.directoryDescriptor()) throw bothFsync;
+        bothFailing.seam.fsyncSync(descriptor);
+      },
+      closeSync: (descriptor) => {
+        if (descriptor === bothFailing.directoryDescriptor()) throw bothClose;
+        bothFailing.seam.closeSync(descriptor);
+      },
+    };
+    assert.throws(
+      () => publish(join(root, "both-case.json"), validMarker("session/current"), bothSeam),
+      (error: unknown) =>
+        error instanceof AggregateError &&
+        error.errors[0] === bothFsync &&
+        error.errors.includes(bothClose) &&
+        error.cause === bothFsync,
+      "the primary durability error is preserved with cleanup diagnostics attached secondarily",
+    );
+  });
+
+  test("publishers own only their invocation's temporary files", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    const foreignTemporary = `${destination}.55555.9.tmp`;
+    writeFileSync(foreignTemporary, "another writer's in-flight publication");
+    const renameFailure = new Error("injected rename failure");
+    const failing = recordingSeam(root);
+    const failingSeam: MarkerSeamLike = {
+      ...failing.seam,
+      renameSync: () => {
+        throw renameFailure;
+      },
+    };
+    assert.throws(
+      () => publish(destination, validMarker("session/current"), failingSeam),
+      (error: unknown) => error === renameFailure,
+    );
+    const ownTemporaries = failing.temporaryPaths();
+    assert.equal(ownTemporaries.length, 1);
+    const removed = failing.log.filter((entry) => entry.startsWith("rm:"));
+    assert.deepEqual(removed, [`rm:${ownTemporaries[0] ?? ""}`], "failure cleanup removes only the owned temporary");
+    assert.equal(existsSync(foreignTemporary), true, "a foreign in-flight temporary is never deleted or stolen");
+    assert.equal(existsSync(destination), false);
+
+    const first = recordingSeam(root);
+    publish(destination, validMarker("session/current"), first.seam);
+    const second = recordingSeam(root);
+    publish(destination, validMarker("session/next"), second.seam);
+    assert.notEqual(first.temporaryPaths()[0], second.temporaryPaths()[0], "each invocation owns a unique temporary");
+  });
+
+  test("orphan temporaries are inert for restore and ordinary close", async () => {
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    const destination = join(root, MARKER_NAME);
+    writeFileSync(destination, validMarker("session/current"));
+    const orphan = `${destination}.44444.2.tmp`;
+    writeFileSync(orphan, "crash-orphaned partial {");
+    const cleanupCoordinator = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: true });
+    let observed = false;
+    try {
+      observed = cleanupCoordinator.state().evidenceTimeline.some((item) => item.kind === "sandbox");
+    } finally {
+      await cleanupCoordinator.close();
+    }
+    assert.equal(observed, true, "the committed marker stays authoritative despite orphan temporaries");
+    assert.equal(existsSync(destination), false, "owned close cleanup removes the committed marker");
+    assert.equal(
+      existsSync(orphan),
+      true,
+      "ordinary close never glob-deletes unknown temporaries that may belong to an active writer",
+    );
+  });
+
+  test("a separate server process restores the exact mission/session-bound evidence", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    publish(join(root, MARKER_NAME), validMarker("session/current"));
+    const port = await new Promise<number>((resolvePort, rejectPort) => {
+      const probe = createServer();
+      probe.listen(0, "127.0.0.1", () => {
+        const address = probe.address();
+        if (address === null || typeof address === "string") {
+          probe.close(() => rejectPort(new Error("no ephemeral port")));
+          return;
+        }
+        probe.close(() => resolvePort(address.port));
+      });
+    });
+    const spawnServer = async (): Promise<ChildProcess> => {
+      const child = spawn(process.execPath, ["dist/src/m5-cli.js", "--port", String(port), "--data-dir", root], {
+        cwd: process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        output += String(chunk);
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        output += String(chunk);
+      });
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        if (output.includes("judge UI ready")) return child;
+        if (child.exitCode !== null) throw new Error(`M5 server exited early: ${output}`);
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+      }
+      child.kill("SIGKILL");
+      throw new Error(`M5 server did not become ready: ${output}`);
+    };
+    const readSandboxObserved = async (): Promise<boolean> => {
+      const state = (await fetch(`http://127.0.0.1:${String(port)}/api/state`).then((response) =>
+        response.json(),
+      )) as { readonly evidenceTimeline: readonly { readonly kind: string }[] };
+      return state.evidenceTimeline.some((item) => item.kind === "sandbox");
+    };
+    const first = await spawnServer();
+    try {
+      assert.equal(await readSandboxObserved(), true, "a separate process restores the durable observation");
+    } finally {
+      const exited = once(first, "exit");
+      first.kill("SIGKILL");
+      await exited;
+    }
+    const second = await spawnServer();
+    try {
+      assert.equal(await readSandboxObserved(), true, "a full process restart keeps the observation");
+    } finally {
+      const exited = once(second, "exit");
+      second.kill("SIGKILL");
+      await exited;
+    }
+  });
+});
+
 describe("Qodo PR16 Round 3: atomic sandbox marker publication", () => {
   const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
   const MARKER_NAME = "m5-sandbox-evidence.json";
@@ -913,7 +1281,11 @@ describe("Qodo PR16 Round 3: atomic sandbox marker publication", () => {
     );
     assert.equal(readFileSync(destination, "utf8"), validMarker("session/current"));
     const leftovers = readdirSync(root).filter((name) => name.startsWith(`${MARKER_NAME}.`));
-    assert.deepEqual(leftovers, [], "owned temporary leftovers are swept safely");
+    assert.equal(
+      leftovers.length,
+      2,
+      "unpublished temporaries are inert and left in place — they may belong to an active writer",
+    );
 
     const orphanRoot = newRoot();
     await ownRoot(orphanRoot);

@@ -21,7 +21,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { Socket } from "node:net";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { canonicalSerialize } from "./canonical.js";
@@ -349,7 +349,6 @@ export class M5DemoCoordinator {
       sandboxEvidence: join(this.#dataRoot, "m5-sandbox-evidence.json"),
     };
     establishOwnedDataRoot(this.#dataRoot);
-    this.#sweepStaleMarkerTemporaries();
     this.#restoreDurableSandboxEvidence();
   }
 
@@ -417,18 +416,10 @@ export class M5DemoCoordinator {
     }
   }
 
-  #sweepStaleMarkerTemporaries(): void {
-    const prefix = `${basename(this.#paths.sandboxEvidence)}.`;
-    for (const name of readFileSafeDirectory(this.#dataRoot)) {
-      if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
-      try {
-        rmSync(join(this.#dataRoot, name), { force: true });
-      } catch {
-        // A stale temporary that cannot be removed is still never read as
-        // evidence; only the committed marker path is authoritative.
-      }
-    }
-  }
+  // Marker temporaries are never swept: a matching name may be another
+  // process's in-flight publication, and deleting it would break that
+  // writer's atomic rename. Restoration reads only the committed marker
+  // path, so crash-orphaned temporaries are inert.
 
   public start(): M5JudgeState {
     this.#assertOpen();
@@ -1608,44 +1599,95 @@ function winningModification(candidate: {
 
 let markerPublicationSequence = 0;
 
+export interface MarkerFilesystem {
+  readonly openSync: (path: string, flags: string, mode?: number) => number;
+  readonly writeSync: (descriptor: number, payload: Uint8Array, offset?: number) => number;
+  readonly fsyncSync: (descriptor: number) => void;
+  readonly closeSync: (descriptor: number) => void;
+  readonly renameSync: (from: string, to: string) => void;
+  readonly rmSync: (path: string, options?: { readonly force?: boolean }) => void;
+}
+
+const REAL_MARKER_FILESYSTEM: MarkerFilesystem = {
+  openSync,
+  writeSync,
+  fsyncSync,
+  closeSync,
+  renameSync,
+  rmSync,
+};
+
 /**
- * Crash-safe marker publication. The complete payload is written to a unique
- * invocation-owned temporary file in the destination directory (exclusive
- * creation, 0o600), flushed to disk, and closed before an atomic
- * same-directory rename publishes it over the committed path. The committed
- * path is never opened or truncated in place, so the last valid marker
- * survives any failure before publication completes. Ordinary failures remove
- * the invocation's temporary file without masking the primary error; if that
- * cleanup itself fails, both diagnostics are reported and persistence is
- * still not claimed.
+ * Crash-durable marker publication. The complete payload is written to a
+ * unique invocation-owned temporary file in the destination directory
+ * (exclusive creation, 0o600), flushed to disk, and closed before an atomic
+ * same-directory rename publishes it over the committed path; the containing
+ * directory is then opened, fsynced, and closed so the rename's directory
+ * entry itself is durable before success is reported. The committed path is
+ * never opened or truncated in place, so the last valid marker survives any
+ * failure before publication. Failures before the rename remove only this
+ * invocation's temporary file without masking the primary error; failures
+ * establishing directory durability propagate — on a platform where the
+ * containing directory cannot be opened or fsynced, publication fails closed
+ * rather than silently claiming crash durability — and when a secondary
+ * cleanup step also fails, both diagnostics are reported with the primary
+ * error first.
  */
-export function publishJsonFileAtomically(destination: string, serialized: string): void {
+export function publishJsonFileAtomically(
+  destination: string,
+  serialized: string,
+  filesystem: MarkerFilesystem = REAL_MARKER_FILESYSTEM,
+): void {
   markerPublicationSequence += 1;
   const temporary = `${destination}.${String(process.pid)}.${String(markerPublicationSequence)}.tmp`;
   let descriptor: number | null = null;
+  let renamed = false;
   try {
-    descriptor = openSync(temporary, "wx", 0o600);
+    descriptor = filesystem.openSync(temporary, "wx", 0o600);
     const payload = Buffer.from(serialized, "utf8");
     let written = 0;
     while (written < payload.length) {
-      written += writeSync(descriptor, payload, written);
+      written += filesystem.writeSync(descriptor, payload, written);
     }
-    fsyncSync(descriptor);
-    closeSync(descriptor);
+    filesystem.fsyncSync(descriptor);
+    filesystem.closeSync(descriptor);
     descriptor = null;
-    renameSync(temporary, destination);
+    filesystem.renameSync(temporary, destination);
+    renamed = true;
+    let directoryDescriptor: number | null = null;
+    let durabilityFailure: unknown = null;
+    try {
+      directoryDescriptor = filesystem.openSync(dirname(destination), "r");
+      filesystem.fsyncSync(directoryDescriptor);
+    } catch (error: unknown) {
+      durabilityFailure = error;
+    }
+    if (directoryDescriptor !== null) {
+      try {
+        filesystem.closeSync(directoryDescriptor);
+      } catch (closeError: unknown) {
+        if (durabilityFailure === null) throw closeError;
+        throw new AggregateError(
+          [durabilityFailure, closeError],
+          "Marker directory durability failed and its descriptor could not be closed",
+          { cause: durabilityFailure },
+        );
+      }
+    }
+    if (durabilityFailure !== null) throw durabilityFailure;
   } catch (error: unknown) {
+    if (renamed) throw error;
     const cleanupFailures: unknown[] = [];
     if (descriptor !== null) {
       try {
-        closeSync(descriptor);
+        filesystem.closeSync(descriptor);
       } catch (closeError: unknown) {
         cleanupFailures.push(closeError);
       }
       descriptor = null;
     }
     try {
-      rmSync(temporary, { force: true });
+      filesystem.rmSync(temporary, { force: true });
     } catch (removeError: unknown) {
       cleanupFailures.push(removeError);
     }
