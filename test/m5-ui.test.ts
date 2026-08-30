@@ -50,8 +50,9 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
     assert.match(stylesheet, /\.capacity-item[^}]*min-width:\s*0/u);
   });
 
-  test("F-04 labels mechanical denial as an active-policy auto-block", () => {
-    assert.match(application, /Auto-blocked · active policy/u);
+  test("F-04 labels mechanical denial as an automatic block of the same denied action", () => {
+    assert.match(application, /Blocked automatically — same denied action/u);
+    assert.match(application, /active M2 policy/u);
   });
 
   test("F-05 preserves the ordered mutation, read-back, and verification proof", () => {
@@ -76,7 +77,7 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
 
   test("F-09 distinguishes the original REPLAN basis from its bounded resolution", () => {
     assert.match(document, /Original promise basis/u);
-    assert.match(application, /Resolved through bounded replan/u);
+    assert.match(application, /Resolved through the safest workable plan \(a bounded replan\)/u);
   });
 
   test("F-10 keeps judge-facing promise acceptance in human language", () => {
@@ -98,7 +99,7 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
   });
 
   test("F-14 labels accepted work accurately and resolves proposal duplication", () => {
-    assert.match(document, /Accepted workload after bounded replan/u);
+    assert.match(document, /Accepted workload after the safest workable plan/u);
     assert.match(application, /acceptedProposal/u);
   });
 
@@ -164,10 +165,10 @@ describe("M5 operator proof center", () => {
   test("keeps the executive proof visible and progressively discloses exact evidence", () => {
     assert.match(document, /Operator proof center/u);
     assert.match(document, /aria-label="Executive proof summary"/u);
-    assert.match(document, /Exact control decisions/u);
-    assert.match(document, /Capacity and before\/after impact/u);
-    assert.match(document, /Durable proof and replay/u);
-    assert.match(document, /Technical evidence/u);
+    assert.match(document, /Show decision history/u);
+    assert.match(document, /Show exact capacity math/u);
+    assert.match(document, /Show durable ledger/u);
+    assert.match(document, /Show technical identifiers/u);
     assert.match(document, /What FlakeBrake prevented/u);
   });
 
@@ -183,6 +184,615 @@ describe("M5 operator proof center", () => {
     assert.match(application, /By itself, it is not verified success/u);
     assert.match(application, /Only this state is presented as success/u);
     assert.match(application, /durable effect count remains/u);
+  });
+});
+
+describe("M5 plain-language guided story", () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-guided-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const pendingFor = (
+    toolName: string,
+    recommendedDecision: "allow" | "deny",
+    revision: number,
+  ): M5JudgeState => {
+    const base = uiProjection(idle, revision, "awaiting_approval");
+    return {
+      ...base,
+      pendingApproval: {
+        ...(base.pendingApproval as NonNullable<M5JudgeState["pendingApproval"]>),
+        toolName,
+        recommendedDecision,
+      },
+    };
+  };
+
+  test("idle answers what, why, and next in plain language", async () => {
+    const harness = await createPollingHarness(idle, []);
+    assert.equal(harness.text("guided-heading"), "A rush order is waiting");
+    assert.match(harness.text("guided-what"), /check whether it fits without disrupting protected work/u);
+    assert.match(harness.text("guided-why"), /This rush order doesn’t fit yet/u);
+    assert.match(harness.text("guided-why"), /2 more agent-work units and 1 more human decision/u);
+    assert.match(harness.text("guided-why"), /production minutes alone are not the only constraint/u);
+    assert.match(harness.text("guided-why"), /FlakeBrake found a safer plan/u);
+    assert.match(harness.text("guided-why"), /display order from 10 to 8/u);
+    assert.match(harness.text("guided-why"), /protected medical order and the rush-order quantity stay unchanged/u);
+    assert.match(harness.text("guided-next"), /Start the mission/u);
+  });
+
+  test("each approval states exactly what approving or denying will do", async () => {
+    const portfolio = await createPollingHarness(
+      pendingFor("select_portfolio_modification", "allow", 2),
+      [],
+    );
+    assert.equal(portfolio.text("guided-heading"), "Your approval is required");
+    assert.match(portfolio.text("guided-what"), /display order from 10 to 8 — nothing else/u);
+    assert.match(portfolio.text("guided-why"), /protected medical order and the rush-order quantity remain exactly/u);
+
+    const promise = await createPollingHarness(pendingFor("accept_promise", "allow", 2), []);
+    assert.equal(promise.text("guided-heading"), "Your approval is required");
+    assert.match(promise.text("guided-what"), /Capacity was recalculated after the approved change/u);
+    assert.match(promise.text("guided-why"), /Nothing executes until you explicitly accept/u);
+
+    const conflict = await createPollingHarness(
+      pendingFor("create_schedule_reservation", "deny", 2),
+      [],
+    );
+    assert.equal(conflict.text("guided-heading"), "This time slot conflicts with protected work");
+    assert.match(conflict.text("guided-what"), /09:10–09:40 slot overlaps time already committed/u);
+    assert.match(conflict.text("guided-next"), /Deny action is the recommended choice/u);
+
+    const alternative = await createPollingHarness(
+      pendingFor("create_schedule_reservation", "allow", 2),
+      [],
+    );
+    assert.equal(alternative.text("guided-heading"), "A safe time slot is available");
+    assert.match(alternative.text("guided-what"), /09:40–10:10 slot starts after the protected commitment/u);
+    assert.match(alternative.text("guided-next"), /Approve action authorizes the safe reservation/u);
+  });
+
+  test("the mechanical block gets its own story and stays visible at the next approval", async () => {
+    const mechanicalGap: M5JudgeState = {
+      ...idle,
+      revision: 3,
+      run: { ...idle.run, status: "running", generation: 1, ownerCallsThisProcess: 3 },
+      approvals: [
+        {
+          toolName: "submit_schedule_change",
+          decision: "deny",
+          source: "active_m2_denial",
+          ownerSourceIdentity: null,
+          actionIdentity: `sha256:${"d".repeat(64)}`,
+          effect: "Reserve proposal/rush-aerospace on cell-alpha, 09:10–09:40",
+          reason: "Equivalent representation of the denied action",
+          denialId: "m4-denial/guided",
+        },
+      ],
+    };
+    const gap = await createPollingHarness(mechanicalGap, []);
+    assert.equal(gap.text("guided-heading"), "The same unsafe request was blocked automatically");
+    assert.match(gap.text("guided-what"), /another technical representation/u);
+    assert.match(gap.text("guided-why"), /No additional owner decision was used/u);
+
+    const nextApproval: M5JudgeState = {
+      ...pendingFor("create_schedule_reservation", "allow", 4),
+      approvals: mechanicalGap.approvals,
+    };
+    const next = await createPollingHarness(nextApproval, []);
+    assert.equal(next.text("guided-heading"), "A safe time slot is available");
+    assert.equal(
+      next.evaluate("document.getElementById('guided-mechanical').hidden"),
+      false,
+      "the mechanical-block fact stays visible when the next approval arrives",
+    );
+    assert.match(next.text("guided-mechanical"), /no additional owner decision was used/iu);
+  });
+
+  test("mutation, verification, and replay states tell the durable story", async () => {
+    const mutated: M5JudgeState = {
+      ...idle,
+      revision: 5,
+      run: { ...idle.run, status: "verifying", generation: 1 },
+      execution: { ...idle.execution, acceptanceCount: 1, attemptCount: 1, mutationCount: 1, receiptCount: 1 },
+    };
+    const pendingVerify = await createPollingHarness(mutated, []);
+    assert.equal(pendingVerify.text("guided-heading"), "The change is recorded—but it is not verified yet");
+    assert.match(pendingVerify.text("guided-why"), /independently reading the factory state/u);
+
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const verified: M5JudgeState = {
+      ...verifiedBase,
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const done = await createPollingHarness(verified, []);
+    assert.equal(done.text("guided-heading"), "Done—and independently verified");
+    assert.match(done.text("guided-what"), /display order changed 10 → 8/u);
+    assert.match(done.text("guided-what"), /exactly one factory mutation/u);
+    assert.match(done.text("guided-why"), /will not repeat owner decisions or factory effects/u);
+
+    const replayed: M5JudgeState = {
+      ...verified,
+      revision: 7,
+      mission: { ...verified.mission, disconnectedAndResumed: true },
+    };
+    const replay = await createPollingHarness(replayed, []);
+    assert.match(replay.text("guided-why"), /same completed TrueForge session/u);
+    assert.match(replay.text("guided-why"), /no decisions, owner calls, or factory effects were repeated/iu);
+  });
+
+  test("stale polls and cross-mission responses cannot regress the guided story", async () => {
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const verified: M5JudgeState = {
+      ...verifiedBase,
+      execution: { ...verifiedBase.execution, independentReadBackObserved: true },
+    };
+    const stalePending = uiProjection(idle, 2, "awaiting_approval");
+    const stale = deferred<unknown>();
+    const harness = await createPollingHarness(verified, [stale.promise]);
+    assert.equal(harness.text("guided-heading"), "Done—and independently verified");
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    stale.resolve(stalePending);
+    await oldPoll;
+    assert.equal(
+      harness.text("guided-heading"),
+      "Done—and independently verified",
+      "a stale pending poll cannot regress the verified story",
+    );
+  });
+
+  test("guided numbers derive from durable counts", async () => {
+    const harness = await createPollingHarness(idle, []);
+    assert.equal(harness.text("guided-number-display"), "10 → 8");
+    assert.equal(harness.text("guided-number-protected"), "10");
+    assert.equal(harness.text("guided-number-mutations"), "0");
+    const verifiedBase = uiProjection(idle, 6, "verified");
+    const done = await createPollingHarness(
+      { ...verifiedBase, execution: { ...verifiedBase.execution, independentReadBackObserved: true } },
+      [],
+    );
+    assert.equal(done.text("guided-number-mutations"), "1");
+  });
+});
+
+interface TrustCheckRow {
+  readonly key: string;
+  readonly kind: string;
+  readonly source: string;
+  readonly claim: string;
+  readonly check: string;
+  readonly result: string;
+  readonly why: string;
+  readonly technicalEvidence: string | null;
+}
+
+interface TrustProjection {
+  readonly recommendationsRecorded: boolean;
+  readonly checks: readonly TrustCheckRow[];
+}
+
+interface TrustApprovalRecordLike {
+  readonly toolName: string;
+  readonly toolCallId: string;
+  readonly turnId: string;
+  readonly threadId: string;
+  readonly decision: "allow" | "deny";
+  readonly reason: string;
+  readonly source: "owner" | "active_m2_denial";
+  readonly ownerSourceIdentity: string | null;
+  readonly bridgeKey: string;
+  readonly denialId: string | null;
+  readonly executionAttemptId: string | null;
+}
+
+describe("M5 agent trust — agents checking agents", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-trust-"));
+  let coordinator!: M5DemoCoordinator;
+  let idle!: M5JudgeState;
+
+  before(() => {
+    coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+    idle = coordinator.state();
+  });
+
+  after(async () => {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const loadProjection = async (): Promise<(input: Record<string, unknown>) => TrustProjection> => {
+    const module_ = (await import("../src/m5-ui.js")) as Record<string, unknown>;
+    const projection = module_["agentTrustProjection"];
+    assert.equal(typeof projection, "function", "src/m5-ui.ts exports agentTrustProjection");
+    return projection as (input: Record<string, unknown>) => TrustProjection;
+  };
+
+  const approvalRecord = (overrides: Partial<TrustApprovalRecordLike>): TrustApprovalRecordLike => ({
+    toolName: "create_schedule_reservation",
+    toolCallId: "call/approve-alternative",
+    turnId: "turn/root-1",
+    threadId: "thread/root",
+    decision: "allow",
+    reason: "owner approved",
+    source: "owner",
+    ownerSourceIdentity: "owner/judge-ui",
+    bridgeKey: "bridge/reservation-alternative",
+    denialId: null,
+    executionAttemptId: "attempt/m4-approved-alternative",
+    ...overrides,
+  });
+
+  const trustInput = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+    approvals: [],
+    approvalEffectText: (approval: TrustApprovalRecordLike) => `effect ${approval.bridgeKey}`,
+    execution: idle.execution,
+    subagentTitles: [],
+    subagentThreadIds: [],
+    admission: null,
+    sessionId: null,
+    disconnectedAndResumed: false,
+    runStatus: "running",
+    ...overrides,
+  });
+
+  const specialists = {
+    subagentTitles: [
+      "Portfolio and order analyst",
+      "Capacity and schedule analyst",
+      "Assurance and simulation engineer",
+    ],
+    subagentThreadIds: ["thread/sub-portfolio", "thread/sub-capacity", "thread/sub-assurance"],
+  };
+
+  const trustState = (base: M5JudgeState, trust: TrustProjection): M5JudgeState =>
+    ({ ...(base as unknown as Record<string, unknown>), agentTrust: trust }) as unknown as M5JudgeState;
+
+  const recommendationRow: TrustCheckRow = {
+    key: "specialist-recommendations",
+    kind: "recommendation",
+    source: "Specialist subagents — Portfolio and order analyst, Capacity and schedule analyst, Assurance and simulation engineer",
+    claim: "Provided read-only analyses and recommendations to the root agent.",
+    check: "TrueForge thread record — provenance linkage only; the prose is recorded, not semantically verified",
+    result: "recorded",
+    why: "Agents can propose anything; they cannot make it true. A recommendation authorizes nothing until the root proposes the exact action and it passes the authoritative checks below.",
+    technicalEvidence: "thread thread/sub-capacity",
+  };
+
+  test("markup carries the exact primary explanation and the trust sequence", () => {
+    assert.match(document, /Agents checking agents/u);
+    assert.ok(
+      document.includes(
+        "Agents can propose anything; they cannot make it true. Every consequential effect must pass current-state checks, authorization, fenced execution, and independent verification.",
+      ),
+      "the exact primary agent-trust sentence is present",
+    );
+    assert.ok(
+      document.includes("recorded, not semantically verified"),
+      "the provenance line states recording without semantic verification",
+    );
+    const chain = [
+      "Specialist recommendation recorded",
+      "Root proposes exact action",
+      "FlakeBrake checks authoritative state",
+      "Human approval when required",
+      "Fenced execution",
+      "Independent read-back",
+    ];
+    let cursor = -1;
+    for (const label of chain) {
+      const next = document.indexOf(label);
+      assert.ok(next > cursor, `trust sequence lists ${label} in order`);
+      cursor = next;
+    }
+    assert.doesNotMatch(document, /rechecked the specialists/u, "no blanket recommendation-recheck claim");
+    assert.doesNotMatch(document, /verify_agent_claim/u, "no invented generic claim-verification tool");
+  });
+
+  test("idle exposes an empty agent-trust projection and renders no rows", async () => {
+    const trust = (idle as unknown as { agentTrust?: TrustProjection }).agentTrust;
+    assert.ok(trust !== undefined, "M5 state exposes agentTrust");
+    assert.deepEqual(trust.checks, []);
+    assert.equal(trust.recommendationsRecorded, false);
+    const harness = await createPollingHarness(idle, []);
+    assert.equal(harness.evaluate("document.getElementById('trust-rows').innerHTML"), "");
+    assert.equal(harness.evaluate("document.getElementById('trust-empty').hidden"), false);
+    assert.equal(harness.evaluate("document.getElementById('trust-recheck').hidden"), true);
+  });
+
+  test("rows render source, claim, authoritative check, result, and why — identities only behind the disclosure", async () => {
+    const verified = uiProjection(idle, 5, "verified");
+    const rows: TrustProjection = {
+      recommendationsRecorded: true,
+      checks: [
+        recommendationRow,
+        {
+          key: "owner:bridge/reservation-alternative",
+          kind: "owner_gate",
+          source: "Root agent — proposed a schedule reservation",
+          claim: "Reserve the safe 09:40–10:10 slot.",
+          check: "factory-change-control/create_schedule_reservation — exact action reevaluated against current authoritative state at the TrueForge approval gate",
+          result: "allowed",
+          why: "Nothing ran on a recommendation alone: the exact action digest was bound to current M1–M4 state and to your recorded decision before the tool executed.",
+          technicalEvidence: "bridge bridge/reservation-alternative · turn turn/root-1 · call call/approve-alternative",
+        },
+        {
+          key: "m2:bridge/reservation-equivalent",
+          kind: "mechanical_block",
+          source: "Root agent — the same denied action in another technical representation",
+          claim: "Reserve the denied 09:10–09:40 slot through a different tool shape.",
+          check: "factory-change-control/submit_schedule_change — M2 canonical-equivalence check against the active denial",
+          result: "blocked",
+          why: "FlakeBrake recognized the same effect behind a different tool shape and blocked it mechanically — no additional owner decision was used.",
+          technicalEvidence: "bridge bridge/reservation-equivalent · denial m4-denial/primary",
+        },
+        {
+          key: "execution-claim",
+          kind: "execution",
+          source: "Root agent — executor success claim",
+          claim: "The approved change was written to the factory.",
+          check: "factory-change-control/verify_schedule_execution — independent authoritative read-back",
+          result: "pending_verification",
+          why: "A recorded change is not success yet — FlakeBrake reads the factory back independently before anything is presented as verified.",
+          technicalEvidence: "attempt attempt/m4-approved-alternative",
+        },
+      ],
+    };
+    const harness = await createPollingHarness(trustState(verified, rows), []);
+    const rendered = harness.evaluate<string>("document.getElementById('trust-rows').innerHTML");
+    assert.match(rendered, /Specialist subagents — Portfolio and order analyst/u);
+    assert.match(rendered, /Recommendation recorded/u);
+    assert.match(rendered, /Provenance: TrueForge thread record/u);
+    assert.match(rendered, /Root agent — proposed a schedule reservation/u);
+    assert.match(rendered, /Authoritative effect check: factory-change-control\/create_schedule_reservation/u);
+    assert.match(rendered, /Allowed/u);
+    assert.match(rendered, /Blocked/u);
+    assert.match(rendered, /Pending verification/u);
+    assert.doesNotMatch(rendered, /Verified result/u);
+    assert.doesNotMatch(rendered, /bridge\/reservation-alternative/u, "raw identities stay out of the visible rows");
+    assert.doesNotMatch(rendered, /turn\/root-1/u);
+    assert.doesNotMatch(rendered, /thread\/sub-capacity/u);
+    const technical = harness.evaluate<string>("document.getElementById('trust-technical-list').innerHTML");
+    assert.match(technical, /bridge\/reservation-alternative/u);
+    assert.match(technical, /m4-denial\/primary/u);
+    assert.match(technical, /thread\/sub-capacity/u);
+    assert.equal(harness.evaluate("document.getElementById('trust-empty').hidden"), true);
+    assert.equal(harness.evaluate("document.getElementById('trust-recheck').hidden"), false);
+  });
+
+  test("no agent-trust row appears without authoritative source evidence", async () => {
+    const agentTrustProjection = await loadProjection();
+    assert.deepEqual(agentTrustProjection(trustInput({})).checks, []);
+    const noMutation = agentTrustProjection(
+      trustInput({ execution: { ...idle.execution, mutationCount: 0 } }),
+    );
+    assert.ok(!noMutation.checks.some((row) => row.kind === "execution"));
+    const runningReplay = agentTrustProjection(
+      trustInput({ disconnectedAndResumed: true, sessionId: "session/live", runStatus: "running" }),
+    );
+    assert.ok(!runningReplay.checks.some((row) => row.kind === "replay"));
+    const sessionlessReplay = agentTrustProjection(
+      trustInput({ disconnectedAndResumed: true, sessionId: null, runStatus: "verified" }),
+    );
+    assert.ok(!sessionlessReplay.checks.some((row) => row.kind === "replay"));
+    const noThreads = agentTrustProjection(trustInput({ subagentTitles: [], subagentThreadIds: [] }));
+    assert.ok(!noThreads.checks.some((row) => row.kind === "recommendation"));
+  });
+
+  test("stale or cross-thread evidence cannot populate rows", async () => {
+    const agentTrustProjection = await loadProjection();
+    const missingIdentity = agentTrustProjection(
+      trustInput({ approvals: [approvalRecord({ turnId: "" })] }),
+    );
+    assert.deepEqual(missingIdentity.checks, [], "an approval without TrueForge identities yields no row");
+    const crossThread = agentTrustProjection(
+      trustInput({
+        approvals: [approvalRecord({ threadId: "thread/sub-capacity" })],
+        ...specialists,
+      }),
+    );
+    assert.ok(
+      !crossThread.checks.some((row) => row.kind === "owner_gate"),
+      "a specialist-thread record cannot populate a root-attributed effect row",
+    );
+    const duplicated = agentTrustProjection(
+      trustInput({ approvals: [approvalRecord({}), approvalRecord({})] }),
+    );
+    assert.equal(duplicated.checks.filter((row) => row.kind === "owner_gate").length, 1);
+    const verifiedRows: TrustProjection = {
+      recommendationsRecorded: false,
+      checks: [
+        {
+          key: "execution-claim",
+          kind: "execution",
+          source: "Root agent — executor success claim",
+          claim: "The approved change was written to the factory.",
+          check: "factory-change-control/verify_schedule_execution — independent authoritative read-back",
+          result: "verified",
+          why: "Success is presented only because FlakeBrake independently read the factory back.",
+          technicalEvidence: null,
+        },
+      ],
+    };
+    const verified = trustState(
+      { ...uiProjection(idle, 6, "verified"), execution: { ...idle.execution, mutationCount: 1 } },
+      verifiedRows,
+    );
+    const stale = deferred<unknown>();
+    const harness = await createPollingHarness(verified, [stale.promise]);
+    assert.match(harness.evaluate<string>("document.getElementById('trust-rows').innerHTML"), /Verified result/u);
+    const oldPoll = harness.evaluate<Promise<void>>("refresh()");
+    stale.resolve(trustState(uiProjection(idle, 2, "awaiting_approval"), { recommendationsRecorded: false, checks: [] }));
+    await oldPoll;
+    assert.match(
+      harness.evaluate<string>("document.getElementById('trust-rows').innerHTML"),
+      /Verified result/u,
+      "a stale poll cannot clear or regress rendered trust rows",
+    );
+  });
+
+  test("recorded specialist prose is never labeled verified", async () => {
+    const agentTrustProjection = await loadProjection();
+    const projection = agentTrustProjection(trustInput({ ...specialists }));
+    const recommendation = projection.checks.find((row) => row.kind === "recommendation");
+    assert.ok(recommendation !== undefined, "recorded specialist threads yield a recommendation row");
+    assert.equal(recommendation.result, "recorded");
+    assert.match(recommendation.check, /recorded, not semantically verified/u);
+    assert.doesNotMatch(recommendation.why, /verified success|semantically verified prose/u);
+    const harness = await createPollingHarness(
+      trustState(uiProjection(idle, 4, "awaiting_approval"), {
+        recommendationsRecorded: true,
+        checks: [recommendationRow],
+      }),
+      [],
+    );
+    const rendered = harness.evaluate<string>("document.getElementById('trust-rows').innerHTML");
+    assert.match(rendered, /Recommendation recorded/u);
+    assert.doesNotMatch(rendered, /pill-verified|pill-approved/u, "recorded prose never renders a verified or allowed badge");
+    assert.doesNotMatch(rendered, /Verified result|>Allowed</u);
+  });
+
+  test("a recommendation alone cannot produce an allowed or verified effect", async () => {
+    const agentTrustProjection = await loadProjection();
+    const recommendationOnly = agentTrustProjection(trustInput({ ...specialists }));
+    assert.equal(recommendationOnly.checks.length, 1, "specialist evidence alone yields only the recorded row");
+    assert.ok(
+      !recommendationOnly.checks.some((row) => row.result === "allowed" || row.result === "verified"),
+      "no allowed or verified row exists without approval, execution, or replay evidence",
+    );
+    const withApproval = agentTrustProjection(
+      trustInput({ ...specialists, approvals: [approvalRecord({})] }),
+    );
+    assert.equal(withApproval.checks.filter((row) => row.result === "allowed").length, 1);
+    assert.equal(
+      withApproval.checks.filter((row) => row.result === "allowed")[0]?.kind,
+      "owner_gate",
+      "allowed results attach only to approval-bridge evidence",
+    );
+  });
+
+  test("provenance linkage is never conflated with semantic verification", async () => {
+    const agentTrustProjection = await loadProjection();
+    const projection = agentTrustProjection(trustInput({ ...specialists }));
+    const recommendation = projection.checks.find((row) => row.kind === "recommendation");
+    assert.ok(recommendation !== undefined);
+    assert.match(recommendation.check, /provenance linkage only/u);
+    assert.match(recommendation.why, /cannot make it true/u);
+    assert.equal(projection.recommendationsRecorded, true);
+    const bare = agentTrustProjection(trustInput({}));
+    assert.equal(bare.recommendationsRecorded, false, "the provenance sentence needs thread evidence");
+  });
+
+  test("equivalent denied effects remain blocked", async () => {
+    const agentTrustProjection = await loadProjection();
+    const mechanical = approvalRecord({
+      toolName: "submit_schedule_change",
+      toolCallId: "call/deny-equivalent-alternate",
+      decision: "deny",
+      source: "active_m2_denial",
+      ownerSourceIdentity: null,
+      bridgeKey: "bridge/equivalent",
+      denialId: "m4-denial/primary",
+      executionAttemptId: null,
+    });
+    for (const runStatus of ["running", "verified"]) {
+      const projection = agentTrustProjection(trustInput({ approvals: [mechanical], runStatus }));
+      const row = projection.checks.find((item) => item.kind === "mechanical_block");
+      assert.ok(row !== undefined, `mechanical row exists while ${runStatus}`);
+      assert.equal(row.result, "blocked");
+      assert.match(row.why, /no additional owner decision/u);
+      assert.match(row.check, /factory-change-control\/submit_schedule_change/u);
+    }
+  });
+
+  test("an executor's claimed success cannot render verified before read-back", async () => {
+    const agentTrustProjection = await loadProjection();
+    const committed = {
+      ...idle.execution,
+      mutationCount: 1,
+      receiptCount: 1,
+      attemptId: "attempt/m4-approved-alternative",
+      receiptId: "receipt/m4",
+      mutationStatus: "committed",
+    };
+    const beforeReadBack = agentTrustProjection(trustInput({ execution: committed }));
+    assert.equal(beforeReadBack.checks.find((row) => row.kind === "execution")?.result, "pending_verification");
+    const readBackWithoutTerminal = agentTrustProjection(
+      trustInput({ execution: { ...committed, independentReadBackObserved: true } }),
+    );
+    assert.equal(
+      readBackWithoutTerminal.checks.find((row) => row.kind === "execution")?.result,
+      "pending_verification",
+    );
+    const verified = agentTrustProjection(
+      trustInput({
+        execution: { ...committed, independentReadBackObserved: true, terminalStatus: "terminal_verified" },
+        runStatus: "verified",
+      }),
+    );
+    assert.equal(verified.checks.find((row) => row.kind === "execution")?.result, "verified");
+  });
+
+  test("refresh and reconnect cannot invent or duplicate a handoff", async () => {
+    const agentTrustProjection = await loadProjection();
+    const base = trustInput({
+      approvals: [approvalRecord({})],
+      execution: {
+        ...idle.execution,
+        mutationCount: 1,
+        independentReadBackObserved: true,
+        terminalStatus: "terminal_verified",
+      },
+      ...specialists,
+      sessionId: "session/durable",
+      runStatus: "verified",
+    });
+    const first = agentTrustProjection(base);
+    const second = agentTrustProjection(base);
+    assert.deepEqual(second, first, "re-projection of identical evidence is identical");
+    assert.ok(!first.checks.some((row) => row.kind === "replay"), "no replay row without a resume claim");
+    const replayed = agentTrustProjection({ ...base, disconnectedAndResumed: true });
+    assert.equal(replayed.checks.filter((row) => row.kind === "replay").length, 1);
+    assert.equal(replayed.checks.length, first.checks.length + 1, "a resume adds exactly the replay row");
+    const replayRow = replayed.checks.find((row) => row.kind === "replay");
+    assert.ok(replayRow !== undefined);
+    assert.equal(replayRow.result, "verified");
+    assert.match(replayRow.why, /1 mutation|one mutation/iu);
+  });
+
+  test("wording matches the actual caller and checker", async () => {
+    const agentTrustProjection = await loadProjection();
+    const projection = agentTrustProjection(
+      trustInput({
+        approvals: [approvalRecord({})],
+        admission: { admissionRecordId: "admission/m4-direct", decision: "REPLAN" },
+        execution: { ...idle.execution, mutationCount: 1 },
+        ...specialists,
+      }),
+    );
+    const owner = projection.checks.find((row) => row.kind === "owner_gate");
+    assert.ok(owner !== undefined);
+    assert.match(owner.source, /^Root agent — proposed/u, "the root agent proposes every consequential action");
+    assert.match(owner.check, /factory-change-control\/create_schedule_reservation/u);
+    assert.match(owner.check, /reevaluated against current authoritative state/u);
+    assert.match(owner.technicalEvidence ?? "", /admission admission\/m4-direct/u, "the recorded admission basis anchors the reevaluation evidence");
+    const recommendation = projection.checks.find((row) => row.kind === "recommendation");
+    assert.ok(recommendation !== undefined);
+    assert.match(recommendation.source, /Capacity and schedule analyst/u);
+    assert.doesNotMatch(recommendation.check, /record_current_admission/u, "no blanket claim that prose is rechecked through an MCP call");
+    const execution = projection.checks.find((row) => row.kind === "execution");
+    assert.ok(execution !== undefined);
+    assert.match(execution.check, /verify_schedule_execution/u);
   });
 });
 
@@ -1396,7 +2006,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(decisionEvidence.length, terminal.approvals.length);
     assert.equal(decisionEvidence.some((item) => item.status === "pending"), false);
     assert.equal(
-      decisionEvidence.filter((item) => item.title === "Auto-blocked · active policy").length,
+      decisionEvidence.filter((item) => item.title === "Blocked automatically — same denied action").length,
       1,
     );
     const receiptIndex = terminal.evidenceTimeline.findIndex((item) => item.kind === "receipt");

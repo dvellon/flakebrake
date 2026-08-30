@@ -230,6 +230,19 @@ export interface M5JudgeState {
     readonly duplicateEffectCount: number;
     readonly unauthorizedMutationCount: number;
   };
+  readonly agentTrust: {
+    readonly recommendationsRecorded: boolean;
+    readonly checks: readonly {
+      readonly key: string;
+      readonly kind: "recommendation" | "owner_gate" | "mechanical_block" | "execution" | "replay";
+      readonly source: string;
+      readonly claim: string;
+      readonly check: string;
+      readonly result: "recorded" | "allowed" | "blocked" | "pending_verification" | "verified";
+      readonly why: string;
+      readonly technicalEvidence: string | null;
+    }[];
+  };
 }
 
 const HARNESS_PROJECTION: M5JudgeState["harness"] = (() => {
@@ -384,8 +397,8 @@ export class M5DemoCoordinator {
         );
         this.#upsertEvidence(
           "terminal",
-          "Terminal verified success",
-          "Independent read-back matched the authorized mutation before root completion.",
+          "Verified complete",
+          "Terminal verified success: independent read-back matched the authorized mutation before root completion.",
           "verified",
         );
       })
@@ -667,7 +680,46 @@ export class M5DemoCoordinator {
             ? execution.mutationCount
             : 0,
       },
+      agentTrust: agentTrustProjection({
+        approvals,
+        approvalEffectText: (approval) => approvalEffect(approval, missionSnapshot),
+        execution,
+        subagentTitles: activity.subagents.map((item) => item.title),
+        subagentThreadIds: activity.subagents.map((item) => item.threadId),
+        admission: this.#readReplanAdmission(),
+        sessionId:
+          missionSnapshot?.mission.trueforgeSessionId ?? result?.mission.trueforgeSessionId ?? null,
+        disconnectedAndResumed:
+          (result?.mission.disconnectedAndResumed ?? false) || this.#replayedTerminal,
+        runStatus: this.#status,
+      }),
     };
+  }
+
+  #readReplanAdmission(): { readonly admissionRecordId: string; readonly decision: string } | null {
+    if (!existsSync(this.#paths.m2) || !existsSync(this.#paths.factory)) return null;
+    try {
+      const store = createStore({
+        path: this.#paths.m2,
+        authoritativeFactoryDatabasePath: this.#paths.factory,
+        now: () => HERO_HORIZON_END,
+      });
+      try {
+        const admission = store
+          .getAdmissionHistory()
+          .find((item) => item.record.decision === "REPLAN");
+        return admission === undefined
+          ? null
+          : {
+              admissionRecordId: admission.record.admissionRecordId,
+              decision: admission.record.decision,
+            };
+      } finally {
+        store.close();
+      }
+    } catch {
+      return null;
+    }
   }
 
   public async close(): Promise<void> {
@@ -739,7 +791,7 @@ export class M5DemoCoordinator {
       this.#upsertEvidence(
         `approval:${checkpoint.approval.bridgeKey}`,
         checkpoint.approval.source === "active_m2_denial"
-          ? "Auto-blocked · active policy"
+          ? "Blocked automatically — same denied action"
           : checkpoint.approval.decision === "allow"
             ? "Owner approved the bound action"
             : "Owner denied the bound action",
@@ -935,7 +987,7 @@ export class M5DemoCoordinator {
         kind: `approval:${approval.bridgeKey}`,
         title:
           approval.source === "active_m2_denial"
-            ? "Auto-blocked · active policy"
+            ? "Blocked automatically — same denied action"
             : approval.decision === "allow"
               ? "Action approved"
               : "Action denied",
@@ -1470,6 +1522,132 @@ function winningModification(candidate: {
   };
 }
 
+export interface AgentTrustEvidence {
+  readonly approvals: readonly M4ApprovalRecord[];
+  readonly approvalEffectText: (approval: M4ApprovalRecord) => string;
+  readonly execution: M5JudgeState["execution"];
+  readonly subagentTitles: readonly string[];
+  readonly subagentThreadIds: readonly string[];
+  readonly admission: { readonly admissionRecordId: string; readonly decision: string } | null;
+  readonly sessionId: string | null;
+  readonly disconnectedAndResumed: boolean;
+  readonly runStatus: M5RunStatus;
+}
+
+/**
+ * Derives the "agents checking agents" rows exclusively from durable evidence:
+ * the recorded admission basis, persisted approval-bridge records, M2/factory
+ * execution reads, subagent-thread evidence, and the durable session identity.
+ * No row is produced without its own authoritative source, so recommendation
+ * prose can never populate, upgrade, or duplicate a check.
+ */
+export function agentTrustProjection(input: AgentTrustEvidence): M5JudgeState["agentTrust"] {
+  const checks: Array<M5JudgeState["agentTrust"]["checks"][number]> = [];
+  if (input.subagentTitles.length > 0) {
+    checks.push({
+      key: "specialist-recommendations",
+      kind: "recommendation",
+      source: `Specialist subagents — ${input.subagentTitles.join(", ")}`,
+      claim: "Provided read-only analyses and recommendations to the root agent.",
+      check:
+        "TrueForge thread record — provenance linkage only; the prose is recorded, not semantically verified",
+      result: "recorded",
+      why: "Agents can propose anything; they cannot make it true. A recommendation authorizes nothing until the root proposes the exact action and it passes the authoritative checks below.",
+      technicalEvidence:
+        input.subagentThreadIds.length === 0
+          ? null
+          : input.subagentThreadIds.map((threadId) => `thread ${threadId}`).join(" · "),
+    });
+  }
+  const subagentThreads = new Set(input.subagentThreadIds);
+  const seenBridges = new Set<string>();
+  for (const approval of input.approvals) {
+    if (
+      approval.bridgeKey === "" ||
+      approval.turnId === "" ||
+      approval.threadId === "" ||
+      approval.toolCallId === "" ||
+      subagentThreads.has(approval.threadId) ||
+      seenBridges.has(approval.bridgeKey)
+    ) {
+      continue;
+    }
+    seenBridges.add(approval.bridgeKey);
+    const identity = [
+      `bridge ${approval.bridgeKey}`,
+      `turn ${approval.turnId}`,
+      `call ${approval.toolCallId}`,
+      ...(approval.denialId === null ? [] : [`denial ${approval.denialId}`]),
+      ...(approval.executionAttemptId === null ? [] : [`attempt ${approval.executionAttemptId}`]),
+      ...(input.admission === null ? [] : [`admission ${input.admission.admissionRecordId}`]),
+    ].join(" · ");
+    if (approval.source === "active_m2_denial") {
+      if (approval.decision !== "deny") continue;
+      checks.push({
+        key: `m2:${approval.bridgeKey}`,
+        kind: "mechanical_block",
+        source: "Root agent — the same denied action in another technical representation",
+        claim: input.approvalEffectText(approval),
+        check: `factory-change-control/${approval.toolName} — M2 canonical-equivalence check against the active denial`,
+        result: "blocked",
+        why: "FlakeBrake recognized the same effect behind a different tool shape and blocked it mechanically — no additional owner decision was used.",
+        technicalEvidence: identity,
+      });
+      continue;
+    }
+    checks.push({
+      key: `owner:${approval.bridgeKey}`,
+      kind: "owner_gate",
+      source: `Root agent — proposed ${humanToolName(approval.toolName)}`,
+      claim: input.approvalEffectText(approval),
+      check: `factory-change-control/${approval.toolName} — exact action reevaluated against current authoritative state at the TrueForge approval gate`,
+      result: approval.decision === "allow" ? "allowed" : "blocked",
+      why:
+        approval.decision === "allow"
+          ? "Nothing ran on a recommendation alone: the exact action digest was bound to current M1–M4 state and to your recorded decision before the tool executed."
+          : "Your denial is durably recorded and becomes an active denial covering this exact effect.",
+      technicalEvidence: identity,
+    });
+  }
+  if (input.execution.mutationCount > 0) {
+    const verified =
+      input.execution.independentReadBackObserved &&
+      input.execution.terminalStatus?.startsWith("terminal_") === true;
+    const executionIdentity = [
+      ...(input.execution.attemptId === null ? [] : [`attempt ${input.execution.attemptId}`]),
+      ...(input.execution.receiptId === null ? [] : [`receipt ${input.execution.receiptId}`]),
+    ].join(" · ");
+    checks.push({
+      key: "execution-claim",
+      kind: "execution",
+      source: "Root agent — executor success claim",
+      claim: "The approved change was written to the factory.",
+      check: "factory-change-control/verify_schedule_execution — independent authoritative read-back",
+      result: verified ? "verified" : "pending_verification",
+      why: verified
+        ? "Success is presented only because FlakeBrake independently read the factory back and the terminal state matched the exact approved effect."
+        : "A recorded change is not success yet — FlakeBrake reads the factory back independently before anything is presented as verified.",
+      technicalEvidence: executionIdentity === "" ? null : executionIdentity,
+    });
+  }
+  if (input.disconnectedAndResumed && input.runStatus === "verified" && input.sessionId !== null) {
+    checks.push({
+      key: "replay-claim",
+      kind: "replay",
+      source: "Resumed process — continuity claim",
+      claim: "This is the same completed session; nothing was re-run.",
+      check: "Durable TrueForge session read + authoritative factory effect counts",
+      result: "verified",
+      why: `The session id is unchanged and the factory still shows ${String(input.execution.mutationCount)} mutation — a reconnect cannot invent or repeat decisions or effects.`,
+      technicalEvidence: `session ${input.sessionId}`,
+    });
+  }
+  return {
+    recommendationsRecorded: input.subagentTitles.length > 0,
+    checks,
+  };
+}
+
 function activityFromResult(result: DeterministicM4MissionResult): M5JudgeState["activity"] {
   const servers = new Set<string>();
   const tools = new Set<string>();
@@ -1719,7 +1897,7 @@ function resourceLabel(key: string): string {
   return key === HERO_RESOURCE_KEYS.agent
     ? "Agent work"
     : key === HERO_RESOURCE_KEYS.human
-      ? "Owner decisions"
+      ? "Human decisions"
       : key === HERO_RESOURCE_KEYS.production
         ? "Production cell"
         : key;
