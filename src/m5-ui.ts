@@ -593,6 +593,7 @@ export class M5DemoCoordinator {
       m2DatabasePath: this.#paths.m2,
       factoryDatabasePath: this.#paths.factory,
       missionDatabasePath: this.#paths.mission,
+      trueforgeDatabasePath: this.#paths.trueforge,
     } as const;
     if (!isMissionEvidenceReady(options)) {
       throw new M5RequestError(

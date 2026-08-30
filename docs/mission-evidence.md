@@ -1,4 +1,4 @@
-# Mission Evidence Bundle v1
+# Mission Evidence Bundle v2
 
 The optional Mission Evidence Bundle is a read-only, canonical projection of a
 completed deterministic mission. It packages the durable facts needed to
@@ -16,7 +16,7 @@ The downloaded document is exact canonical JSON with this envelope:
   "digestAlgorithm": "sha256",
   "payload": {},
   "payloadDigest": "sha256:...",
-  "schemaVersion": "flakebrake-mission-evidence-bundle/v1"
+  "schemaVersion": "flakebrake-mission-evidence-bundle/v2"
 }
 ```
 
@@ -26,10 +26,13 @@ bundle.
 
 ## Durable evidence included
 
-The v1 payload contains:
+The v2 payload contains:
 
-- mission, environment, TrueForge session, terminal-turn identity, and the
-  recomputable successor/bridge linkage material behind those identities;
+- mission, environment, TrueForge agent/session, complete turn-chain,
+  durable-cursor, terminal-turn, and recomputable successor/bridge identities;
+- deterministic judge-profile disclosure, all three completed subagent thread
+  identities, MCP service identities, native approval events and successor
+  decisions, response status/commitments, and path-free local-sandbox proof;
 - the accepted authoritative Promise Basis, calibration digest, and versions;
 - the original REPLAN admission, selected modification, accepted execution
   admission, and pre-execution recomputation, including their durable addenda;
@@ -40,14 +43,20 @@ The v1 payload contains:
 - the mutation result and receipt;
 - terminal independent read-back and its observed-state digest;
 - terminal projection and actual-consumption facts;
+- native mutation/read-back/verification/terminal ordering and refresh/replay
+  continuity evidence;
 - exact relevant counts for admissions, approvals, grants, denials, attempts,
-  fences, mutations, receipts, terminal events, actuals, and bridge actions.
+  fences, mutations, receipts, terminal events, actuals, bridge actions, and
+  TrueForge turns/events/connectors/threads/sandbox actions.
 
-The payload omits database paths and instance identities, credentials and
-secret-shaped fields, mutable UI state, process counters, and audit timestamps
+The payload omits database paths, credentials and secret-shaped fields,
+provider/connector manifests and URLs, raw sandbox identifiers, mutable UI
+state, process counters, and audit timestamps
 such as creation, update, issue, observation, or recording times. Semantic
 windows such as schedule start/end and grant validity remain because they are
-part of the authorization and effect.
+part of the authorization and effect. M2/factory instance bindings are emitted
+only as opaque digest identities so the owner-action commitment can be
+independently recomputed without revealing a path.
 
 ## Read-only export
 
@@ -58,8 +67,9 @@ security headers. Export opens SQLite with `readOnly: true` plus
 `PRAGMA query_only = ON` and never calls a mutating store operation.
 Before projecting records, the exporter recomputes the supplied M2 and factory
 database instance identities and requires them to match the mission's durable
-cross-store binding. Those path-derived instance identities are validated but
-not placed in the portable payload.
+cross-store binding. It also opens the TrueForge session database read-only and
+requires its agent, session, turns, events, threads, connectors, approvals,
+responses, and sandbox evidence to match the mission bridge.
 
 ## Local verification
 
@@ -84,11 +94,13 @@ npm run evidence:verify -- \
   --bundle /absolute/path/mission-evidence.json \
   --m2-db /absolute/path/m2.sqlite \
   --factory-db /absolute/path/factory.sqlite \
-  --mission-db /absolute/path/mission.sqlite
+  --mission-db /absolute/path/mission.sqlite \
+  --trueforge-db /absolute/path/trueforge.sqlite
 ```
 
 Standalone verification rejects invalid schemas, noncanonical bytes, digest
 tampering, broken identity linkage, inconsistent counts, mismatched factory
 results and receipts, missing owner/mechanical-denial proof, read-back mismatch,
-or inconsistent terminal/actual facts. Database-backed verification additionally
-rebuilds the projection through read-only handles and requires byte equality.
+inconsistent terminal/actual facts, or invalid TrueForge provenance and event
+ordering. Database-backed verification additionally rebuilds the projection
+through four read-only handles and requires byte equality.

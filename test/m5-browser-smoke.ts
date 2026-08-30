@@ -287,7 +287,7 @@ try {
   assert.equal(await evidenceDownload.getAttribute("download"), "flakebrake-mission-evidence.json");
   assert.equal(
     await browser.executeScript<boolean>(
-      "return fetch('/api/evidence').then(async (response) => response.status === 200 && response.headers.get('content-type')?.startsWith('application/json') === true && JSON.parse(await response.text()).schemaVersion === 'flakebrake-mission-evidence-bundle/v1');",
+      "return fetch('/api/evidence').then(async (response) => response.status === 200 && response.headers.get('content-type')?.startsWith('application/json') === true && JSON.parse(await response.text()).schemaVersion === 'flakebrake-mission-evidence-bundle/v2');",
     ),
     true,
     "the completed mission exposes inspectable canonical evidence",

@@ -34,10 +34,10 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     m2DatabasePath: join(directory, "m2.sqlite"),
     factoryDatabasePath: join(directory, "factory.sqlite"),
     missionDatabasePath: join(directory, "mission.sqlite"),
+    trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
   };
   const missionOptions = {
     ...options,
-    trueforgeDatabasePath: join(directory, "trueforge.sqlite"),
     localSandboxRootParent: join(directory, "trueforge-data"),
   };
   let canonicalBytes = "";
@@ -60,9 +60,21 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     assert.equal(exportMissionEvidenceBundle(options), canonicalBytes);
     assert.equal(exportMissionEvidenceBundle(options), canonicalBytes);
     const beforeRestart = durableSnapshot(options);
-    await runDeterministicM4Mission(missionOptions);
+    let replayOwnerCalls = 0;
+    await runDeterministicM4Mission({
+      ...missionOptions,
+      ownerDecisionProvider: () => {
+        replayOwnerCalls += 1;
+        throw new Error("completed replay must not call the owner");
+      },
+    });
+    assert.equal(replayOwnerCalls, 0);
     assert.equal(exportMissionEvidenceBundle(options), canonicalBytes);
-    assert.deepEqual(durableSnapshot(options), beforeRestart);
+    const afterRestart = durableSnapshot(options);
+    assert.deepEqual(
+      consequentialSnapshots(afterRestart),
+      consequentialSnapshots(beforeRestart),
+    );
   });
 
   test("canonical payload excludes machine-local, secret, timestamp, and display-only data", () => {
@@ -75,8 +87,19 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
       "observedAt",
       "recordedAt",
       "updatedAt",
+      "created_at",
+      "updated_at",
+      "last_activity_at",
     ]) {
       assert.equal(canonicalBytes.includes(`\"${field}\"`), false, field);
+    }
+    for (const excluded of [
+      "v1:local:",
+      '"manifest"',
+      '"base_url"',
+      '"owner_token"',
+    ]) {
+      assert.equal(canonicalBytes.includes(excluded), false, excluded);
     }
     assert.equal(canonicalBytes.includes("runtimeEvidence"), false);
     assert.deepEqual(
@@ -91,6 +114,35 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
       () => sanitizeEvidenceValue({ databasePath: "/machine/local.sqlite" }),
       /forbidden field/u,
     );
+  });
+
+  test("canonical payload contains the exact durable TrueForge provenance projection", () => {
+    const bundle = mutableBundle(canonicalBytes);
+    const provenance = bundle.payload.trueforgeProvenance;
+    assert.equal(provenance.runtimeProfile.runtimeId, "@truefoundry/trueforge");
+    assert.equal(provenance.runtimeProfile.profileKind, "deterministic_judge");
+    assert.equal(provenance.runtimeProfile.provider.name, "flakebrake-deterministic");
+    assert.equal(provenance.runtimeProfile.provider.modelId, "m4-mission");
+    assert.equal(provenance.turns.length, 7);
+    assert.equal(provenance.subagentThreads.length, 3);
+    assert.deepEqual(
+      provenance.connectors.map((connector) => connector.serviceId),
+      [
+        "factory-capacity",
+        "factory-change-control",
+        "factory-orders",
+        "factory-simulator",
+      ],
+    );
+    assert.equal(bundle.payload.ownerApprovalBindings.length, 5);
+    assert.equal(
+      bundle.payload.ownerApprovalBindings.filter(
+        (binding) => binding.ownerRequest !== null,
+      ).length,
+      4,
+    );
+    assert.equal(provenance.replayContinuity.resumeEventIds.length, 5);
+    assert.equal(bundle.payload.counts["trueforgeSessionEvents"], 71);
   });
 
   test("verifier checks exact source bytes and leaves all durable snapshots unchanged", () => {
@@ -128,6 +180,31 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
       );
     } finally {
       rmSync(mixedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("export rejects a different TrueForge session-store incarnation", async () => {
+    const foreignRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-foreign-tf-"));
+    const foreignOptions = {
+      missionId: M4_HERO_MISSION_ID,
+      m2DatabasePath: join(foreignRoot, "m2.sqlite"),
+      factoryDatabasePath: join(foreignRoot, "factory.sqlite"),
+      missionDatabasePath: join(foreignRoot, "mission.sqlite"),
+      trueforgeDatabasePath: join(foreignRoot, "trueforge.sqlite"),
+      localSandboxRootParent: join(foreignRoot, "trueforge-data"),
+    } as const;
+    try {
+      await runDeterministicM4Mission(foreignOptions);
+      assert.throws(
+        () =>
+          exportMissionEvidenceBundle({
+            ...options,
+            trueforgeDatabasePath: foreignOptions.trueforgeDatabasePath,
+          }),
+        /mission-bound TrueForge session must have exactly one row; found 0/u,
+      );
+    } finally {
+      rmSync(foreignRoot, { recursive: true, force: true });
     }
   });
 
@@ -181,7 +258,7 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     refreshDigest(inconsistent);
     assert.throws(
       () => verifyMissionEvidenceBytes(canonicalSerialize(inconsistent)),
-      /exact relevant evidence counts are inconsistent/u,
+      /exact (?:relevant evidence|TrueForge provenance) counts are inconsistent/u,
     );
 
     const missingReceipt = mutableBundle(canonicalBytes);
@@ -218,6 +295,245 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     );
   });
 
+  test("every added TrueForge provenance category rejects focused tampering", () => {
+    const cases: readonly {
+      readonly name: string;
+      readonly mutate: (bundle: MutableEvidenceBundle) => void;
+      readonly databaseBacked?: boolean;
+    }[] = [
+      {
+        name: "runtime identity",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.runtimeProfile.runtimeId =
+            "@truefoundry/foreign";
+        },
+      },
+      {
+        name: "deterministic profile disclosure",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.runtimeProfile.agent.iterationLimit = 95;
+        },
+      },
+      {
+        name: "agent identity",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.missionBinding.agentId = "agent/foreign";
+        },
+      },
+      {
+        name: "mission session identity",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.missionBinding.sessionId =
+            "session/foreign";
+        },
+      },
+      {
+        name: "turn chain",
+        mutate: (bundle) => {
+          const turn = requiredItem(
+            bundle.payload.trueforgeProvenance.turns,
+            2,
+            "third turn",
+          );
+          turn.previousTurnId = "turn/foreign";
+        },
+      },
+      {
+        name: "durable cursor",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.cursor.currentTurnId = "turn/foreign";
+        },
+      },
+      {
+        name: "subagent thread linkage",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.trueforgeProvenance.subagentThreads,
+            0,
+            "first subagent",
+          ).parentThreadId = "thread/foreign";
+        },
+      },
+      {
+        name: "connector identity",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.trueforgeProvenance.connectors,
+            0,
+            "first connector",
+          ).serviceId = "service/foreign";
+        },
+      },
+      {
+        name: "native MCP tool-call linkage",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).native.toolCallPosition.turnOrdinal = 7;
+        },
+      },
+      {
+        name: "cross-thread action substitution",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).trueforgeThreadId = "thread/foreign";
+        },
+      },
+      {
+        name: "safe argument commitment",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).arguments["tampered"] = true;
+        },
+      },
+      {
+        name: "native MCP response status",
+        mutate: (bundle) => {
+          const native = requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).native;
+          native.responseStatus =
+            native.responseStatus === "completed" ? "rejected" : "completed";
+        },
+      },
+      {
+        name: "local sandbox identity",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.sandbox.sandboxIdentity =
+            digestIdentity("trueforge-local-sandbox", "0");
+        },
+      },
+      {
+        name: "sandbox completion result",
+        databaseBacked: true,
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.sandbox.resultDigest = digest("1");
+        },
+      },
+      {
+        name: "sandbox execution argument commitment",
+        databaseBacked: true,
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.sandbox.executionArgumentsDigest =
+            digest("4");
+        },
+      },
+      {
+        name: "approval-required event identity",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).native.approvalRequiredEventId = "event/foreign";
+        },
+      },
+      {
+        name: "user approval decision linkage",
+        mutate: (bundle) => {
+          const userApproval = requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).native.userApproval;
+          userApproval.decision =
+            userApproval.decision === "allow" ? "deny" : "allow";
+        },
+      },
+      {
+        name: "user approval input commitment",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).native.userApproval.inputDigest = digest("5");
+        },
+      },
+      {
+        name: "owner action digest",
+        mutate: (bundle) => {
+          const binding = requiredItem(
+            bundle.payload.ownerApprovalBindings.filter(
+              (item) => item.ownerRequest !== null,
+            ),
+            0,
+            "owner approval",
+          );
+          assert.ok(binding.ownerRequest);
+          binding.ownerRequest.requestDigest = digest("2");
+        },
+      },
+      {
+        name: "refresh resume linkage",
+        mutate: (bundle) => {
+          requiredItem(
+            bundle.payload.ownerApprovalBindings,
+            0,
+            "first approval",
+          ).native.resumeBridgeEventId = digestIdentity("m4-bridge-event", "3");
+        },
+      },
+      {
+        name: "restart replay continuity",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.replayContinuity.resumeEventIds.pop();
+        },
+      },
+      {
+        name: "durable terminal ordering",
+        mutate: (bundle) => {
+          bundle.payload.trueforgeProvenance.durableOrdering.terminal.position = {
+            turnOrdinal: 1,
+            eventOrdinal: 1,
+          };
+        },
+      },
+      {
+        name: "native response result commitment",
+        mutate: (bundle) => {
+          const binding = requiredItem(
+            bundle.payload.ownerApprovalBindings.filter(
+              (item) => item.trueforgeToolCallId === "approve-alternative",
+            ),
+            0,
+            "mutation approval",
+          );
+          binding.native.responseDigest = digest("6");
+        },
+      },
+      {
+        name: "exact TrueForge counts",
+        mutate: (bundle) => {
+          bundle.payload.counts["trueforgeSessionEvents"] = 70;
+        },
+      },
+    ];
+    for (const regression of cases) {
+      const tampered = mutableBundle(canonicalBytes);
+      regression.mutate(tampered);
+      refreshDigest(tampered);
+      assert.throws(
+        () =>
+          verifyMissionEvidenceBytes(
+            canonicalSerialize(tampered),
+            regression.databaseBacked === true ? options : undefined,
+          ),
+        regression.name,
+      );
+    }
+  });
+
   test("failed read-only database opens release every acquired handle", () => {
     const corruptRoot = mkdtempSync(join(tmpdir(), "flakebrake-evidence-corrupt-"));
     const corruptOptions: MissionEvidenceBuildOptions = {
@@ -225,10 +541,15 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
       m2DatabasePath: join(corruptRoot, "m2.sqlite"),
       factoryDatabasePath: join(corruptRoot, "factory.sqlite"),
       missionDatabasePath: join(corruptRoot, "mission.sqlite"),
+      trueforgeDatabasePath: join(corruptRoot, "trueforge.sqlite"),
     };
     try {
       copyFileSync(options.m2DatabasePath, corruptOptions.m2DatabasePath);
       copyFileSync(options.factoryDatabasePath, corruptOptions.factoryDatabasePath);
+      copyFileSync(
+        options.trueforgeDatabasePath,
+        corruptOptions.trueforgeDatabasePath,
+      );
       writeFileSync(corruptOptions.missionDatabasePath, "not a SQLite database", "utf8");
       for (let attempt = 0; attempt < 16; attempt += 1) {
         assert.throws(
@@ -298,6 +619,7 @@ describe("canonical Mission Evidence Bundle", { concurrency: false }, () => {
     copyFileSync(options.m2DatabasePath, join(corruptRoot, "m2.sqlite"));
     copyFileSync(options.factoryDatabasePath, join(corruptRoot, "factory.sqlite"));
     copyFileSync(options.missionDatabasePath, join(corruptRoot, "mission.sqlite"));
+    copyFileSync(options.trueforgeDatabasePath, join(corruptRoot, "trueforge.sqlite"));
     const mission = new DatabaseSync(join(corruptRoot, "mission.sqlite"));
     try {
       mission
@@ -358,6 +680,50 @@ interface MutableEvidenceBundle {
     promiseAcceptance: {
       body: Record<string, unknown>;
     };
+    ownerApprovalBindings: {
+      bridgeKey: string;
+      toolName: string;
+      trueforgeThreadId: string;
+      trueforgeToolCallId: string;
+      arguments: Record<string, unknown>;
+      ownerRequest: {
+        bridgeEventId: string;
+        requestDigest: string;
+        phase: string;
+      } | null;
+      native: {
+        toolCallPosition: { turnOrdinal: number; eventOrdinal: number };
+        approvalRequiredEventId: string;
+        responseStatus: "completed" | "rejected";
+        responseDigest: string;
+        resumeBridgeEventId: string;
+        userApproval: { decision: "allow" | "deny"; inputDigest: string };
+      };
+    }[];
+    trueforgeProvenance: {
+      runtimeProfile: {
+        runtimeId: string;
+        profileKind: string;
+        provider: { name: string; modelId: string };
+        agent: { iterationLimit: number };
+      };
+      missionBinding: { agentId: string; sessionId: string };
+      cursor: { currentTurnId: string };
+      turns: { previousTurnId: string | null }[];
+      subagentThreads: { parentThreadId: string }[];
+      connectors: { serviceId: string }[];
+      sandbox: {
+        sandboxIdentity: string;
+        executionArgumentsDigest: string;
+        resultDigest: string;
+      };
+      replayContinuity: { resumeEventIds: string[] };
+      durableOrdering: {
+        terminal: {
+          position: { turnOrdinal: number; eventOrdinal: number };
+        };
+      };
+    };
     [key: string]: unknown;
   };
 }
@@ -370,6 +736,20 @@ function refreshDigest(bundle: MutableEvidenceBundle): void {
   bundle.payloadDigest = `sha256:${createHash("sha256")
     .update(canonicalSerialize(bundle.payload), "utf8")
     .digest("hex")}`;
+}
+
+function digest(fill: string): string {
+  return `sha256:${fill.repeat(64)}`;
+}
+
+function digestIdentity(prefix: string, fill: string): string {
+  return `${prefix}/${digest(fill)}`;
+}
+
+function requiredItem<T>(values: readonly T[], index: number, label: string): T {
+  const value = values[index];
+  assert.ok(value, `${label} is missing`);
+  return value;
 }
 
 function openDescriptorCount(path: string): number {
@@ -390,7 +770,16 @@ function durableSnapshot(
       ["m2", paths.m2DatabasePath],
       ["factory", paths.factoryDatabasePath],
       ["mission", paths.missionDatabasePath],
+      ["trueforge", paths.trueforgeDatabasePath],
     ].map(([label, path]) => [label, logicalDatabaseDigest(path as string)]),
+  );
+}
+
+function consequentialSnapshots(
+  snapshot: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+  return Object.fromEntries(
+    Object.entries(snapshot).filter(([label]) => label !== "trueforge"),
   );
 }
 
@@ -413,7 +802,7 @@ function logicalDatabaseDigest(path: string): string {
       const rows = (database.prepare(`SELECT * FROM "${quoted}"`).all() as Record<
         string,
         unknown
-      >[]).sort((left, right) =>
+      >[]).map(normalizeDatabaseRow).sort((left, right) =>
         canonicalSerialize(left).localeCompare(canonicalSerialize(right), "en"),
       );
       return { name, rows };
@@ -424,4 +813,22 @@ function logicalDatabaseDigest(path: string): string {
   } finally {
     database.close();
   }
+}
+
+function normalizeDatabaseRow(
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [
+      key,
+      value instanceof Uint8Array
+        ? {
+            sqliteBlobByteLength: value.byteLength,
+            sqliteBlobDigest: `sha256:${createHash("sha256")
+              .update(value)
+              .digest("hex")}`,
+          }
+        : value,
+    ]),
+  );
 }

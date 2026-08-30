@@ -13,6 +13,7 @@ const VALUE_FLAGS = [
   "--m2-db",
   "--factory-db",
   "--mission-db",
+  "--trueforge-db",
   "--mission-id",
 ] as const;
 
@@ -59,6 +60,7 @@ export function parseMissionEvidenceCliArguments(
     values["--m2-db"],
     values["--factory-db"],
     values["--mission-db"],
+    values["--trueforge-db"],
   ];
   if (dataDirectory !== undefined && explicitPaths.some((value) => value !== undefined)) {
     throw new TypeError("--data-dir cannot be combined with explicit database paths");
@@ -68,7 +70,9 @@ export function parseMissionEvidenceCliArguments(
     explicitPaths.some((value) => value !== undefined) &&
     explicitPaths.some((value) => value === undefined)
   ) {
-    throw new TypeError("--m2-db, --factory-db, and --mission-db must be supplied together");
+    throw new TypeError(
+      "--m2-db, --factory-db, --mission-db, and --trueforge-db must be supplied together",
+    );
   }
   const missionId = values["--mission-id"] ?? "mission/flakebrake-m4-hero";
   const databases =
@@ -85,6 +89,10 @@ export function parseMissionEvidenceCliArguments(
             missionDatabasePath: absolutePath(
               values["--mission-db"] as string,
               "--mission-db",
+            ),
+            trueforgeDatabasePath: absolutePath(
+              values["--trueforge-db"] as string,
+              "--trueforge-db",
             ),
           }
         : undefined;
@@ -118,6 +126,7 @@ function databaseOptionsFromDirectory(
     m2DatabasePath: join(root, "m2.sqlite"),
     factoryDatabasePath: join(root, "factory.sqlite"),
     missionDatabasePath: join(root, "mission.sqlite"),
+    trueforgeDatabasePath: join(root, "trueforge.sqlite"),
   };
 }
 
@@ -134,7 +143,7 @@ function isValueFlag(value: string | undefined): value is ValueFlag {
 function usage(): string {
   return (
     "Usage: npm run evidence:verify -- --bundle PATH [--data-dir PATH] [--mission-id ID]\n" +
-    "       npm run evidence:verify -- --bundle PATH --m2-db PATH --factory-db PATH --mission-db PATH [--mission-id ID]\n\n" +
+    "       npm run evidence:verify -- --bundle PATH --m2-db PATH --factory-db PATH --mission-db PATH --trueforge-db PATH [--mission-id ID]\n\n" +
     "Validates schema, canonical bytes, the SHA-256 payload digest, linkage, exact counts, and terminal consistency. " +
     "Supplying the databases also requires an exact read-only durable projection match.\n"
   );
