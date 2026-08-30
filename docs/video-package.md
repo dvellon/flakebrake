@@ -77,7 +77,7 @@ constraint."
 ### 1:30–1:50 · Mechanical equivalent-action denial
 
 **Shot:** The policy panel appears: **"Owner denied primary interval"** and
-**"Auto-blocked · active policy"**. In the Proof Center's
+**"Blocked automatically — same denied action"**. In the Proof Center's
 **"Exact control decisions"** drawer, show
 **"Mechanically blocked · no owner decision"**.
 
@@ -89,7 +89,7 @@ mechanically — no extra owner call, no mutation."
 ### 1:50–2:05 · Safe alternative approval, one mutation
 
 **Shot:** Fourth pause: the distinct 09:40–10:10 alternative. Click
-**"Approve action"**. Show the **"Execution ledger"** metrics ticking to one
+**"Approve action"**. Show the **"Factory change ledger"** metrics ticking to one
 acceptance, one attempt, one mutation, one receipt.
 
 **Say:** "The nine-forty alternative is a genuinely different effect, so it
@@ -128,6 +128,8 @@ real TrueForge harness. FlakeBrake: an agent you can hold to its word."
 ---
 
 ## YouTube metadata
+
+**Final URL:** https://www.youtube.com/watch?v=E00_3udo804
 
 **Title (drop-in):**
 FlakeBrake — a human-governed TrueForge agent that proves its promises (3-min demo)
@@ -185,9 +187,9 @@ blue `#72c9ff` for the TrueForge line, big mono numerals if used.
       the second (recorded) run will match it.
 - [ ] Verify the four owner calls land ALLOW / ALLOW / DENY / ALLOW.
 - [ ] Confirm the counts on screen: 4 owner calls, 1 mechanical block,
-      1 mutation, 1 receipt, 2 actual facts.
+      1 factory reallocation, 1 factory change record, 2 measured resource facts.
 - [ ] Capture the refresh beat in the same take (it's the proof).
 - [ ] Runtime check before upload: **under 3:00**, narration 2:40–2:55.
-- [ ] After upload: paste the final URL into the site's video panel
+- [x] After upload: the final URL is installed in the site's video panel
       (see the comment in `docs/index.html`), `docs/submission-form.md`, and
       the YouTube description placeholders above.

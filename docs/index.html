@@ -137,10 +137,10 @@
 
         <figure class="shot">
           <div class="shot-frame">
-            <img src="assets/pages/harness-observed.png" width="2788" height="367"
-              alt="TrueForge harness ribbon from the judge UI after a verified run, showing the session and turn identifiers, runtime TrueForge 0.1.4 · SDK 0.1.3, MCP 4/4 services reached, sandbox 1 executed, 3 subagent threads evidenced, approval gate Native · 4 owner calls, and replay Durable session replayed.">
+            <img src="assets/pages/harness-observed.png" width="1280" height="714"
+              alt="TrueForge harness strip from the judge UI after a verified run: the action chain marks Mission and Verified result as VERIFIED, with 3 specialist agents, 4 factory tools, Sandbox check, Human pause, and Same-session resume all OBSERVED, above the sentence 'TrueForge coordinated 3 specialist agents, connected 4 factory tools, ran a sandbox check, paused for your decisions, and resumed the same durable session.' Session, runtime, and MCP identifiers sit behind the collapsed technical-evidence disclosure.">
           </div>
-          <figcaption><strong>Observed, not asserted:</strong> the harness ribbon after a verified deterministic run. Before the mission starts it reads "4 services configured / Configured / Dynamic · configured"; afterwards it reads <em>4/4 services reached, 1 executed, 3 threads evidenced, Native · 4 owner calls</em> — runtime evidence from that run, captured at the current build.</figcaption>
+          <figcaption><strong>Observed, not asserted:</strong> the harness ribbon after a verified deterministic run. Before the mission starts every chain station reads <em>Configured</em>; afterwards the stations read <em>Observed</em> and the mission and result read <em>Verified</em> — and the disclosure's facts flip from "4 services configured / Configured / Dynamic · configured" to <em>4/4 services reached, 1 executed, 3 threads evidenced, Native · 4 owner calls</em>. Runtime evidence from that run, captured at the current build.</figcaption>
         </figure>
 
         <div class="vocab" role="group" aria-label="How FlakeBrake labels its evidence">
@@ -339,7 +339,7 @@
 
         <figure class="shot">
           <div class="shot-frame">
-            <img src="assets/pages/owner-approval-pause.png" width="2788" height="658"
+            <img src="assets/pages/owner-approval-pause.png" width="1280" height="714"
               alt="The judge UI's external owner boundary paused on the first decision. The panel reads 'Your decision is required', names the action 'Select Portfolio Modification — Modify order/best-effort-display: quantity 10 → 8', offers a collapsed 'Durable action identity' disclosure, and presents Deny action and Approve action buttons with a recommendation note.">
           </div>
           <figcaption><strong>Owner call 1, as the judge sees it.</strong> TrueForge holds the turn; the UI never auto-approves. The response can authorize only the exact digest and arguments displayed — missing, stale, malformed, or replayed-with-different-arguments responses fail closed.</figcaption>
@@ -369,8 +369,8 @@
         </div>
         <figure class="shot">
           <div class="shot-frame">
-            <img src="assets/pages/mechanical-denial.png" width="2694" height="285"
-              alt="Judge UI policy panel showing two entries: 'Owner denied primary interval' with the rationale that the primary interval conflicts with protected production commitments, and 'Auto-blocked · active policy' recording that the equivalent reservation for cell-alpha 09:10–09:40 cannot bypass the active denial.">
+            <img src="assets/pages/mechanical-denial.png" width="1280" height="714"
+              alt="Judge UI policy panel showing two entries: 'Owner denied primary interval' with the rationale that the primary interval conflicts with protected production commitments, and 'Blocked automatically — same denied action' recording that the equivalent reservation for cell-alpha 09:10–09:40 cannot bypass the active denial.">
           </div>
           <figcaption><strong>Both denials, side by side, from the record.</strong> The mechanical block consumed no owner call — the four-call budget is itself an asserted safety property of the run.</figcaption>
         </figure>
@@ -390,9 +390,9 @@
           <div><strong>1</strong><span>mechanical block</span></div>
           <div><strong>1</strong><span>acceptance</span></div>
           <div><strong>1</strong><span>attempt</span></div>
-          <div><strong>1</strong><span>mutation</span></div>
-          <div><strong>1</strong><span>receipt</span></div>
-          <div><strong>2</strong><span>actual facts</span></div>
+          <div><strong>1</strong><span>factory change</span></div>
+          <div><strong>1</strong><span>change record</span></div>
+          <div><strong>2</strong><span>measured facts</span></div>
           <div class="is-zero"><strong>0</strong><span>duplicates</span></div>
         </div>
         <p class="ledger-caption">Counts rendered live by the judge UI and asserted by the deterministic test gates — including zero duplicate approvals and zero unauthorized mutations. Refreshing the browser changes none of them.</p>
@@ -400,8 +400,8 @@
         <ol class="proof-ladder">
           <li>
             <span class="rung">Rung 1</span>
-            <h3>Mutation receipt</h3>
-            <p>A receipt proves the fenced factory command committed. By itself, it is not verified success — and the UI says so in exactly those words.</p>
+            <h3>Factory change record</h3>
+            <p>This record proves the one-time-locked factory command committed. By itself, it is not verified success — and the UI says so in exactly those words.</p>
           </li>
           <li>
             <span class="rung">Rung 2</span>
@@ -439,8 +439,8 @@
         </div>
         <figure class="shot">
           <div class="shot-frame">
-            <img src="assets/pages/proof-center-verified.png" width="2788" height="1003"
-              alt="The Operator Proof Center in its Verified record state. Summary cards read: Direct plan REPLAN with agent work over by 2 and owner decisions over by 1; Safe winner 10 → 8 for the best-effort display order with protected work unchanged; Owner boundary 3 allowed · 1 denied with 1 equivalent action mechanically blocked; Durable outcome 1 mutation · verified with 1 receipt, 1 terminal event, 2 actual facts. Below are disclosure rows for exact control decisions, capacity impact, durable proof and replay, and technical evidence, plus a 'What FlakeBrake prevented' summary naming the denied 09:10–09:40 interval and the approved 09:40–10:10 mutation.">
+            <img src="assets/pages/proof-center-verified.png" width="1280" height="714"
+              alt="The Operator Proof Center in its Verified record state. Summary cards read: Direct plan 'Doesn’t fit yet' (REPLAN) with agent work over by 2 and human decisions over by 1; Safe winner 10 → 8 for the best-effort display order with protected work unchanged; Human decisions 3 allowed · 1 denied with 1 equivalent action mechanically blocked; Durable outcome 1 factory change · verified with 1 change record, 1 verified completion, 2 measured facts. Below are disclosure rows to show decision history, exact capacity math, the durable ledger, and technical identifiers, plus a 'What FlakeBrake prevented' summary naming the denied 09:10–09:40 interval and the approved 09:40–10:10 mutation.">
           </div>
           <figcaption><strong>The verified record, one screen.</strong> Even the counterfactual — "What FlakeBrake prevented" — is composed only of facts derivable from the deterministic fixture: the overload amounts, the protected order kept at 10, the bounded 10&nbsp;→&nbsp;8 change, and which interval did and didn't become the factory result.</figcaption>
         </figure>
@@ -520,7 +520,7 @@
             <a href="https://github.com/dvellon/flakebrake/pull/7">Review trail →</a>
           </article>
         </div>
-        <p class="quality-note">Earlier milestone trails live in merged <a href="https://github.com/dvellon/flakebrake/pull/2">PR&nbsp;#2</a>, <a href="https://github.com/dvellon/flakebrake/pull/3">#3</a>, and <a href="https://github.com/dvellon/flakebrake/pull/4">#4</a>; later rounds — submission readiness, M5 polish, and the Judge Clarity corrections — in <a href="https://github.com/dvellon/flakebrake/pull/8">#8</a>, <a href="https://github.com/dvellon/flakebrake/pull/9">#9</a>, and <a href="https://github.com/dvellon/flakebrake/pull/14">#14</a>. Each preserves initial findings, remediation rounds, exact-head re-reviews, and the final human adjudication.</p>
+        <p class="quality-note">FlakeBrake went through 16 Qodo-reviewed pull requests, resolving more than 50 findings, with zero unresolved findings on the merged release. Earlier milestone trails live in merged <a href="https://github.com/dvellon/flakebrake/pull/2">PR&nbsp;#2</a>, <a href="https://github.com/dvellon/flakebrake/pull/3">#3</a>, and <a href="https://github.com/dvellon/flakebrake/pull/4">#4</a>; later rounds — submission readiness, M5 polish, and the Judge Clarity corrections — in <a href="https://github.com/dvellon/flakebrake/pull/8">#8</a>, <a href="https://github.com/dvellon/flakebrake/pull/9">#9</a>, and <a href="https://github.com/dvellon/flakebrake/pull/14">#14</a>. Each preserves initial findings, remediation rounds, exact-head re-reviews, and the final human adjudication.</p>
       </div>
     </section>
 
@@ -529,17 +529,14 @@
       <div class="wrap">
         <p class="eyebrow">Three-minute demo</p>
         <h2 id="video-title">Watch the whole story in one take.</h2>
-        <!-- FINAL VIDEO URL: when the YouTube link is final, replace the .video-frame div below
-             with the linked thumbnail or embed. Title/description/chapters are prepared in
-             docs/video-package.md. No other layout change is needed. -->
         <div class="video-panel">
-          <div class="video-frame">
+          <a class="video-frame" href="https://www.youtube.com/watch?v=E00_3udo804">
             <div>
               <span class="play" aria-hidden="true">▶</span>
-              <p class="mono-label">Final cut in production</p>
-              <p>The three-minute demo video lands here — REPLAN to verified success, with all four owner calls and the mechanical block on screen.</p>
+              <p class="mono-label">Watch on YouTube</p>
+              <p>REPLAN to verified success in under three minutes — all four owner calls and the mechanical block on screen.</p>
             </div>
-          </div>
+          </a>
           <div class="video-meta">
             <span><strong>Runtime</strong> under 3:00</span>
             <span><strong>Path</strong> deterministic judge profile, credential-free</span>

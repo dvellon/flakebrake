@@ -148,7 +148,7 @@ approval.
 | Team name | `⟨TEAM NAME⟩` — if submitting alone, enter `SOLO` (or your handle) per the form's guidance |
 | GitHub URL | `https://github.com/dvellon/flakebrake` |
 | Deployed URL (optional) | `⟨PAGES URL — e.g. https://dvellon.github.io/flakebrake/ once Pages is enabled⟩` |
-| YouTube URL (required) | `⟨FINAL YOUTUBE URL — under 3:00⟩` |
+| YouTube URL (required) | https://www.youtube.com/watch?v=E00_3udo804 |
 | Blog URL (optional) | `⟨PAGES URL⟩/blog.html` (or the GitHub blob URL for `docs/blog.html`) |
 
 ## Tracks — select all four
