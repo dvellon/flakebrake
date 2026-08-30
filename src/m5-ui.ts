@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   createReadStream,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import {
   createServer,
@@ -16,7 +21,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { Socket } from "node:net";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { canonicalSerialize } from "./canonical.js";
@@ -344,6 +349,7 @@ export class M5DemoCoordinator {
       sandboxEvidence: join(this.#dataRoot, "m5-sandbox-evidence.json"),
     };
     establishOwnedDataRoot(this.#dataRoot);
+    this.#sweepStaleMarkerTemporaries();
     this.#restoreDurableSandboxEvidence();
   }
 
@@ -391,16 +397,36 @@ export class M5DemoCoordinator {
     const snapshot = this.#readMissionSnapshot();
     if (snapshot === null) return;
     try {
-      writeFileSync(
-        this.#paths.sandboxEvidence,
-        `${JSON.stringify({
-          missionId: snapshot.mission.missionId,
-          trueforgeSessionId: snapshot.mission.trueforgeSessionId,
-          trueforgeTurnId: snapshot.mission.currentTurnId,
-        })}\n`,
-      );
+      const serialized = `${JSON.stringify({
+        missionId: snapshot.mission.missionId,
+        trueforgeSessionId: snapshot.mission.trueforgeSessionId,
+        trueforgeTurnId: snapshot.mission.currentTurnId,
+      })}\n`;
+      const roundTrip = objectValue(parseJsonRejectingDuplicateKeys(serialized));
+      if (
+        roundTrip === null ||
+        stringValue(roundTrip["missionId"]) !== snapshot.mission.missionId ||
+        stringValue(roundTrip["trueforgeSessionId"]) !== snapshot.mission.trueforgeSessionId
+      ) {
+        return;
+      }
+      publishJsonFileAtomically(this.#paths.sandboxEvidence, serialized);
     } catch {
-      // Persistence is best effort; the live in-memory evidence still renders.
+      // Persistence is best effort; the live in-memory evidence still renders
+      // and any previously committed marker remains untouched on disk.
+    }
+  }
+
+  #sweepStaleMarkerTemporaries(): void {
+    const prefix = `${basename(this.#paths.sandboxEvidence)}.`;
+    for (const name of readFileSafeDirectory(this.#dataRoot)) {
+      if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+      try {
+        rmSync(join(this.#dataRoot, name), { force: true });
+      } catch {
+        // A stale temporary that cannot be removed is still never read as
+        // evidence; only the committed marker path is authoritative.
+      }
     }
   }
 
@@ -1578,6 +1604,58 @@ function winningModification(candidate: {
     fromQuantity: before.value,
     toQuantity: after.value,
   };
+}
+
+let markerPublicationSequence = 0;
+
+/**
+ * Crash-safe marker publication. The complete payload is written to a unique
+ * invocation-owned temporary file in the destination directory (exclusive
+ * creation, 0o600), flushed to disk, and closed before an atomic
+ * same-directory rename publishes it over the committed path. The committed
+ * path is never opened or truncated in place, so the last valid marker
+ * survives any failure before publication completes. Ordinary failures remove
+ * the invocation's temporary file without masking the primary error; if that
+ * cleanup itself fails, both diagnostics are reported and persistence is
+ * still not claimed.
+ */
+export function publishJsonFileAtomically(destination: string, serialized: string): void {
+  markerPublicationSequence += 1;
+  const temporary = `${destination}.${String(process.pid)}.${String(markerPublicationSequence)}.tmp`;
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(temporary, "wx", 0o600);
+    const payload = Buffer.from(serialized, "utf8");
+    let written = 0;
+    while (written < payload.length) {
+      written += writeSync(descriptor, payload, written);
+    }
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+    renameSync(temporary, destination);
+  } catch (error: unknown) {
+    const cleanupFailures: unknown[] = [];
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch (closeError: unknown) {
+        cleanupFailures.push(closeError);
+      }
+      descriptor = null;
+    }
+    try {
+      rmSync(temporary, { force: true });
+    } catch (removeError: unknown) {
+      cleanupFailures.push(removeError);
+    }
+    if (cleanupFailures.length === 0) throw error;
+    throw new AggregateError(
+      [error, ...cleanupFailures],
+      "Marker publication failed and its temporary file could not be cleaned",
+      { cause: error },
+    );
+  }
 }
 
 export interface AgentTrustEvidence {

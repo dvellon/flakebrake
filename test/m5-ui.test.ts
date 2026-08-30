@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -793,6 +793,180 @@ describe("M5 agent trust — agents checking agents", () => {
     const execution = projection.checks.find((row) => row.kind === "execution");
     assert.ok(execution !== undefined);
     assert.match(execution.check, /verify_schedule_execution/u);
+  });
+});
+
+describe("Qodo PR16 Round 3: atomic sandbox marker publication", () => {
+  const HERO_MISSION_ID = "mission/flakebrake-m4-hero";
+  const MARKER_NAME = "m5-sandbox-evidence.json";
+  const roots: string[] = [];
+
+  after(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  });
+
+  const newRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), "flakebrake-m5-round3-"));
+    roots.push(root);
+    return root;
+  };
+
+  const ownRoot = async (root: string): Promise<void> => {
+    const owner = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    await owner.close();
+  };
+
+  const bindHeroMission = async (root: string, sessionId: string): Promise<void> => {
+    const { M4MissionStore } = await import("../src/m4-mission-store.js");
+    const store = new M4MissionStore({ path: join(root, "mission.sqlite") });
+    try {
+      store.bindMission({
+        missionId: HERO_MISSION_ID,
+        environmentId: "env/hero-microfactory",
+        trueforgeAgentId: "agent/test",
+        trueforgeSessionId: sessionId,
+        m2EnvironmentIdentity: "m2/test",
+        factoryEnvironmentIdentity: "factory/test",
+      });
+    } finally {
+      store.close();
+    }
+  };
+
+  const validMarker = (sessionId: string): string =>
+    `${JSON.stringify({ missionId: HERO_MISSION_ID, trueforgeSessionId: sessionId, trueforgeTurnId: "turn/test" })}\n`;
+
+  const sandboxObserved = async (root: string): Promise<boolean> => {
+    const coordinator = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    try {
+      return coordinator.state().evidenceTimeline.some((item) => item.kind === "sandbox");
+    } finally {
+      await coordinator.close();
+    }
+  };
+
+  const loadPublisher = async (): Promise<(destination: string, serialized: string) => void> => {
+    const module_ = (await import("../src/m5-ui.js")) as Record<string, unknown>;
+    const publisher = module_["publishJsonFileAtomically"];
+    assert.equal(
+      typeof publisher,
+      "function",
+      "src/m5-ui.ts exposes the atomic marker publisher (the in-place writer cannot satisfy the torn-write contract)",
+    );
+    return publisher as (destination: string, serialized: string) => void;
+  };
+
+  test("reproduction: an in-place torn write loses an acknowledged sandbox observation", async () => {
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    writeFileSync(join(root, MARKER_NAME), validMarker("session/current"));
+    assert.equal(await sandboxObserved(root), true, "the acknowledged observation restores as Observed");
+    // The exact crash aftermath of the eea5d52 in-place writer: open(O_TRUNC)
+    // succeeded, the process died before the JSON landed.
+    writeFileSync(join(root, MARKER_NAME), "");
+    assert.equal(
+      await sandboxObserved(root),
+      false,
+      "a torn committed marker silently loses the observation — the writer must make this state unreachable",
+    );
+    await loadPublisher();
+  });
+
+  test("a failed publication leaves the prior valid committed marker byte-identical", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    const destination = join(root, MARKER_NAME);
+    publish(destination, validMarker("session/current"));
+    const before = readFileSync(destination);
+    const { chmodSync } = await import("node:fs");
+    chmodSync(root, 0o500);
+    try {
+      assert.throws(
+        () => publish(destination, validMarker("session/next")),
+        "publication into an unwritable directory fails closed",
+      );
+    } finally {
+      chmodSync(root, 0o700);
+    }
+    assert.deepEqual(readFileSync(destination), before, "the committed marker was never opened or truncated in place");
+    assert.equal(await sandboxObserved(root), true, "the surviving marker still restores Observed");
+    const leftovers = readdirSync(root).filter((name) => name.startsWith(`${MARKER_NAME}.`));
+    assert.deepEqual(leftovers, [], "no temporary residue survives a failed publication");
+  });
+
+  test("crash aftermath between temporary write and publication keeps the committed marker authoritative", async () => {
+    await loadPublisher();
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    const destination = join(root, MARKER_NAME);
+    writeFileSync(destination, validMarker("session/current"));
+    writeFileSync(`${destination}.99999.7.tmp`, validMarker("session/other"));
+    writeFileSync(`${destination}.99999.8.tmp`, "not json {");
+    assert.equal(
+      await sandboxObserved(root),
+      true,
+      "only the committed marker is authoritative; unpublished temporaries change nothing",
+    );
+    assert.equal(readFileSync(destination, "utf8"), validMarker("session/current"));
+    const leftovers = readdirSync(root).filter((name) => name.startsWith(`${MARKER_NAME}.`));
+    assert.deepEqual(leftovers, [], "owned temporary leftovers are swept safely");
+
+    const orphanRoot = newRoot();
+    await ownRoot(orphanRoot);
+    await bindHeroMission(orphanRoot, "session/current");
+    writeFileSync(join(orphanRoot, `${MARKER_NAME}.42.1.tmp`), validMarker("session/current"));
+    assert.equal(
+      await sandboxObserved(orphanRoot),
+      false,
+      "a complete but unpublished temporary never promotes the station",
+    );
+  });
+
+  test("successful publication is complete, valid, restrictive, and exactly mission/session bound", async () => {
+    const publish = await loadPublisher();
+    const root = newRoot();
+    const destination = join(root, MARKER_NAME);
+    publish(destination, validMarker("session/current"));
+    const stats = statSync(destination);
+    assert.equal(stats.mode & 0o777, 0o600, "the committed marker keeps restrictive permissions");
+    const parsed = parseJsonRejectingDuplicateKeys(readFileSync(destination, "utf8")) as Record<string, unknown>;
+    assert.deepEqual({ ...parsed }, {
+      missionId: HERO_MISSION_ID,
+      trueforgeSessionId: "session/current",
+      trueforgeTurnId: "turn/test",
+    });
+    publish(destination, validMarker("session/replaced"));
+    const replaced = parseJsonRejectingDuplicateKeys(readFileSync(destination, "utf8")) as Record<string, unknown>;
+    assert.equal(replaced["trueforgeSessionId"], "session/replaced", "replacement is atomic and complete");
+    assert.deepEqual(
+      readdirSync(root).filter((name) => name.startsWith(`${MARKER_NAME}.`)),
+      [],
+      "publication leaves no temporary residue",
+    );
+  });
+
+  test("reset removes the prior mission's evidence without contaminating the next mission", async () => {
+    const root = newRoot();
+    await ownRoot(root);
+    await bindHeroMission(root, "session/current");
+    writeFileSync(join(root, MARKER_NAME), validMarker("session/current"));
+    const coordinator = new M5DemoCoordinator({ dataRoot: root, cleanupDataOnClose: false });
+    try {
+      assert.equal(coordinator.state().evidenceTimeline.some((item) => item.kind === "sandbox"), true);
+      coordinator.reset();
+      assert.equal(existsSync(join(root, MARKER_NAME)), false, "reset deletes the committed marker");
+      assert.equal(
+        coordinator.state().evidenceTimeline.some((item) => item.kind === "sandbox"),
+        false,
+        "the next mission starts without inherited sandbox evidence",
+      );
+    } finally {
+      await coordinator.close();
+    }
   });
 });
 
