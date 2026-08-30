@@ -16,11 +16,13 @@
     "m4:mission": "npm run build --silent && node dist/src/m4-cli.js",
     "m4:live": "npm run build --silent && node dist/src/m4-cli.js --live",
     "m5:ui": "npm run build --silent && node dist/src/m5-cli.js",
+    "recovery:demo": "npm run build --silent && node dist/src/recovery-demo-cli.js",
     "evidence:verify": "npm run build --silent && node dist/src/mission-evidence-cli.js",
     "test": "npm run build --silent && node --test --experimental-test-isolation=none dist/test/*.test.js",
     "test:evidence": "npm run build --silent && node --test --experimental-test-isolation=none dist/test/mission-evidence-lifecycle.test.js dist/test/mission-evidence.test.js",
     "test:m5": "npm run build --silent && node --test --experimental-test-isolation=none dist/test/m5-ui.test.js",
     "test:m5:browser": "npm run build --silent && node dist/test/m5-browser-smoke.js",
+    "test:recovery:browser": "npm run build --silent && node dist/test/recovery-demo-browser-smoke.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

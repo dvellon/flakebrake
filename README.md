@@ -266,6 +266,27 @@ two genuine-provider tests. All deterministic M1–M5 tests still run. The brows
 command drives the hero mission, recovery, owner decisions, verification,
 refresh/reconnect, keyboard focus, tablet layout, and clean shutdown in Firefox.
 
+### Explicit recovery demonstration
+
+The optional recovery demonstration is a separate mode and cannot be activated
+from the standard hero UI. It uses fresh invocation-owned SQLite databases,
+binds only to loopback, and deliberately closes its owning runner at either of
+two exact deterministic boundaries:
+
+- after the M2 execution fence is durable and before the factory mutation;
+- after the factory transaction commits and before M2 binds its receipt.
+
+Start it on its dedicated default port:
+
+```bash
+npm run recovery:demo
+```
+
+Open `http://127.0.0.1:4177`, select a boundary, then advance the visible
+interruption, restart, recovery/verification, and completed-replay stages. No
+credentials or process-wide kill commands are used. The focused browser check
+is `npm run test:recovery:browser`.
+
 ## Optional genuine OpenAI/Daytona mode
 
 Genuine mode is an additional assurance gate, not a judging prerequisite. It
