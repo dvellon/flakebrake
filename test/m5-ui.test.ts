@@ -157,6 +157,35 @@ describe("M5 judge-readiness audit F-01 through F-26", () => {
   });
 });
 
+describe("M5 operator proof center", () => {
+  const document = readFileSync(join(process.cwd(), "ui/m5/index.html"), "utf8");
+  const application = readFileSync(join(process.cwd(), "ui/m5/app.js"), "utf8");
+
+  test("keeps the executive proof visible and progressively discloses exact evidence", () => {
+    assert.match(document, /Operator proof center/u);
+    assert.match(document, /aria-label="Executive proof summary"/u);
+    assert.match(document, /Exact control decisions/u);
+    assert.match(document, /Capacity and before\/after impact/u);
+    assert.match(document, /Durable proof and replay/u);
+    assert.match(document, /Technical evidence/u);
+    assert.match(document, /What FlakeBrake prevented/u);
+  });
+
+  test("derives proof claims from state without adding a mutating endpoint", () => {
+    assert.match(application, /criticalityWeightedServiceDegradation/u);
+    assert.match(application, /terminalEventCount/u);
+    assert.match(application, /state\.approvals\.filter/u);
+    assert.match(application, /state\.hero\.capacity\.filter/u);
+    assert.doesNotMatch(application, /api\/proof/u);
+  });
+
+  test("states the receipt, verification, and replay boundary directly", () => {
+    assert.match(application, /By itself, it is not verified success/u);
+    assert.match(application, /Only this state is presented as success/u);
+    assert.match(application, /durable effect count remains/u);
+  });
+});
+
 describe("Qodo Round 2: executable session error-capture arming", () => {
   test("arming registers the observer before any navigation and clears the probe", async () => {
     const session = createFakeBrowserSession();
@@ -1069,6 +1098,33 @@ describe("M5 judge UI", { concurrency: false }, () => {
       [initial.hero.winningModification.fromQuantity, initial.hero.winningModification.toQuantity],
       [10, 8],
     );
+    const winner = initial.hero.candidates.find((item) => item.recommended);
+    const proposalAlternative = initial.hero.candidates.find((item) => item.strategy === "modify_proposal");
+    assert.ok(winner);
+    assert.ok(proposalAlternative);
+    assert.deepEqual(winner.changes, [{
+      obligationId: "order/best-effort-display",
+      optionId: "best-effort-order/reduce-to-8",
+      criticality: "best_effort",
+      fromQuantity: 10,
+      toQuantity: 8,
+      serviceLoss: { numerator: 2, denominator: 5 },
+    }]);
+    assert.deepEqual(winner.rank, {
+      protectedObligationViolations: 0,
+      criticalityWeightedServiceDegradation: { numerator: 2, denominator: 5 },
+      previouslyAcceptedObligationsChanged: 1,
+      bottleneckSlack: { numerator: 0, denominator: 1 },
+    });
+    assert.deepEqual(proposalAlternative.rank.criticalityWeightedServiceDegradation, {
+      numerator: 5,
+      denominator: 1,
+    });
+    assert.deepEqual(winner.remainingCapacity, [
+      { resourceKey: "agent_work_units", value: 1 },
+      { resourceKey: "human_review_decisions", value: 0 },
+      { resourceKey: "production_cell_minutes", value: 20 },
+    ]);
     assert.equal(initial.hero.protectedWorkUnchanged, true);
   });
 
@@ -1171,6 +1227,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
         attempt: terminal.execution.attemptCount,
         mutation: terminal.execution.mutationCount,
         receipt: terminal.execution.receiptCount,
+        terminalEvents: terminal.execution.terminalEventCount,
         actuals: terminal.execution.actualFactCount,
         terminal: terminal.execution.terminalStatus,
       },
@@ -1179,6 +1236,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
         attempt: 1,
         mutation: 1,
         receipt: 1,
+        terminalEvents: 1,
         actuals: 2,
         terminal: "terminal_verified",
       },
@@ -1219,6 +1277,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(refreshed.mission.sessionId, sessionId);
     assert.equal(refreshed.mission.terminalProjectionDigest, projectionDigest);
     assert.equal(refreshed.execution.mutationCount, 1);
+    assert.equal(refreshed.execution.terminalEventCount, 1);
     assert.equal(refreshed.run.ownerCallsThisProcess, 4);
   });
 
@@ -1277,6 +1336,7 @@ describe("M5 judge UI", { concurrency: false }, () => {
     assert.equal(replay.mission.disconnectedAndResumed, true);
     assert.equal(replay.execution.mutationCount, 1);
     assert.equal(replay.execution.receiptCount, 1);
+    assert.equal(replay.execution.terminalEventCount, 1);
     assert.equal(replay.execution.attemptCount, 1);
   });
 

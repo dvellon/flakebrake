@@ -116,6 +116,10 @@ try {
   await capture.openApplication(running.url);
   assert.equal(await browser.getTitle(), "FlakeBrake · Promise control room");
   await waitText(browser, By.css(".pill-denied"), "REPLAN");
+  await waitText(browser, By.id("proof-direct-result"), "REPLAN");
+  await waitText(browser, By.id("proof-winner-result"), "10 → 8");
+  assert.match(await browser.findElement(By.id("proof-winner-note")).getText(), /Deliver best-effort display stands/u);
+  assert.match(await browser.findElement(By.id("proof-direct-note")).getText(), /Agent work over by 2.*Owner decisions over by 1/u);
   assert.match(await browser.findElement(By.css(".basis-note")).getText(), /precomputed canonical basis/u);
   assert.equal((await browser.findElements(By.css("progress.capacity-baseline"))).length, 3);
   assert.equal((await browser.findElements(By.css("[style]"))).length, 0, "CSP-safe UI has no inline style attributes");
@@ -142,9 +146,16 @@ try {
     "the sticky topbar keeps scrolled content from reading through",
   );
   await screenshot(browser, join(screenshots, "01-initial.png"));
+  await browser.executeScript("document.getElementById('proof-capacity-details').open = true; document.getElementById('proof-center-title').scrollIntoView({block: 'start'});");
+  const capacityProof = await browser.findElement(By.id("proof-capacity-impact")).getText();
+  assert.match(capacityProof, /BEFORE RUSH[\s\S]*DIRECT PLAN[\s\S]*SAFE WINNER/u);
+  assert.match(capacityProof, /Agent work\s+4\s+-2\s+2\s+1/u);
+  assert.match(capacityProof, /criticality-weighted service degradation:[\s\S]*2\/5[\s\S]*versus[\s\S]*5/u);
+  await screenshot(browser, join(screenshots, "02-proof-center-capacity.png"));
+  await browser.executeScript("document.getElementById('proof-capacity-details').open = false; window.scrollTo(0, 0);");
   await browser.manage().window().setRect({ width: 1024, height: 768 });
   assert.equal(await hasHorizontalOverflow(browser), false);
-  await screenshot(browser, join(screenshots, "02-1024x768-idle.png"));
+  await screenshot(browser, join(screenshots, "03-1024x768-idle.png"));
   await browser.manage().window().setRect({ width: 1440, height: 900 });
 
   const start = await browser.findElement(By.id("start-button"));
@@ -201,7 +212,7 @@ try {
         5_000,
         "the session network observer did not record the pre-refresh controlled failure",
       );
-      await screenshot(browser, join(screenshots, "03-pending-approval.png"));
+      await screenshot(browser, join(screenshots, "04-pending-approval.png"));
       await browser.navigate().refresh();
       await browser.wait(until.elementLocated(By.id("approval-panel")), 60_000);
       await browser.wait(
@@ -256,7 +267,7 @@ try {
         "block",
         "policy decision titles render as stacked rows rather than run-on text",
       );
-      await screenshot(browser, join(screenshots, "04-owner-and-mechanical-denial.png"));
+      await screenshot(browser, join(screenshots, "05-owner-and-mechanical-denial.png"));
     }
   }
 
@@ -273,6 +284,10 @@ try {
   assert.doesNotMatch(documentText, /Mission stopped safely/u);
   assert.match(documentText, /Independent read-back observed/u);
   assert.doesNotMatch(documentText, /Independent read-back pending/u);
+  assert.match(documentText, /What FlakeBrake prevented/iu);
+  assert.match(documentText, /3 allowed · 1 denied/u);
+  assert.match(documentText, /1 receipt · 1 terminal event · 2 actual facts/u);
+  assert.match(documentText, /only mutation is the approved 09:40–10:10 interval/u);
   assert.equal(await browser.findElement(By.id("connection-label")).getText(), "Mission complete");
   assert.equal((await browser.findElements(By.css("#proof-stages .proof-complete"))).length, 3);
   assert.equal((await browser.findElements(By.css("#timeline li.pending"))).length, 0);
@@ -281,15 +296,24 @@ try {
     (await browser.findElements(By.css(".metric strong"))).map((element) => element.getText()),
   );
   assert.deepEqual(metrics, ["1", "1", "1", "1"]);
+  assert.deepEqual(
+    await browser.executeScript("return [...document.querySelectorAll('.proof-counts strong')].map((item) => item.textContent);"),
+    ["1", "1", "1", "2"],
+  );
   await browser.executeScript("window.scrollTo(0, 0);");
-  await screenshot(browser, join(screenshots, "05-terminal-overview.png"));
+  await screenshot(browser, join(screenshots, "06-terminal-overview.png"));
+  await browser.executeScript("document.getElementById('proof-control-details').open = true; document.getElementById('proof-durable-details').open = true; document.getElementById('proof-center-title').scrollIntoView({block: 'start'});");
+  assert.equal((await browser.findElements(By.css("#proof-decisions .proof-decision"))).length, 4);
+  assert.equal((await browser.findElements(By.css("#proof-decisions .mechanical-proof"))).length, 1);
+  await screenshot(browser, join(screenshots, "07-terminal-proof-center.png"));
   await browser.executeScript("document.getElementById('result-title').scrollIntoView({block: 'start'});");
-  await screenshot(browser, join(screenshots, "06-readback-proof.png"));
+  await screenshot(browser, join(screenshots, "08-readback-proof.png"));
 
   const sessionBeforeRefresh = await browser.findElement(By.id("session-id")).getText();
   await browser.navigate().refresh();
   await waitText(browser, By.id("outcome"), "Verified success", 60_000);
   await waitText(browser, By.id("connection-label"), "Durable replay restored", 60_000);
+  assert.match((await browser.findElement(By.id("proof-durable-proof")).getAttribute("textContent")) ?? "", /browser is attached to a durable replay/u);
   assert.equal(await browser.findElement(By.id("session-id")).getText(), sessionBeforeRefresh);
   assert.deepEqual(
     await Promise.all(
@@ -307,7 +331,7 @@ try {
     assert.equal(await hasHorizontalOverflow(browser), false, `${String(width)}x${String(height)} overflow`);
     assert.equal(await browser.findElement(By.id("start-button")).isDisplayed(), true);
   }
-  await screenshot(browser, join(screenshots, "07-tablet-820x1180.png"));
+  await screenshot(browser, join(screenshots, "09-tablet-820x1180.png"));
   assert.equal(
     capture.capturedErrorCount(),
     0,
