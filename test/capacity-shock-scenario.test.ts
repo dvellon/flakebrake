@@ -261,6 +261,38 @@ describe("M5 scenario selection and isolation", { concurrency: false }, () => {
       const capacityInitial = await getState(running);
       assert.equal(capacityInitial.scenario.initialDecision, "ADMITTABLE");
       assert.equal(capacityInitial.scenario.currentCapacityPlanVersion, "capacity-plan/v2");
+      assert.deepEqual(capacityInitial.challengeLab, {
+        status: "idle",
+        canRun: false,
+        label: "Deterministic assurance demonstration",
+        allPassed: null,
+        omitted: [],
+        challenges: [],
+        errorCode: null,
+      });
+      assert.deepEqual(capacityInitial.agentTrust, {
+        recommendationsRecorded: false,
+        checks: [],
+      });
+      const unavailableEvidence = await fetch(`${running.url}/api/evidence`);
+      assert.equal(unavailableEvidence.status, 409);
+      assert.equal(
+        (await unavailableEvidence.json() as { readonly error: string }).error,
+        "evidence_unavailable_for_scenario",
+      );
+      const unavailableChallenge = await fetch(`${running.url}/api/challenge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: running.url },
+        body: JSON.stringify({
+          operation: "run",
+          requestId: "capacity-challenge-inert-0001",
+        }),
+      });
+      assert.equal(unavailableChallenge.status, 409);
+      assert.equal(
+        (await unavailableChallenge.json() as { readonly error: string }).error,
+        "challenge_unavailable_for_scenario",
+      );
       assert.deepEqual(
         capacityInitial.hero.capacity.map((item) => [
           item.resourceKey,
@@ -298,6 +330,7 @@ describe("M5 scenario selection and isolation", { concurrency: false }, () => {
           attempt: firstTerminal.execution.attemptCount,
           mutation: firstTerminal.execution.mutationCount,
           receipt: firstTerminal.execution.receiptCount,
+          terminalEvents: firstTerminal.execution.terminalEventCount,
           actuals: firstTerminal.execution.actualFactCount,
           terminal: firstTerminal.execution.terminalStatus,
         },
@@ -306,6 +339,7 @@ describe("M5 scenario selection and isolation", { concurrency: false }, () => {
           attempt: 1,
           mutation: 1,
           receipt: 1,
+          terminalEvents: 1,
           actuals: 2,
           terminal: "terminal_verified",
         },
@@ -323,6 +357,9 @@ describe("M5 scenario selection and isolation", { concurrency: false }, () => {
       assert.equal(existsSync(join(root, "factory.sqlite")), false);
       assert.equal(existsSync(join(root, "capacity-shock-m2.sqlite")), true);
       assert.equal(existsSync(join(root, "capacity-shock-factory.sqlite")), true);
+      assert.equal(existsSync(join(root, "challenge-lab-v1")), false);
+      assert.equal(existsSync(join(root, "recovery")), false);
+      assert.equal(existsSync(join(root, "m5-sandbox-evidence.json")), false);
 
       const sessionId = firstTerminal.mission.sessionId;
       const projectionDigest = firstTerminal.mission.terminalProjectionDigest;
@@ -354,13 +391,21 @@ describe("M5 scenario selection and isolation", { concurrency: false }, () => {
       assert.equal(replay.execution.mutationCount, 1);
       assert.equal(replay.execution.attemptCount, 1);
       assert.equal(replay.execution.receiptCount, 1);
+      assert.equal(replay.execution.terminalEventCount, 1);
       assert.equal(replay.scenario.staleBasisRejectionCount, 1);
+      assert.equal((await fetch(`${running.url}/api/evidence`)).status, 409);
 
       await post(running, "/api/scenario", {
         scenarioId: "rush-order",
         requestId: "hero-selector-after-capacity-0001",
       });
-      assertOriginalHeroProjection(await getState(running));
+      const restoredHero = await getState(running);
+      assertOriginalHeroProjection(restoredHero);
+      assert.equal(restoredHero.challengeLab.status, "idle");
+      assert.equal(restoredHero.challengeLab.canRun, true);
+      assert.equal((await fetch(`${running.url}/api/evidence`)).status, 409);
+      assert.equal(restoredHero.execution.mutationCount, 0);
+      assert.equal(restoredHero.safety.ownerCallCount, 0);
       assert.equal(existsSync(join(root, "capacity-shock-m2.sqlite")), true);
     } finally {
       await running?.close();

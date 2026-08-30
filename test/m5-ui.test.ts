@@ -3948,6 +3948,48 @@ test("M5 Round 1: mutation and reset generations discard older responses", async
   }
 });
 
+test("M5 integration: scenario switching rejects stale polls and cross-scenario terminal state", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-scenario-race-"));
+  const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
+  try {
+    const hero = coordinator.state();
+    const capacity = coordinator.selectScenario("capacity-shock");
+    const staleHeroPoll = deferred<unknown>();
+    const switchResponse = deferred<unknown>();
+    const harness = await createPollingHarness(hero, [staleHeroPoll.promise, switchResponse.promise]);
+    const poll = harness.evaluate<Promise<void>>("refresh()");
+    const switchScenario = harness.evaluate<Promise<void>>(
+      'mutate("/api/scenario", {scenarioId: "capacity-shock", requestId: "race-scenario-switch"})',
+    );
+    switchResponse.resolve({ state: capacity });
+    await switchScenario;
+    staleHeroPoll.resolve({
+      ...uiProjection(hero, capacity.revision + 10, "verified"),
+      run: { ...hero.run, generation: capacity.run.generation + 1, status: "verified" },
+    });
+    await poll;
+    assert.equal(
+      harness.evaluate<string>('state.scenario.scenarioId'),
+      "capacity-shock",
+      "a poll issued before the switch cannot restore the hero projection",
+    );
+    assert.match(harness.text("basis-resolution"), /capacity-plan\/v1/iu);
+
+    const forgedNewerHero = {
+      ...uiProjection(hero, capacity.revision + 20, "verified"),
+      run: { ...hero.run, generation: capacity.run.generation + 2, status: "verified" as const },
+    };
+    const applied = harness.evaluate<boolean>(
+      `applyState(${JSON.stringify(forgedNewerHero)}, responseToken("poll"))`,
+    );
+    assert.equal(applied, false);
+    assert.equal(harness.evaluate<string>('state.scenario.scenarioId'), "capacity-shock");
+  } finally {
+    await coordinator.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("M5 Round 1: reconnect generation invalidates responses issued before disconnect", async () => {
   const directory = mkdtempSync(join(tmpdir(), "flakebrake-m5-reconnect-race-"));
   const coordinator = new M5DemoCoordinator({ dataRoot: directory, cleanupDataOnClose: false });
